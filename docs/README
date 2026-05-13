@@ -1,0 +1,57 @@
+# AionDB documentation engine
+
+Self-contained static site generator. No external dependencies; Python 3.8+
+standard library is enough.
+
+## Layout
+
+  docs/
+    build.py               build engine (single file, ~300 lines)
+    theme/
+      style.css            design tokens + components
+      layout.html          page template
+    content/               source markdown (organize freely)
+      index.md             landing page (URL: /)
+      presentation.md      project presentation (URL: /presentation.html)
+      license.md           license page (URL: /license.html)
+      documentation/       documentation section (URL: /documentation/)
+        index.md
+      specification-avancee/
+        index.md           crate-level implementation notes
+    _site/                 build output (gitignored, regenerated)
+
+## Adding pages
+
+Create a Markdown file under `content/`. Optional YAML front-matter:
+
+    ---
+    title: My page title
+    order: 5
+    ---
+
+`order` controls placement in nav/sidebar (lower first). `title` overrides the
+first H1 of the page if present.
+
+Sub-section: create `content/<section>/` with an `index.md` inside; the
+directory becomes its own top-level entry.
+
+## Building
+
+From the repository root:
+
+    python3 docs/build.py            # build to docs/_site/
+    python3 docs/build.py --serve    # build then serve on localhost:8000
+    python3 docs/build.py --out PATH # build to a custom directory
+
+## Markdown subset
+
+Supported: headings (# .. ######), paragraphs, **bold**, *italic*, `inline
+code`, [links](url), fenced code blocks, unordered/ordered lists,
+blockquotes, horizontal rules, basic tables (when written as raw HTML).
+
+Out of scope: embedded HTML pass-through (kept off so generated output stays
+predictable), images (add support to `build.py` if needed), nested lists,
+footnotes.
+
+If you need a feature that is not in the subset, extend `build.py` rather
+than pulling in a markdown library.

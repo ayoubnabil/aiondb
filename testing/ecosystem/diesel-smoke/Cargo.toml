@@ -1,0 +1,12 @@
+[package]
+name = "aiondb-diesel-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+diesel = { version = "2.2", default-features = false, features = ["postgres"] }
+pq-sys = { package = "pq-sys", version = "0.7", features = ["bundled"] }
+serde_json = "1"

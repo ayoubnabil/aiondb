@@ -1,0 +1,25 @@
+[package]
+name = "aiondb-integrity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "aiondb-integrity"
+path = "src/main.rs"
+
+[[bin]]
+name = "persistence-microbench"
+path = "src/bin/persistence_microbench.rs"
+
+[dependencies]
+aiondb-embedded = { path = "../../crates/aiondb-embedded" }
+aiondb-engine = { path = "../../crates/aiondb-engine" }
+aiondb-config = { path = "../../crates/aiondb-config" }
+aiondb-security = { path = "../../crates/aiondb-security" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[lints]
+workspace = true

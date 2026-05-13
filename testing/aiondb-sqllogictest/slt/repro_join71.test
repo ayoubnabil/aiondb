@@ -1,0 +1,277 @@
+statement ok
+CREATE TABLE t2(
+  a2 INTEGER PRIMARY KEY,
+  b2 INTEGER,
+  x2 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t2 VALUES(1,7,'table t2 row 1')
+
+statement ok
+INSERT INTO t2 VALUES(2,5,'table t2 row 2')
+
+statement ok
+INSERT INTO t2 VALUES(3,9,'table t2 row 3')
+
+statement ok
+INSERT INTO t2 VALUES(4,3,'table t2 row 4')
+
+statement ok
+INSERT INTO t2 VALUES(5,2,'table t2 row 5')
+
+statement ok
+INSERT INTO t2 VALUES(6,10,'table t2 row 6')
+
+statement ok
+INSERT INTO t2 VALUES(7,8,'table t2 row 7')
+
+statement ok
+INSERT INTO t2 VALUES(8,6,'table t2 row 8')
+
+statement ok
+INSERT INTO t2 VALUES(9,4,'table t2 row 9')
+
+statement ok
+INSERT INTO t2 VALUES(10,1,'table t2 row 10')
+
+statement ok
+CREATE TABLE t3(
+  a3 INTEGER PRIMARY KEY,
+  b3 INTEGER,
+  x3 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t3 VALUES(1,6,'table t3 row 1')
+
+statement ok
+INSERT INTO t3 VALUES(2,8,'table t3 row 2')
+
+statement ok
+INSERT INTO t3 VALUES(3,3,'table t3 row 3')
+
+statement ok
+INSERT INTO t3 VALUES(4,2,'table t3 row 4')
+
+statement ok
+INSERT INTO t3 VALUES(5,4,'table t3 row 5')
+
+statement ok
+INSERT INTO t3 VALUES(6,5,'table t3 row 6')
+
+statement ok
+INSERT INTO t3 VALUES(7,9,'table t3 row 7')
+
+statement ok
+INSERT INTO t3 VALUES(8,10,'table t3 row 8')
+
+statement ok
+INSERT INTO t3 VALUES(9,1,'table t3 row 9')
+
+statement ok
+INSERT INTO t3 VALUES(10,7,'table t3 row 10')
+
+statement ok
+CREATE TABLE t14(
+  a14 INTEGER PRIMARY KEY,
+  b14 INTEGER,
+  x14 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t14 VALUES(1,5,'table t14 row 1')
+
+statement ok
+INSERT INTO t14 VALUES(2,3,'table t14 row 2')
+
+statement ok
+INSERT INTO t14 VALUES(3,9,'table t14 row 3')
+
+statement ok
+INSERT INTO t14 VALUES(4,7,'table t14 row 4')
+
+statement ok
+INSERT INTO t14 VALUES(5,4,'table t14 row 5')
+
+statement ok
+INSERT INTO t14 VALUES(6,1,'table t14 row 6')
+
+statement ok
+INSERT INTO t14 VALUES(7,8,'table t14 row 7')
+
+statement ok
+INSERT INTO t14 VALUES(8,2,'table t14 row 8')
+
+statement ok
+INSERT INTO t14 VALUES(9,10,'table t14 row 9')
+
+statement ok
+INSERT INTO t14 VALUES(10,6,'table t14 row 10')
+
+statement ok
+CREATE TABLE t22(
+  a22 INTEGER PRIMARY KEY,
+  b22 INTEGER,
+  x22 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t22 VALUES(1,7,'table t22 row 1')
+
+statement ok
+INSERT INTO t22 VALUES(2,3,'table t22 row 2')
+
+statement ok
+INSERT INTO t22 VALUES(3,6,'table t22 row 3')
+
+statement ok
+INSERT INTO t22 VALUES(4,4,'table t22 row 4')
+
+statement ok
+INSERT INTO t22 VALUES(5,2,'table t22 row 5')
+
+statement ok
+INSERT INTO t22 VALUES(6,8,'table t22 row 6')
+
+statement ok
+INSERT INTO t22 VALUES(7,9,'table t22 row 7')
+
+statement ok
+INSERT INTO t22 VALUES(8,10,'table t22 row 8')
+
+statement ok
+INSERT INTO t22 VALUES(9,5,'table t22 row 9')
+
+statement ok
+INSERT INTO t22 VALUES(10,1,'table t22 row 10')
+
+statement ok
+CREATE TABLE t49(
+  a49 INTEGER PRIMARY KEY,
+  b49 INTEGER,
+  x49 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t49 VALUES(1,9,'table t49 row 1')
+
+statement ok
+INSERT INTO t49 VALUES(2,10,'table t49 row 2')
+
+statement ok
+INSERT INTO t49 VALUES(3,4,'table t49 row 3')
+
+statement ok
+INSERT INTO t49 VALUES(4,6,'table t49 row 4')
+
+statement ok
+INSERT INTO t49 VALUES(5,5,'table t49 row 5')
+
+statement ok
+INSERT INTO t49 VALUES(6,2,'table t49 row 6')
+
+statement ok
+INSERT INTO t49 VALUES(7,3,'table t49 row 7')
+
+statement ok
+INSERT INTO t49 VALUES(8,1,'table t49 row 8')
+
+statement ok
+INSERT INTO t49 VALUES(9,8,'table t49 row 9')
+
+statement ok
+INSERT INTO t49 VALUES(10,7,'table t49 row 10')
+
+statement ok
+CREATE TABLE t52(
+  a52 INTEGER PRIMARY KEY,
+  b52 INTEGER,
+  x52 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t52 VALUES(1,5,'table t52 row 1')
+
+statement ok
+INSERT INTO t52 VALUES(2,8,'table t52 row 2')
+
+statement ok
+INSERT INTO t52 VALUES(3,6,'table t52 row 3')
+
+statement ok
+INSERT INTO t52 VALUES(4,3,'table t52 row 4')
+
+statement ok
+INSERT INTO t52 VALUES(5,4,'table t52 row 5')
+
+statement ok
+INSERT INTO t52 VALUES(6,10,'table t52 row 6')
+
+statement ok
+INSERT INTO t52 VALUES(7,7,'table t52 row 7')
+
+statement ok
+INSERT INTO t52 VALUES(8,1,'table t52 row 8')
+
+statement ok
+INSERT INTO t52 VALUES(9,9,'table t52 row 9')
+
+statement ok
+INSERT INTO t52 VALUES(10,2,'table t52 row 10')
+
+statement ok
+CREATE TABLE t59(
+  a59 INTEGER PRIMARY KEY,
+  b59 INTEGER,
+  x59 VARCHAR(40)
+)
+
+statement ok
+INSERT INTO t59 VALUES(1,9,'table t59 row 1')
+
+statement ok
+INSERT INTO t59 VALUES(2,10,'table t59 row 2')
+
+statement ok
+INSERT INTO t59 VALUES(3,4,'table t59 row 3')
+
+statement ok
+INSERT INTO t59 VALUES(4,2,'table t59 row 4')
+
+statement ok
+INSERT INTO t59 VALUES(5,1,'table t59 row 5')
+
+statement ok
+INSERT INTO t59 VALUES(6,3,'table t59 row 6')
+
+statement ok
+INSERT INTO t59 VALUES(7,7,'table t59 row 7')
+
+statement ok
+INSERT INTO t59 VALUES(8,5,'table t59 row 8')
+
+statement ok
+INSERT INTO t59 VALUES(9,8,'table t59 row 9')
+
+statement ok
+INSERT INTO t59 VALUES(10,6,'table t59 row 10')
+
+query TTTTTTT valuesort join-7-1-repro
+SELECT x2,x3,x52,x22,x14,x49,x59
+  FROM t52,t3,t22,t2,t49,t59,t14
+ WHERE a49=b14
+   AND a3=9
+   AND a3=b59
+   AND b52=a59
+   AND b22=a2
+   AND a52=b49
+   AND a14=b2
+----
+table t14 row 3
+table t2 row 4
+table t22 row 4
+table t3 row 9
+table t49 row 9
+table t52 row 8
+table t59 row 1

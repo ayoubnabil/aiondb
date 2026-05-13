@@ -1,0 +1,19 @@
+= Neo4j Compatibility Suite
+
+This suite complements the public `testing/cypher-tck/`.
+
+Goals:
+
+* cover behaviors often expected by Neo4j users
+* keep the tests separate from the `openCypher` TCK
+* clearly document that this is an in-house compatibility suite
+
+* use only public or documented behavior
+* prefer stable assertions that are easy to diagnose
+
+Run:
+
+----
+bash ./scripts/neo4j-compat-check.sh --mode smoke
+bash ./scripts/neo4j-compat-check.sh --mode full
+----

@@ -1,0 +1,32 @@
+[package]
+name = "pg-regress-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pg-regress"
+path = "src/pg_regress_strict.rs"
+
+[[bin]]
+name = "feature-test"
+path = "src/feature_test.rs"
+
+
+[dependencies]
+aiondb-core = { path = "../crates/aiondb-core" }
+aiondb-config = { path = "../crates/aiondb-config" }
+aiondb-engine = { path = "../crates/aiondb-engine" }
+aiondb-embedded = { path = "../crates/aiondb-embedded" }
+aiondb-catalog-store = { path = "../crates/aiondb-catalog-store" }
+aiondb-storage-engine = { path = "../crates/aiondb-storage-engine" }
+aiondb-pgwire = { path = "../crates/aiondb-pgwire" }
+aiondb-tx = { path = "../crates/aiondb-tx" }
+
+time = { version = ">=0.3.47, <0.4", default-features = false, features = ["std", "large-dates"] }
+regex = "1"
+serde = "1"
+serde_json = "1"
+
+[dependencies.aiondb-parser]
+path = "../crates/aiondb-parser"

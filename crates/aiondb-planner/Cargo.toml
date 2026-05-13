@@ -1,0 +1,19 @@
+[package]
+name = "aiondb-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-eval = { path = "../aiondb-eval" }
+aiondb-optimizer = { path = "../aiondb-optimizer" }
+aiondb-parser = { path = "../aiondb-parser" }
+aiondb-plan = { path = "../aiondb-plan" }
+regex.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

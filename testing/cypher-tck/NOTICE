@@ -1,0 +1,13 @@
+Cypher Technology Compatibility Kit (TCK)
+
+This subtree contains vendored Cypher TCK material from the openCypher / Neo4j
+ecosystem.
+
+- Upstream attribution is preserved in the individual `.feature` files.
+- Those files state that the TCK material is licensed under the Apache
+  License, Version 2.0.
+- The authoritative Apache 2.0 text is published by the Apache Software
+  Foundation at https://www.apache.org/licenses/LICENSE-2.0.
+
+When redistributing this subtree, preserve the existing per-file notices and
+ship the Apache 2.0 license text with it.

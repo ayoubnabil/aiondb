@@ -1,0 +1,18 @@
+[package]
+name = "aiondb-catalog-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-wal = { path = "../aiondb-wal" }
+parking_lot = "0.12"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[Unit]
+Description=AionDB single-node server
+Documentation=https://github.com/aiondb/aiondb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiondb
+Group=aiondb
+EnvironmentFile=-/etc/aiondb/aiondb.env
+Environment=AIONDB_STORAGE_DATA_DIR=/var/lib/aiondb/data
+Environment=AIONDB_PGWIRE_LISTEN_ADDR=127.0.0.1:5432
+Environment=AIONDB_OBSERVABILITY_BIND=127.0.0.1
+Environment=AIONDB_OBSERVABILITY_PORT=9187
+ExecStart=/usr/local/bin/aiondb --data-dir /var/lib/aiondb/data --storage-backend durable
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aiondb
+
+[Install]
+WantedBy=multi-user.target

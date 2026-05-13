@@ -1,0 +1,26 @@
+# Compatibility command matrix mirror.
+# Keep in sync with crates/aiondb-pg-compat/src/compat_tag_matrix.rs.
+
+[[tag]]
+name = "ALTER TABLE"
+behavior = "ImplementedReal"
+dispatch = "Dedicated"
+handler = "compat_runtime::ddl::validate_compat_alter_table_target + apply_compat_alter_table_trigger_state"
+
+[[tag]]
+name = "CREATE TEXT SEARCH"
+behavior = "ImplementedReal"
+dispatch = "Dedicated"
+handler = "compat_runtime::ddl::record_compat_misc_create"
+
+[[tag]]
+name = "GRANT"
+behavior = "ExplicitNotSupported"
+dispatch = "Dedicated"
+handler = "noop_validation::unsupported_compatibility_command (compat stub reject)"
+
+[[tag]]
+name = "REVOKE"
+behavior = "ExplicitNotSupported"
+dispatch = "Dedicated"
+handler = "noop_validation::unsupported_compatibility_command (compat stub reject)"

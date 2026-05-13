@@ -1,0 +1,10 @@
+services:
+  aiondb:
+    build:
+      context: .
+    image: ${AIONDB_IMAGE:-aiondb:local}
+
+  aiondb-studio:
+    build:
+      context: ./integrations/aiondb-studio
+    image: ${AIONDB_STUDIO_IMAGE:-aiondb-studio:local}

@@ -1,0 +1,18 @@
+[package]
+name = "aiondb-buffer-pool"
+description = "Buffer pool / page cache for AionDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+parking_lot = "0.12"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

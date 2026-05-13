@@ -1,0 +1,20 @@
+[package]
+name = "aiondb-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+base64.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+unicode-normalization = "0.1"
+zeroize.workspace = true
+
+[lints]
+workspace = true

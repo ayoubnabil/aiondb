@@ -1,0 +1,18 @@
+[package]
+name = "aiondb-test-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../../crates/aiondb-core" }
+aiondb-embedded = { path = "../../crates/aiondb-embedded" }
+aiondb-engine = { path = "../../crates/aiondb-engine" }
+aiondb-parser = { path = "../../crates/aiondb-parser" }
+aiondb-pgwire = { path = "../../crates/aiondb-pgwire" }
+bytes = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

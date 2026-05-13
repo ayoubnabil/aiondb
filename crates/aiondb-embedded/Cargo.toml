@@ -1,0 +1,15 @@
+[package]
+name = "aiondb-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-config = { path = "../aiondb-config" }
+aiondb-engine = { path = "../aiondb-engine" }
+aiondb-security = { path = "../aiondb-security" }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

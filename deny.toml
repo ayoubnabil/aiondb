@@ -1,0 +1,51 @@
+[advisories]
+unmaintained = "workspace"
+yanked = "warn"
+# Tracked unmaintained transitive deps. Each entry should be removed once the
+# upstream chain migrates. Do NOT add entries without a tracking issue.
+ignore = [
+    # bincode 1.x — superseded by bincode 2.x. Tracking migration in executor +
+    # fragment-transport. https://rustsec.org/advisories/RUSTSEC-2025-0141
+    "RUSTSEC-2025-0141",
+    # rustls-pemfile 2.x archived in favour of `PemObject` in rustls-pki-types.
+    # https://rustsec.org/advisories/RUSTSEC-2025-0134
+    "RUSTSEC-2025-0134",
+    # paste 1.x archived; transitive only. Migrate to `pastey` when upstream deps do.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BUSL-1.1",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+deny = [
+    { name = "sqlparser", reason = "ADR-0002: use aiondb-parser" },
+    { name = "sqlparser-rs", reason = "ADR-0002: use aiondb-parser" },
+    { name = "pg_query", reason = "ADR-0002: use aiondb-parser" },
+    { name = "pg-query", reason = "ADR-0002: use aiondb-parser" },
+    { name = "pg-query-rust", reason = "ADR-0002: use aiondb-parser" },
+    { name = "libpg_query-sys", reason = "ADR-0002: use aiondb-parser" },
+    { name = "pg-parser", reason = "ADR-0002: use aiondb-parser" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

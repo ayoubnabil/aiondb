@@ -1,0 +1,16 @@
+[package]
+name = "aiondb-schema-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

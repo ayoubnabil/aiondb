@@ -1,0 +1,16 @@
+[package]
+name = "aiondb-turso-embedded-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+aiondb-core = { path = "../../../crates/aiondb-core" }
+aiondb-embedded = { path = "../../../crates/aiondb-embedded" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+turso = "0.5.3"

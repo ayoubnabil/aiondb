@@ -1,0 +1,17 @@
+[package]
+name = "aiondb-pg-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-eval = { path = "../aiondb-eval" }
+aiondb-pg-syntax = { path = "../aiondb-pg-syntax" }
+aiondb-parser = { path = "../aiondb-parser" }
+tracing.workspace = true
+
+[lints]
+workspace = true

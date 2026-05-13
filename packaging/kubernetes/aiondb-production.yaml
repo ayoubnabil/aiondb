@@ -1,0 +1,178 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiondb-prod-config
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+data:
+  AIONDB_STORAGE_BACKEND: durable
+  AIONDB_STORAGE_DATA_DIR: /var/lib/aiondb/data
+  AIONDB_PGWIRE_LISTEN_ADDR: 0.0.0.0:5432
+  AIONDB_OBSERVABILITY_BIND: 0.0.0.0
+  AIONDB_OBSERVABILITY_PORT: "9187"
+  AIONDB_STORAGE_DURABLE_WAL_COMMIT_POLICY: always
+  AIONDB_PGWIRE_TLS_MODE: require
+  AIONDB_PGWIRE_TLS_CERT_PATH: /etc/aiondb/tls/server.crt
+  AIONDB_PGWIRE_TLS_KEY_PATH: /etc/aiondb/tls/server.key
+  AIONDB_PGWIRE_TLS_CLIENT_CA_PATH: /etc/aiondb/tls/client-ca.crt
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aiondb-bootstrap-prod
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+type: Opaque
+stringData:
+  AIONDB_BOOTSTRAP_USER: REPLACE_WITH_BOOTSTRAP_ADMIN
+  AIONDB_BOOTSTRAP_PASSWORD: REPLACE_WITH_LONG_UNIQUE_PASSWORD
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aiondb-pgwire-tls
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+type: Opaque
+stringData:
+  server.crt: |
+    REPLACE_WITH_PEM_CERT
+  server.key: |
+    REPLACE_WITH_PEM_KEY
+  client-ca.crt: |
+    REPLACE_WITH_CLIENT_CA_PEM
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiondb-prod
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+  ports:
+    - name: pgwire
+      port: 5432
+      targetPort: pgwire
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiondb-prod
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: aiondb-prod
+spec:
+  serviceName: aiondb-prod
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aiondb
+      app.kubernetes.io/component: database
+      app.kubernetes.io/part-of: aiondb-prod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aiondb
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: aiondb-prod
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: aiondb
+          image: ghcr.io/ayoubnabil/aiondb:main
+          imagePullPolicy: Always
+          args:
+            - --data-dir
+            - /var/lib/aiondb/data
+            - --storage-backend
+            - durable
+          envFrom:
+            - configMapRef:
+                name: aiondb-prod-config
+            - secretRef:
+                name: aiondb-bootstrap-prod
+          ports:
+            - name: pgwire
+              containerPort: 5432
+            - name: observability
+              containerPort: 9187
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: observability
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: observability
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: observability
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/aiondb/data
+            - name: tls
+              mountPath: /etc/aiondb/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: aiondb-pgwire-tls
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: aiondb
+          app.kubernetes.io/component: database
+          app.kubernetes.io/part-of: aiondb-prod
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,0 +1,89 @@
+# Files temporarily exempt from the 1400-line limit.
+# These modules are already monolithic and need explicit follow-up refactors;
+# the allowlist keeps the architecture gate honest for new files while main is
+# brought back to green.
+
+crates/aiondb-engine/src/engine/compat/mod.rs <= 3208
+crates/aiondb-executor/src/executor/special_exprs/hybrid_and_relation.rs
+crates/aiondb-engine/src/engine_tests/vectors.rs
+crates/aiondb-engine/src/engine/query_api.rs <= 5272
+crates/aiondb-planner/src/binder/cte.rs
+testing/aiondb-integrity/src/suites/differential_sqlite.rs
+crates/aiondb-engine/src/engine/recursive_cte.rs
+crates/aiondb-executor/src/executor/special_exprs.rs
+crates/aiondb-engine/src/engine/compat/statement_rewrite.rs
+crates/aiondb-executor/src/executor/join_plans/mod.rs
+crates/aiondb-engine/src/engine_tests/views.rs
+crates/aiondb-executor/src/executor/dml_plans.rs
+crates/aiondb-eval/src/eval/scalar_functions/jsonpath.rs
+crates/aiondb-executor/src/executor/mod.rs
+crates/aiondb-eval/src/eval/scalar_functions/pg_compat.rs
+crates/aiondb-engine/src/engine/statement_exec.rs <= 5430
+crates/aiondb-executor/src/executor/join_plans/set_ops.rs
+crates/aiondb-optimizer/src/tests/catalog_and_ranges.rs
+crates/aiondb-planner/src/type_check/expr_functions.rs
+crates/aiondb-parser/src/lib.rs
+crates/aiondb-engine/src/catalog_authorizer_functions.rs
+crates/aiondb-planner/src/binder/ddl.rs
+crates/aiondb-executor/src/executor/command_plans.rs
+crates/aiondb-storage-engine/src/engine/dml/mod.rs
+crates/aiondb-engine/src/engine/compat/session_compat_helpers.rs
+crates/aiondb-optimizer/src/lib.rs
+crates/aiondb-storage-engine/src/engine/mod.rs
+crates/aiondb-engine/src/engine/session_vars.rs
+crates/aiondb-executor/src/executor/projection_plans.rs
+crates/aiondb-engine/src/engine_tests/portals.rs
+crates/aiondb-eval/src/eval/scalar_functions/mod.rs
+crates/aiondb-planner/src/type_check/dml.rs
+crates/aiondb-planner/src/type_check/expr.rs
+crates/aiondb-engine/src/engine_tests/acl_enforcement.rs
+crates/aiondb-wal/src/replication.rs
+crates/aiondb-wal/src/codec.rs
+crates/aiondb-executor/src/executor/user_functions.rs
+crates/aiondb-optimizer/src/access_path.rs
+
+# Capped legacy debt. These files may stay above 1400 lines temporarily,
+# but any growth beyond the recorded count fails `cargo xtask file-limits`.
+crates/aiondb-engine/src/engine/compat_runtime/ddl.rs <= 4084
+crates/aiondb-executor/src/executor/aggregate_set.rs <= 3220
+crates/aiondb-storage-engine/src/engine/tests/engine_basic_index_tests.rs <= 3124
+crates/aiondb-executor/src/executor/graph_plans/mod.rs <= 3094
+crates/aiondb-planner/src/information_schema/mod.rs <= 2849
+crates/aiondb-storage-engine/src/engine/recovery/mod.rs <= 2792
+crates/aiondb-plpgsql/src/interpreter.rs <= 2596
+crates/aiondb-engine/src/engine_tests/dml_and_errors.rs <= 2457
+crates/aiondb-engine/src/engine_tests/functions.rs <= 2376
+crates/aiondb-planner/src/pg_catalog/pg_catalog_extra2.rs <= 2361
+crates/aiondb-parser/src/parser_select/from_ref.rs <= 2203
+crates/aiondb-storage-engine/src/engine/index_ops.rs <= 2085
+crates/aiondb-eval/src/eval/scalar_functions/range.rs <= 1976
+crates/aiondb-engine/src/engine_tests/distributed.rs <= 1963
+crates/aiondb-server/src/main.rs <= 1960
+crates/aiondb-parser/src/ast.rs <= 1949
+crates/aiondb-storage-engine/src/engine/disk_ordered_index.rs <= 1947
+crates/aiondb-cluster/src/distributed.rs <= 1878
+crates/aiondb-eval/src/eval/scalar_functions/jsonb.rs <= 1841
+crates/aiondb-storage-engine/src/engine/btree/mod.rs <= 1831
+crates/aiondb-executor/src/executor/derived_source_plans.rs <= 1776
+crates/aiondb-plpgsql/src/parser.rs <= 1747
+crates/aiondb-planner/src/binder/mod.rs <= 1720
+crates/aiondb-planner/src/pg_catalog/mod.rs <= 1705
+crates/aiondb-parser/src/tests/basic_parse.rs <= 1688
+crates/aiondb-storage-engine/src/engine/dml/scan.rs <= 1675
+xtask/src/ecosystem_compat.rs <= 1670
+crates/aiondb-engine/src/params.rs <= 1669
+crates/aiondb-catalog-store/src/writer.rs <= 1643
+crates/aiondb-engine/src/builder.rs <= 1634
+crates/aiondb-planner/src/logical_builder.rs <= 1567
+crates/aiondb-pgwire/src/binary_format.rs <= 1561
+crates/aiondb-engine/src/engine/portal_exec.rs <= 1547
+crates/aiondb-planner/src/lib.rs <= 1501
+crates/aiondb-parser/src/lexer.rs <= 1496
+crates/aiondb-catalog-store/src/lib.rs <= 1484
+crates/aiondb-pgwire/src/binary_format_tests.rs <= 1472
+crates/aiondb-eval/src/eval/operators/mod.rs <= 1432
+crates/aiondb-planner/src/type_check.rs <= 1427
+crates/aiondb-engine/src/engine/compat_aggregate_rewrite_body.rs <= 1425
+crates/aiondb-optimizer/src/physical_builder_join_builder.rs <= 1425
+crates/aiondb-planner/src/tests.rs <= 1409
+crates/aiondb-planner/src/binder/dml.rs <= 1402

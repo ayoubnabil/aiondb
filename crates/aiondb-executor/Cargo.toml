@@ -1,0 +1,32 @@
+[package]
+name = "aiondb-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-cluster = { path = "../aiondb-cluster" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-eval = { path = "../aiondb-eval" }
+aiondb-graph = { path = "../aiondb-graph" }
+aiondb-optimizer = { path = "../aiondb-optimizer" }
+aiondb-parser = { path = "../aiondb-parser" }
+aiondb-plan = { path = "../aiondb-plan" }
+aiondb-planner = { path = "../aiondb-planner" }
+aiondb-plpgsql = { path = "../aiondb-plpgsql" }
+aiondb-security = { path = "../aiondb-security" }
+aiondb-schema-bridge = { path = "../aiondb-schema-bridge" }
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+aiondb-tx = { path = "../aiondb-tx" }
+aiondb-vector = { path = "../aiondb-vector" }
+bincode.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

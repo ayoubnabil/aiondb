@@ -1,0 +1,16 @@
+[package]
+name = "aiondb-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-plan = { path = "../aiondb-plan" }
+rayon = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true
