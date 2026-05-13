@@ -148,7 +148,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 time = { version = ">=0.3.47, <0.4", default-features = false, features = ["std", "parsing", "formatting", "large-dates", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util", "fs"] }
