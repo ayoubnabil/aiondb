@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: python3 scripts/check_github_actions_pins.py
       - run: python3 scripts/validate_container_profile.py
       - run: docker compose --env-file .env.example config >/dev/null
@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       # ADR-0003: pas de nouveau CommandNoOp sans RFC
       - run: cargo run --locked -q -p xtask -- check-noops
       # Stop compat-layer growth: any new `try_execute_compat_*` or any
@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo check --locked --workspace --all-targets
 
   test-workspace:
@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo test --locked --workspace --tests --exclude aiondb-engine
 
   test-engine:
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo test --locked -p aiondb-engine --tests
 
   clippy:
@@ -96,7 +96,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   fmt:
@@ -119,7 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - run: cargo doc --locked --workspace --no-deps
 
   product-surface:
@@ -130,7 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Run product smoke gate
         run: make product-smoke
       - name: Upload local release artifacts
@@ -177,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.8.5 --locked
       - name: Select coverage threshold profile
@@ -199,7 +199,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Run pg-regress smoke gate
         run: cargo run --locked -q --manifest-path .pg-regress/Cargo.toml --bin feature-test
       - name: Run sqllogictest smoke gate
@@ -215,7 +215,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install ecosystem dependencies
         run: |
           python3 -m pip install "psycopg==3.3.3" "sqlalchemy==2.0.48"
@@ -237,7 +237,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Select TCK profile
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
