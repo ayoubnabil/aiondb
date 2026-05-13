@@ -134,7 +134,7 @@ type_complexity = "allow"
 [workspace.dependencies]
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
-bincode = "1"
+bincode = "3"
 bytes = "1"
 getrandom = "0.3"
 half = { version = "2", features = ["std", "serde"] }
