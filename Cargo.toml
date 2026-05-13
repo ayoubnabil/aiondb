@@ -141,7 +141,7 @@ half = { version = "2", features = ["std", "serde"] }
 hmac = "0.12"
 lz4_flex = "0.11"
 md-5 = "0.10"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 rayon = "1.10"
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
