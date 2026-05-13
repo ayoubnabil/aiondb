@@ -136,7 +136,7 @@ axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 bincode = "1"
 bytes = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 half = { version = "2", features = ["std", "serde"] }
 hmac = "0.12"
 lz4_flex = "0.11"

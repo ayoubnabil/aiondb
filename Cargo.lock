@@ -134,7 +134,7 @@ dependencies = [
  "aiondb-pg-compat",
  "axum",
  "base64",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hmac",
  "serde",
  "serde_json",
@@ -202,7 +202,7 @@ dependencies = [
  "aiondb-storage-engine",
  "aiondb-tx",
  "aiondb-wal",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hmac",
  "parking_lot",
  "serde",
@@ -224,7 +224,7 @@ dependencies = [
  "aiondb-plan",
  "aiondb-vector",
  "base64",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "md-5",
  "regex",
  "serde_json",
@@ -265,7 +265,7 @@ name = "aiondb-extension"
 version = "0.1.0"
 dependencies = [
  "aiondb-core",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "md-5",
  "sha2",
 ]
@@ -388,7 +388,7 @@ dependencies = [
  "aiondb-wal",
  "base64",
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hmac",
  "pbkdf2",
  "rustls",
@@ -468,7 +468,7 @@ version = "0.1.0"
 dependencies = [
  "aiondb-core",
  "base64",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "hmac",
  "pbkdf2",
  "sha2",
