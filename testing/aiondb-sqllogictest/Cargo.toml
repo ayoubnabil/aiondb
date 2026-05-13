@@ -14,7 +14,7 @@ aiondb-embedded = { path = "../../crates/aiondb-embedded" }
 aiondb-engine = { path = "../../crates/aiondb-engine" }
 aiondb-tx = { path = "../../crates/aiondb-tx" }
 rusqlite = { version = "0.31", features = ["bundled"] }
-sqllogictest = "0.24"
+sqllogictest = "0.29"
 
 [lints]
 workspace = true
