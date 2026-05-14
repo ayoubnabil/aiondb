@@ -813,6 +813,96 @@ mod tests {
         assert_eq!(view.read_tuple(0).unwrap(), b"test data");
     }
 
+    /// Storage format v1 contract: pin the exact byte layout of an empty page
+    /// and of a page with a single tuple. Any accidental change to header
+    /// offsets, magic bytes, item id encoding, or tuple growth direction must
+    /// break this test loudly.
+    ///
+    /// If a deliberate format change is required, the major or minor format
+    /// version in `aiondb-storage-engine::storage_compat` must be bumped and
+    /// this fixture updated in the same commit.
+    #[test]
+    fn frozen_layout_v1_empty_page() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = HeapPage::from_buf(&mut buf);
+        page.init();
+
+        assert_eq!(&buf[0..8], HEAP_PAGE_MAGIC, "magic bytes drift");
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            PAGE_HEADER_SIZE as u32,
+            "lower offset drift",
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            PAGE_SIZE as u32,
+            "upper offset drift",
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            0,
+            "page_lsn drift",
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[24..26].try_into().unwrap()),
+            0,
+            "item_count drift",
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[26..28].try_into().unwrap()),
+            PAGE_FLAG_NONE,
+            "flags drift",
+        );
+        assert_eq!(&buf[28..32], &[0u8; 4], "reserved bytes drift");
+        for byte in &buf[32..] {
+            assert_eq!(*byte, 0, "free space must be zero-initialized");
+        }
+    }
+
+    #[test]
+    fn frozen_layout_v1_single_tuple() {
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut page = HeapPage::from_buf(&mut buf);
+        page.init();
+        page.set_page_lsn(0x0123_4567_89AB_CDEF);
+        let tuple = b"AIONDB-FROZEN-TUPLE";
+        let slot = page.insert_tuple(tuple).expect("slot");
+        assert_eq!(slot, 0);
+
+        // Magic stays put.
+        assert_eq!(&buf[0..8], HEAP_PAGE_MAGIC);
+
+        // lower grew by ITEM_ID_SIZE.
+        let lower = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        assert_eq!(lower, PAGE_HEADER_SIZE + ITEM_ID_SIZE);
+
+        // upper shrank by tuple length.
+        let upper = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        assert_eq!(upper, PAGE_SIZE - tuple.len());
+
+        // page_lsn round-trips.
+        assert_eq!(
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            0x0123_4567_89AB_CDEF,
+        );
+
+        // One item.
+        assert_eq!(u16::from_le_bytes(buf[24..26].try_into().unwrap()), 1);
+
+        // ItemId at the start of the line pointer area decodes to (upper, len, NORMAL).
+        let raw_item =
+            u32::from_le_bytes(buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + ITEM_ID_SIZE]
+                .try_into()
+                .unwrap());
+        let item = ItemId::from_le_bytes(raw_item.to_le_bytes());
+        assert_eq!(item.offset() as usize, upper);
+        assert_eq!(item.length() as usize, tuple.len());
+        assert_eq!(item.flags(), ITEM_NORMAL);
+
+        // Tuple bytes land at upper, growing upward to end of page.
+        assert_eq!(&buf[upper..upper + tuple.len()], tuple);
+    }
+
     #[test]
     fn item_id_roundtrip() {
         let id = ItemId::new(4096, 128, ITEM_NORMAL);

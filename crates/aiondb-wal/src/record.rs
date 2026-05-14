@@ -769,6 +769,115 @@ impl WalRecord {
     }
 }
 
+/// Number of `WalRecord` variants frozen for the v0.2 release line.
+///
+/// Bumping this requires updating [`FROZEN_WAL_RECORD_TAGS_V0_2`] in lock-step.
+/// The frozen test `frozen_wal_tag_table_is_dense_and_unique` enforces that
+/// `tag()` returns a unique value in `0..FROZEN_WAL_RECORD_TAG_COUNT_V0_2` for
+/// every variant.
+pub const FROZEN_WAL_RECORD_TAG_COUNT_V0_2: usize = 86;
+
+/// Frozen on-disk tag table for the WAL record kinds shipped in v0.2.
+///
+/// Every entry is `(tag, variant_name)`. The order of this slice is also the
+/// canonical documentation order: see `docs/content/documentation/learn/
+/// wal-contract.md`. Adding a new variant means:
+///
+/// 1. Append it to the end of `WalRecord` and `tag()`.
+/// 2. Append the matching `(tag, "VariantName")` entry to this slice.
+/// 3. Bump [`FROZEN_WAL_RECORD_TAG_COUNT_V0_2`] and the doc page.
+///
+/// Reordering, renumbering, or removing an existing entry is a breaking change
+/// and is forbidden inside the v0.2 line.
+pub const FROZEN_WAL_RECORD_TAGS_V0_2: &[(u8, &str)] = &[
+    (0, "BeginTxn"),
+    (1, "CommitTxn"),
+    (2, "AbortTxn"),
+    (3, "InsertRow"),
+    (4, "DeleteRow"),
+    (5, "UpdateRow"),
+    (6, "CreateTable"),
+    (7, "DropTable"),
+    (8, "CreateIndex"),
+    (9, "DropIndex"),
+    (10, "AlterTable"),
+    (11, "Checkpoint"),
+    (12, "UpdateStatistics"),
+    (13, "CatalogCreateSchema"),
+    (14, "CatalogDropSchema"),
+    (15, "CatalogCreateRole"),
+    (16, "CatalogAlterRole"),
+    (17, "CatalogDropRole"),
+    (18, "CatalogCreateView"),
+    (19, "CatalogDropView"),
+    (20, "CatalogCreateSequence"),
+    (21, "CatalogDropSequence"),
+    (22, "CatalogAlterSequence"),
+    (23, "CatalogCreateFunction"),
+    (24, "CatalogDropFunction"),
+    (25, "CatalogCreateTrigger"),
+    (26, "CatalogDropTrigger"),
+    (27, "CatalogGrantPrivilege"),
+    (28, "CatalogRevokePrivilege"),
+    (29, "CatalogSetTableDescriptor"),
+    (30, "RegisterEdgeTable"),
+    (31, "AdjacencyInsert"),
+    (32, "AdjacencyRemove"),
+    (33, "CatalogDropTable"),
+    (34, "CatalogDropIndex"),
+    (35, "CatalogUpdateStatistics"),
+    (36, "CatalogCreateNodeLabel"),
+    (37, "CatalogCreateEdgeLabel"),
+    (38, "CatalogDropNodeLabel"),
+    (39, "CatalogDropEdgeLabel"),
+    (40, "CatalogSetIndexDescriptor"),
+    (41, "CatalogCreateTenant"),
+    (42, "CatalogDropTenant"),
+    (43, "CatalogSetSequenceValue"),
+    (44, "FullPageImage"),
+    (45, "PagedRowRef"),
+    (46, "FullPageImageBatch"),
+    (47, "PagePatch"),
+    (48, "PagePatchBatch"),
+    (49, "PageSetU64Batch"),
+    (50, "DiskBtreeMetaUpdate"),
+    (51, "DiskBtreeLeafInsert"),
+    (52, "DiskBtreeLeafDelete"),
+    (53, "DiskBtreeLeafSplit"),
+    (54, "DiskBtreeInternalInsert"),
+    (55, "DiskBtreeInternalSplit"),
+    (56, "DiskBtreeRootGrow"),
+    (57, "DiskBtreeInternalDelete"),
+    (58, "DiskBtreeLeafRedistribute"),
+    (59, "DiskBtreeInternalRedistribute"),
+    (60, "DiskBtreeLeafMerge"),
+    (61, "DiskBtreeInternalMerge"),
+    (62, "DiskBtreeRootShrinkLeaf"),
+    (63, "DiskBtreeRootShrinkInternal"),
+    (64, "DiskBtreeInternalCollapse"),
+    (65, "DiskBtreeRootPromoteSingleChild"),
+    (66, "DiskBtreeRootPromoteCollapsedChain"),
+    (67, "DiskBtreeInternalCollapseChain"),
+    (68, "AutocommitInsertRow"),
+    (69, "AutocommitDeleteRow"),
+    (70, "AutocommitUpdateRow"),
+    (71, "CatalogCreateDomain"),
+    (72, "CatalogDropDomain"),
+    (73, "CatalogAlterDomain"),
+    (74, "CatalogCreateUserType"),
+    (75, "CatalogDropUserType"),
+    (76, "CatalogAlterUserType"),
+    (77, "CatalogCreateCast"),
+    (78, "CatalogDropCast"),
+    (79, "CatalogCreatePolicy"),
+    (80, "CatalogDropPolicy"),
+    (81, "CatalogAlterPolicy"),
+    (82, "CatalogCreateRule"),
+    (83, "CatalogDropRule"),
+    (84, "CatalogSetComment"),
+    (85, "CatalogDropComment"),
+];
+
 /// A WAL entry = LSN + database id + record.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalEntry {
@@ -1193,5 +1302,105 @@ mod tests {
         let tags: Vec<u8> = (0..=42).collect();
         let set: HashSet<u8> = tags.iter().copied().collect();
         assert_eq!(set.len(), 43);
+    }
+
+    /// The frozen tag table must be dense over `0..FROZEN_WAL_RECORD_TAG_COUNT_V0_2`,
+    /// each tag must appear exactly once, and each variant name must appear
+    /// exactly once.
+    #[test]
+    fn frozen_wal_tag_table_is_dense_and_unique() {
+        use std::collections::HashSet;
+
+        assert_eq!(
+            FROZEN_WAL_RECORD_TAGS_V0_2.len(),
+            FROZEN_WAL_RECORD_TAG_COUNT_V0_2,
+            "v0.2 freeze: WAL record tag table length must match the constant; \
+             adding a variant requires updating both",
+        );
+
+        let mut tag_set: HashSet<u8> = HashSet::new();
+        let mut name_set: HashSet<&str> = HashSet::new();
+        for (index, (tag, name)) in FROZEN_WAL_RECORD_TAGS_V0_2.iter().enumerate() {
+            let expected = u8::try_from(index).expect("index fits in u8");
+            assert_eq!(
+                *tag, expected,
+                "v0.2 freeze: tag at slot {index} must be {expected} (got {tag} for {name})",
+            );
+            assert!(
+                tag_set.insert(*tag),
+                "v0.2 freeze: duplicate tag {tag} for {name}",
+            );
+            assert!(
+                name_set.insert(name),
+                "v0.2 freeze: duplicate variant name {name}",
+            );
+        }
+    }
+
+    /// Spot-check a representative sample of variants against the frozen
+    /// table. The full table is exercised by the unique-and-dense test above
+    /// plus the per-variant `tag_*` tests in this module.
+    #[test]
+    fn frozen_wal_tag_table_matches_record_tag() {
+        let samples: Vec<(WalRecord, u8)> = vec![
+            (
+                WalRecord::BeginTxn {
+                    txn_id: txn(1),
+                    isolation: IsolationLevel::ReadCommitted,
+                },
+                0,
+            ),
+            (
+                WalRecord::CommitTxn {
+                    txn_id: txn(1),
+                    commit_ts: 0,
+                },
+                1,
+            ),
+            (WalRecord::AbortTxn { txn_id: txn(1) }, 2),
+            (
+                WalRecord::Checkpoint {
+                    last_committed_lsn: Lsn::new(0),
+                },
+                11,
+            ),
+            (
+                WalRecord::FullPageImage {
+                    relation_id: RelationId::new(1),
+                    page_number: 0,
+                    page_data: vec![0u8; 0],
+                },
+                44,
+            ),
+            (
+                WalRecord::AutocommitDeleteRow {
+                    txn_id: txn(1),
+                    table_id: RelationId::new(1),
+                    tuple_id: TupleId::new(1),
+                },
+                69,
+            ),
+            (
+                WalRecord::CatalogDropComment {
+                    txn_id: txn(1),
+                    object_type: "table".to_owned(),
+                    object_identity: "public.t".to_owned(),
+                },
+                85,
+            ),
+        ];
+
+        for (record, expected_tag) in samples {
+            assert_eq!(
+                record.tag(),
+                expected_tag,
+                "tag drift detected for {record:?}",
+            );
+            let table_entry = FROZEN_WAL_RECORD_TAGS_V0_2
+                .iter()
+                .find(|(tag, _)| *tag == expected_tag)
+                .expect("frozen table must contain every sampled tag");
+            assert_eq!(table_entry.0, expected_tag);
+        }
     }
 }

@@ -421,6 +421,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Recovery must be idempotent: opening the same WAL twice from the same
+    /// start LSN must yield the same entry sequence, byte for byte.
+    ///
+    /// This is the v0.2 recovery contract. A replayer that re-runs after a
+    /// crash mid-replay must see exactly what it saw the first time.
+    #[test]
+    fn reader_replay_is_idempotent_within_a_single_run() {
+        use crate::record::WalRecord;
+        use crate::Lsn;
+        use aiondb_core::{RelationId, Row, TupleId, TxnId, Value};
+
+        let dir = segment::test_dir("reader_idempotent_single");
+        let config = test_config(dir.clone());
+
+        let records: Vec<WalRecord> = (1..=8u64)
+            .map(|i| WalRecord::AutocommitInsertRow {
+                txn_id: TxnId::new(i),
+                table_id: RelationId::new(7),
+                tuple_id: TupleId::new(i),
+                row: Row::new(vec![Value::Int(i as i32)]),
+            })
+            .collect();
+
+        let mut writer = WalWriter::open(config).unwrap();
+        for record in &records {
+            writer.append(record).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let mut first = WalReader::open(dir.clone(), Lsn::new(1)).unwrap();
+        let first_pass = first.collect_all().unwrap();
+
+        let mut second = WalReader::open(dir.clone(), Lsn::new(1)).unwrap();
+        let second_pass = second.collect_all().unwrap();
+
+        assert_eq!(first_pass.len(), records.len(), "entry count drift");
+        assert_eq!(first_pass, second_pass, "replay must be deterministic");
+
+        // And replaying from a checkpoint mid-stream must still match the
+        // suffix of the full replay.
+        let mut suffix = WalReader::open(dir.clone(), Lsn::new(4)).unwrap();
+        let suffix_pass = suffix.collect_all().unwrap();
+        assert_eq!(suffix_pass, first_pass[3..].to_vec());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recovery must also be idempotent across reopens: after closing the
+    /// reader and reopening it on the same on-disk state, the second open
+    /// must replay the same entries (no progress is silently consumed).
+    #[test]
+    fn reader_replay_is_idempotent_across_reopen() {
+        use crate::record::WalRecord;
+        use crate::Lsn;
+        use aiondb_core::{RelationId, TupleId, TxnId};
+
+        let dir = segment::test_dir("reader_idempotent_reopen");
+        let config = test_config(dir.clone());
+
+        let mut writer = WalWriter::open(config).unwrap();
+        for i in 1..=5u64 {
+            writer
+                .append(&WalRecord::AutocommitDeleteRow {
+                    txn_id: TxnId::new(i),
+                    table_id: RelationId::new(11),
+                    tuple_id: TupleId::new(i),
+                })
+                .unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let first_pass: Vec<_> = {
+            let mut r = WalReader::open(dir.clone(), Lsn::new(1)).unwrap();
+            r.collect_all().unwrap()
+        };
+        let second_pass: Vec<_> = {
+            let mut r = WalReader::open(dir.clone(), Lsn::new(1)).unwrap();
+            r.collect_all().unwrap()
+        };
+        assert_eq!(first_pass, second_pass);
+        assert_eq!(first_pass.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reader_collect_all() {
         let dir = segment::test_dir("reader_collect");

@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::StorageBackendKind;
 
 pub const STORAGE_FORMAT_MAJOR: u16 = 1;
-pub const STORAGE_FORMAT_MINOR: u16 = 0;
+pub const STORAGE_FORMAT_MINOR: u16 = 1;
 pub const MIN_READABLE_STORAGE_FORMAT_MAJOR: u16 = 1;
 pub const MAX_READABLE_STORAGE_FORMAT_MAJOR: u16 = 1;
+pub const STORAGE_RELEASE_LINE: &str = "0.2";
 
 const MANIFEST_FILE: &str = "aiondb.storage";
 const MANIFEST_MAGIC: &[u8; 8] = b"AIONFMT1";
@@ -244,7 +245,7 @@ fn current_manifest(backend: StorageBackendKind) -> StorageManifest {
     StorageManifest {
         format_major: STORAGE_FORMAT_MAJOR,
         format_minor: STORAGE_FORMAT_MINOR,
-        created_by_release_line: "0.1".to_owned(),
+        created_by_release_line: STORAGE_RELEASE_LINE.to_owned(),
         backend: backend.as_str().to_owned(),
         stable: vec![
             "catalog snapshots and catalog WAL".to_owned(),
@@ -1522,6 +1523,93 @@ mod tests {
         assert!(manifest_path(&dir).is_file());
         assert!(backup.is_dir());
         assert!(doctor_data_dir(&dir).ok());
+    }
+
+    /// v0.1 data dirs were written with format 1.0 and release line "0.1".
+    /// A v0.2 binary must doctor them OK (major still in range), upgrade them
+    /// in place to 1.1 / "0.2", and back up the old manifest so a downgrade
+    /// can recover the previous metadata.
+    #[test]
+    fn upgrade_from_v01_minor_zero_rewrites_manifest_to_current() {
+        let dir = test_dir("upgrade-from-v01");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write a manifest that matches what a v0.1 binary would have produced.
+        let legacy = StorageManifest {
+            format_major: 1,
+            format_minor: 0,
+            created_by_release_line: "0.1".to_owned(),
+            backend: StorageBackendKind::Durable.as_str().to_owned(),
+            stable: vec!["legacy".to_owned()],
+            experimental: vec![],
+        };
+        let payload = serde_json::to_vec_pretty(&legacy).unwrap();
+        let mut bytes =
+            Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
+        bytes.extend_from_slice(MANIFEST_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let checksum = compute_crc32c(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        fs::write(manifest_path(&dir), &bytes).unwrap();
+
+        // doctor must accept the legacy minor and surface the version it found.
+        let pre = doctor_data_dir(&dir);
+        assert!(pre.ok(), "{pre:?}");
+        assert_eq!(pre.format_major, Some(1));
+        assert_eq!(pre.format_minor, Some(0));
+
+        // upgrade must rewrite the manifest in place to the current minor and
+        // record a backup of the previous data dir state.
+        let backup = upgrade_data_dir(&dir).unwrap();
+        assert!(backup.is_dir(), "upgrade did not create a backup dir");
+
+        let post = doctor_data_dir(&dir);
+        assert!(post.ok(), "{post:?}");
+        assert_eq!(post.format_major, Some(STORAGE_FORMAT_MAJOR));
+        assert_eq!(post.format_minor, Some(STORAGE_FORMAT_MINOR));
+
+        let rewritten = read_manifest(&dir).unwrap();
+        assert_eq!(rewritten.format_minor, STORAGE_FORMAT_MINOR);
+        assert_eq!(rewritten.created_by_release_line, STORAGE_RELEASE_LINE);
+    }
+
+    /// A manifest produced by a hypothetical future release with a larger
+    /// major version must be refused. This protects users from a newer binary
+    /// silently mishandling an older data dir.
+    #[test]
+    fn doctor_refuses_unknown_future_major() {
+        let dir = test_dir("future-major");
+        fs::create_dir_all(&dir).unwrap();
+
+        let future = StorageManifest {
+            format_major: MAX_READABLE_STORAGE_FORMAT_MAJOR + 1,
+            format_minor: 0,
+            created_by_release_line: "9.9".to_owned(),
+            backend: StorageBackendKind::Durable.as_str().to_owned(),
+            stable: vec![],
+            experimental: vec![],
+        };
+        let payload = serde_json::to_vec_pretty(&future).unwrap();
+        let mut bytes =
+            Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
+        bytes.extend_from_slice(MANIFEST_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let checksum = compute_crc32c(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        fs::write(manifest_path(&dir), &bytes).unwrap();
+
+        let report = doctor_data_dir(&dir);
+        assert!(!report.ok(), "future major must be refused: {report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|message| message.contains("newer than this binary supports")),
+            "expected explicit refusal message, got {:?}",
+            report.errors,
+        );
     }
 
     #[test]
