@@ -1,0 +1,141 @@
+# ============================================================
+# Test: patterns typiques des ORMs (SQLAlchemy, Prisma, etc.)
+# ============================================================
+
+# --- Schema introspection (ce que les ORMs font au demarrage) ---
+statement ok
+CREATE TABLE accounts (
+    id INT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    role TEXT DEFAULT 'user'
+)
+
+statement ok
+CREATE TABLE posts (
+    id INT PRIMARY KEY,
+    author_id INT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    published BOOLEAN DEFAULT FALSE
+)
+
+statement ok
+CREATE INDEX idx_posts_author ON posts (author_id)
+
+# ORM: list tables
+query T rowsort
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'
+----
+accounts
+posts
+
+# ORM: list columns
+query TT rowsort
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'accounts'
+----
+id integer
+role text
+username text
+
+# --- Typical ORM CRUD patterns ---
+statement ok
+INSERT INTO accounts (id, username, role) VALUES (1, 'admin', 'admin')
+
+statement ok
+INSERT INTO accounts (id, username, role) VALUES (2, 'alice', 'user')
+
+statement ok
+INSERT INTO posts VALUES (1, 1, 'First Post', 'Hello World', TRUE)
+
+statement ok
+INSERT INTO posts VALUES (2, 2, 'Draft Post', 'WIP', FALSE)
+
+statement ok
+INSERT INTO posts VALUES (3, 1, 'Second Post', 'More content', TRUE)
+
+# ORM: find by PK
+query TT
+SELECT username, role FROM accounts WHERE id = 1
+----
+admin admin
+
+# ORM: find with filter + order + limit
+query TT
+SELECT title, body FROM posts WHERE published = TRUE ORDER BY id DESC LIMIT 1
+----
+Second Post More content
+
+# ORM: count
+query I
+SELECT COUNT(*) FROM posts WHERE author_id = 1
+----
+2
+
+# ORM: eager load (join)
+query TTT rowsort
+SELECT a.username, p.title, p.body
+FROM posts p
+JOIN accounts a ON a.id = p.author_id
+WHERE p.published = TRUE
+----
+admin First Post Hello World
+admin Second Post More content
+
+# ORM: update by PK
+statement ok
+UPDATE posts SET published = TRUE WHERE id = 2
+
+query B
+SELECT published FROM posts WHERE id = 2
+----
+true
+
+# ORM: delete
+statement ok
+DELETE FROM posts WHERE id = 3
+
+query I
+SELECT COUNT(*) FROM posts
+----
+2
+
+# --- Transactions (ORM wraps operations) ---
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO accounts (id, username) VALUES (3, 'bob')
+
+statement ok
+INSERT INTO posts VALUES (4, 3, 'Bob Post', 'Content', FALSE)
+
+statement ok
+COMMIT
+
+query I
+SELECT COUNT(*) FROM accounts
+----
+3
+
+# --- Pagination (LIMIT/OFFSET) ---
+query T
+SELECT username FROM accounts ORDER BY id LIMIT 2 OFFSET 1
+----
+alice
+bob
+
+# --- EXISTS pattern (ORM relationship check) ---
+query T rowsort
+SELECT a.username
+FROM accounts a
+WHERE EXISTS (SELECT 1 FROM posts p WHERE p.author_id = a.id AND p.published = TRUE)
+----
+admin
+alice
+
+# Cleanup
+statement ok
+DROP TABLE posts
+
+statement ok
+DROP TABLE accounts

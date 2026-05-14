@@ -1,0 +1,24 @@
+[package]
+name = "aiondb-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-extension = { path = "../aiondb-extension" }
+aiondb-parser = { path = "../aiondb-parser" }
+aiondb-plan = { path = "../aiondb-plan" }
+aiondb-vector = { path = "../aiondb-vector" }
+base64.workspace = true
+getrandom.workspace = true
+md-5.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true

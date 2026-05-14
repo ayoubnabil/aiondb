@@ -1,0 +1,3 @@
+:START_ID,:END_ID,:TYPE,since:int,weight:float
+1,2,KNOWS,2020,0.8
+2,3,WORKS_AT,2021,1.0

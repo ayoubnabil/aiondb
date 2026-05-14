@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiondb-config
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+data:
+  AIONDB_STORAGE_BACKEND: durable
+  AIONDB_STORAGE_DATA_DIR: /var/lib/aiondb/data
+  AIONDB_PGWIRE_LISTEN_ADDR: 0.0.0.0:5432
+  AIONDB_OBSERVABILITY_BIND: 0.0.0.0
+  AIONDB_OBSERVABILITY_PORT: "9187"
+  AIONDB_STORAGE_DURABLE_WAL_COMMIT_POLICY: always
+  AIONDB_ALLOW_UNENCRYPTED_STORAGE: "true"
+  AIONDB_PGWIRE_TLS_MODE: disable
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aiondb-bootstrap
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+type: Opaque
+stringData:
+  AIONDB_BOOTSTRAP_USER: dev
+  AIONDB_BOOTSTRAP_PASSWORD: CHANGE_ME_BEFORE_EVALUATION
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiondb
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+  ports:
+    - name: pgwire
+      port: 5432
+      targetPort: pgwire
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiondb
+  labels:
+    app.kubernetes.io/name: aiondb
+    app.kubernetes.io/component: database
+spec:
+  serviceName: aiondb
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aiondb
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aiondb
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: aiondb
+          image: ghcr.io/ayoubnabil/aiondb:main
+          imagePullPolicy: Always
+          args:
+            - --data-dir
+            - /var/lib/aiondb/data
+            - --storage-backend
+            - durable
+          envFrom:
+            - configMapRef:
+                name: aiondb-config
+            - secretRef:
+                name: aiondb-bootstrap
+          ports:
+            - name: pgwire
+              containerPort: 5432
+            - name: observability
+              containerPort: 9187
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: observability
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: observability
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/aiondb/data
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: aiondb
+          app.kubernetes.io/component: database
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

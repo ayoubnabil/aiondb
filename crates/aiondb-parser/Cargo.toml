@@ -1,0 +1,12 @@
+[package]
+name = "aiondb-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+
+[lints]
+workspace = true

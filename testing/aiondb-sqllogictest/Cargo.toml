@@ -1,0 +1,20 @@
+[package]
+name = "aiondb-sqllogictest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "aiondb-slt"
+path = "src/main.rs"
+
+[dependencies]
+aiondb-embedded = { path = "../../crates/aiondb-embedded" }
+aiondb-engine = { path = "../../crates/aiondb-engine" }
+aiondb-tx = { path = "../../crates/aiondb-tx" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+sqllogictest = "0.24"
+
+[lints]
+workspace = true

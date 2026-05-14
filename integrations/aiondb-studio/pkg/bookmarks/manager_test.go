@@ -1,0 +1,162 @@
+package bookmarks
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestManagerList(t *testing.T) {
+	examples := []struct {
+		dir string
+		num int
+		err string
+	}{
+		{"../../data", 4, ""},
+		{"../../data/bookmark.toml", 0, "is not a directory"},
+		{"../../data2", 0, ""},
+		{"", 0, ""},
+	}
+
+	for _, ex := range examples {
+		t.Run(ex.dir, func(t *testing.T) {
+			bookmarks, err := NewManager(ex.dir).List()
+			if ex.err != "" {
+				assert.Contains(t, err.Error(), ex.err)
+			}
+			assert.Len(t, bookmarks, ex.num)
+		})
+	}
+}
+
+func TestManagerListIDs(t *testing.T) {
+	ids, err := NewManager("../../data").ListIDs()
+	assert.NoError(t, err)
+	assert.Equal(t, []string{
+		"bookmark",
+		"bookmark_invalid_ssl",
+		"bookmark_url",
+		"bookmark_with_ssh",
+	}, ids)
+}
+
+func TestManagerListRejectsTooManyBookmarkFiles(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i <= maxBookmarkFiles; i++ {
+		path := filepath.Join(dir, "bookmark_"+strconv.Itoa(i)+".toml")
+		assert.NoError(t, os.WriteFile(path, []byte(`host = "localhost"`), 0o600))
+	}
+
+	bookmarks, err := NewManager(dir).List()
+
+	assert.Nil(t, bookmarks)
+	assert.EqualError(t, err, "bookmarks directory exceeds maximum file count of 1000")
+}
+
+func TestBookmarkTotalWouldExceed(t *testing.T) {
+	assert.False(t, bookmarkTotalWouldExceed(0, 10, 100))
+	assert.True(t, bookmarkTotalWouldExceed(95, 10, 100))
+	assert.True(t, bookmarkTotalWouldExceed(0, 101, 100))
+}
+
+func TestManagerGet(t *testing.T) {
+	manager := NewManager("../../data")
+
+	b, err := manager.Get("bookmark")
+	assert.NoError(t, err)
+	assert.Equal(t, "bookmark", b.ID)
+
+	b, err = manager.Get("foo")
+	assert.Equal(t, "bookmark foo not found", err.Error())
+	assert.Nil(t, b)
+}
+
+func Test_fileBasename(t *testing.T) {
+	assert.Equal(t, "filename", fileBasename("filename.toml"))
+	assert.Equal(t, "filename", fileBasename("path/filename.toml"))
+	assert.Equal(t, "filename", fileBasename("~/long/path/filename.toml"))
+	assert.Equal(t, "filename", fileBasename("filename"))
+}
+
+func Test_readBookmark(t *testing.T) {
+	t.Run("good", func(t *testing.T) {
+		b, err := readBookmark("../../data/bookmark.toml")
+		assert.NoError(t, err)
+		assert.Equal(t, "bookmark", b.ID)
+		assert.Equal(t, "localhost", b.Host)
+		assert.Equal(t, 5432, b.Port)
+		assert.Equal(t, "postgres", b.User)
+		assert.Equal(t, "mydatabase", b.Database)
+		assert.Equal(t, "disable", b.SSLMode)
+		assert.Equal(t, "", b.Password)
+		assert.Equal(t, "", b.URL)
+	})
+
+	t.Run("with url", func(t *testing.T) {
+		b, err := readBookmark("../../data/bookmark_url.toml")
+		assert.NoError(t, err)
+		assert.Equal(t, "postgres://username:password@host:port/database?sslmode=disable", b.URL)
+		assert.Equal(t, "", b.Host)
+		assert.Equal(t, 5432, b.Port)
+		assert.Equal(t, "", b.User)
+		assert.Equal(t, "", b.Database)
+		assert.Equal(t, "disable", b.SSLMode)
+		assert.Equal(t, "", b.Password)
+	})
+
+	t.Run("with ssh options", func(t *testing.T) {
+		b, err := readBookmark("../../data/bookmark_with_ssh.toml")
+		assert.NoError(t, err)
+		assert.NotNil(t, b.SSH)
+
+		sshc := b.SSH
+		assert.Equal(t, "ssh-host", sshc.Host)
+		assert.Equal(t, "ssh-user", sshc.User)
+		assert.Equal(t, "ssh-password", sshc.Password)
+		assert.Equal(t, "/path/to/key-file", sshc.Key)
+		assert.Equal(t, "key-file-password", sshc.KeyPassword)
+	})
+
+	t.Run("invalid ssl", func(t *testing.T) {
+		b, err := readBookmark("../../data/bookmark_invalid_ssl.toml")
+		assert.NoError(t, err)
+		assert.Equal(t, "disable", b.SSLMode)
+	})
+
+	t.Run("invalid file", func(t *testing.T) {
+		_, err := readBookmark("foobar")
+		assert.Equal(t, "bookmark file foobar does not exist", err.Error())
+	})
+
+	t.Run("invalid syntax", func(t *testing.T) {
+		_, err := readBookmark("../../data/invalid.toml")
+		assert.Equal(t, "toml: line 1: expected '.' or '=', but got 'e' instead", err.Error())
+	})
+
+	t.Run("oversized file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "large.toml")
+		assert.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", 1024*1024+1)), 0o600))
+
+		_, err := readBookmark(path)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "bookmark file exceeds maximum size")
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		root := t.TempDir()
+		outsidePath := filepath.Join(root, "outside.toml")
+		linkPath := filepath.Join(root, "link.toml")
+		assert.NoError(t, os.WriteFile(outsidePath, []byte(`host = "localhost"`), 0o600))
+		assert.NoError(t, os.Symlink(outsidePath, linkPath))
+
+		_, err := readBookmark(linkPath)
+		if !assert.Error(t, err) {
+			return
+		}
+		assert.Contains(t, err.Error(), "regular file")
+	})
+}

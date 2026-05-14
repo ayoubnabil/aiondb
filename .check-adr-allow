@@ -1,0 +1,26 @@
+# Baseline ADR gate exceptions.
+# Format: <check>:<violation text>
+
+ignores:crates/aiondb-engine/src/engine_tests/join_perf_bench.rs:24 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/join_perf_bench.rs:24 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/insert_perf_bench.rs:50 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/insert_perf_bench.rs:50 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/select_perf_bench.rs:43 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/select_perf_bench.rs:43 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/select_perf_bench.rs:654 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/select_perf_bench.rs:654 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/graph_perf_bench.rs:63 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/graph_perf_bench.rs:63 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/update_perf_bench.rs:41 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/update_perf_bench.rs:41 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:334 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:334 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:377 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:377 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:441 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:441 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:487 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:487 missing `target:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:542 missing `tracked:`
+ignores:crates/aiondb-engine/src/engine_tests/dos_audit.rs:542 missing `target:`
+internal-execute-sql:crates/aiondb-engine/src/engine/query_api.rs:2621 <Self as QueryEngine>::execute_sql(self, session, sql)

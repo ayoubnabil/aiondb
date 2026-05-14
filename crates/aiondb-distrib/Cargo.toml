@@ -1,0 +1,25 @@
+[package]
+name = "aiondb-distrib"
+description = "Umbrella crate that re-exports AionDB's distributed-systems primitives"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aiondb-admission = { path = "../aiondb-admission" }
+aiondb-cluster = { path = "../aiondb-cluster" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-ha = { path = "../aiondb-ha" }
+aiondb-replication = { path = "../aiondb-replication" }
+aiondb-shard = { path = "../aiondb-shard" }
+aiondb-tx = { path = "../aiondb-tx" }
+
+[dev-dependencies]
+async-trait = "0.1"
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }

@@ -1,0 +1,17 @@
+[package]
+name = "aiondb-update-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+lto = false
+codegen-units = 16
+opt-level = 3
+debug = false
+
+[dependencies]
+anyhow = "1"
+aiondb-embedded = { path = "../../crates/aiondb-embedded" }

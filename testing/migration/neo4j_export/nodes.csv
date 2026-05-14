@@ -1,0 +1,4 @@
+:ID,:LABEL,name,age:int,active:boolean
+1,Person,Alice,42,true
+2,Person;Admin,Bob,35,false
+3,Company,Acme,12,true

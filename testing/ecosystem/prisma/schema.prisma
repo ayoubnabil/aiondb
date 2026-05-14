@@ -1,0 +1,29 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique @db.VarChar(255)
+  name      String   @db.VarChar(120)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  posts     Post[]
+
+  @@map("xtask_prisma_users")
+}
+
+model Post {
+  id        Int     @id @default(autoincrement())
+  slug      String  @unique @db.VarChar(80)
+  title     String  @db.VarChar(140)
+  published Boolean @default(false)
+  userId    Int     @map("user_id")
+  user      User    @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([userId, title], map: "xtask_prisma_posts_user_title_uniq")
+  @@map("xtask_prisma_posts")
+}

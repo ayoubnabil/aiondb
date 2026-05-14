@@ -1,0 +1,14 @@
+[package]
+name = "aiondb-storage-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-tx = { path = "../aiondb-tx" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

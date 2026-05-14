@@ -1,0 +1,15 @@
+[package]
+name = "aiondb-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+getrandom.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

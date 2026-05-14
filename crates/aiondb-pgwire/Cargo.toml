@@ -1,0 +1,34 @@
+[package]
+name = "aiondb-pgwire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-cluster = { path = "../aiondb-cluster" }
+aiondb-config = { path = "../aiondb-config" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-eval = { path = "../aiondb-eval" }
+aiondb-engine = { path = "../aiondb-engine" }
+aiondb-parser = { path = "../aiondb-parser" }
+aiondb-replication = { path = "../aiondb-replication" }
+aiondb-security = { path = "../aiondb-security" }
+aiondb-wal = { path = "../aiondb-wal" }
+base64.workspace = true
+bytes.workspace = true
+getrandom.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hmac.workspace = true
+pbkdf2.workspace = true
+
+[lints]
+workspace = true

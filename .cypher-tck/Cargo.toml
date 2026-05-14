@@ -1,0 +1,19 @@
+[package]
+name = "cypher-tck-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "cypher-tck"
+path = "src/main.rs"
+
+[dependencies]
+aiondb-core = { path = "../crates/aiondb-core" }
+aiondb-config = { path = "../crates/aiondb-config" }
+aiondb-engine = { path = "../crates/aiondb-engine" }
+aiondb-catalog-store = { path = "../crates/aiondb-catalog-store" }
+aiondb-storage-engine = { path = "../crates/aiondb-storage-engine" }
+
+regex = "1"
+serde_json = "1"

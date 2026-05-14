@@ -1,0 +1,18 @@
+[package]
+name = "aiondb-admission"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AionDB Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Login -->
+  <div id="login-screen" class="screen">
+    <div class="login-box">
+      <div class="login-header">AionDB</div>
+      <form id="login-form" autocomplete="off">
+        <table class="form-table">
+          <tr>
+            <td class="form-label">Username</td>
+            <td><input type="text" id="login-user" name="username" required autofocus></td>
+          </tr>
+          <tr>
+            <td class="form-label">Password</td>
+            <td><input type="password" id="login-pass" name="password"></td>
+          </tr>
+          <tr>
+            <td class="form-label">Database</td>
+            <td><input type="text" id="login-db" name="database" value="aiondb"></td>
+          </tr>
+          <tr>
+            <td></td>
+            <td><button type="submit" class="btn btn-primary" id="login-btn">Connect</button></td>
+          </tr>
+        </table>
+        <div id="login-error" class="error-msg" hidden></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <div id="dashboard-screen" class="screen" hidden>
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <strong class="brand">AionDB</strong>
+        <span class="toolbar-sep"></span>
+        <button class="tab-btn active" data-tab="query">SQL Editor</button>
+        <button class="tab-btn" data-tab="graph">Graph</button>
+        <button class="tab-btn" data-tab="schema">Schema</button>
+        <button class="tab-btn" data-tab="metrics">Metrics</button>
+        <button class="tab-btn" data-tab="tools">pgAdmin</button>
+      </div>
+      <div class="toolbar-right">
+        <span id="session-info" class="session-info"></span>
+        <button id="logout-btn" class="btn btn-sm">Disconnect</button>
+      </div>
+    </div>
+
+    <!-- SQL Editor -->
+    <div id="tab-query" class="tab-pane active">
+      <div class="editor-toolbar">
+        <div class="segmented-control" role="group" aria-label="Query language">
+          <button class="seg-btn active" id="mode-sql" data-mode="sql" type="button">SQL</button>
+          <button class="seg-btn" id="mode-cypher" data-mode="cypher" type="button">Cypher</button>
+        </div>
+        <select id="snippet-select" class="input-sm snippet-select" aria-label="Insert snippet">
+          <option value="">Snippets</option>
+          <option value="sql-basic">SQL table + query</option>
+          <option value="cypher-match">Cypher MATCH</option>
+          <option value="graph-model">Graph labels</option>
+          <option value="hybrid-vector">Hybrid vector + graph</option>
+        </select>
+        <button id="run-query" class="btn btn-primary btn-sm">&#9654; Execute</button>
+        <button id="preview-graph" class="btn btn-sm">Preview Graph</button>
+        <button id="clear-editor" class="btn btn-sm">Clear</button>
+        <button id="history-toggle" class="btn btn-sm">History</button>
+        <span class="toolbar-spacer"></span>
+        <span id="query-status" class="status-text"></span>
+      </div>
+      <div class="split-pane" id="split-pane">
+        <div class="editor-panel" id="editor-panel">
+          <div class="editor-wrap">
+            <div class="line-gutter" id="line-gutter"></div>
+            <div class="editor-inner">
+              <pre class="highlight-layer" id="highlight-layer"><code id="highlight-code"></code></pre>
+              <textarea id="sql-editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" wrap="off"></textarea>
+            </div>
+          </div>
+        </div>
+        <div class="resize-bar" id="resize-bar"></div>
+        <div class="results-panel" id="results-panel">
+          <div id="results-container" class="results-container">
+            <div class="placeholder-text">Execute a query to see results here.</div>
+          </div>
+        </div>
+      </div>
+      <!-- History -->
+      <div id="history-panel" class="history-panel" hidden>
+        <div class="history-header">
+          <strong>Query History</strong>
+          <button id="history-close" class="btn btn-sm">Close</button>
+        </div>
+        <div class="history-list" id="history-list"></div>
+      </div>
+    </div>
+
+    <!-- Graph -->
+    <div id="tab-graph" class="tab-pane" hidden>
+      <div class="graph-layout">
+        <div class="graph-side">
+          <div class="panel-hd">Graph Workspace</div>
+          <button id="graph-run-current" class="btn btn-primary btn-sm wide-btn">Run editor and draw</button>
+          <button id="graph-draw-last" class="btn btn-sm wide-btn">Draw last result</button>
+          <button id="graph-fit" class="btn btn-sm wide-btn">Fit</button>
+          <div class="graph-stat-grid">
+            <div><span id="graph-node-count">0</span><small>Nodes</small></div>
+            <div><span id="graph-edge-count">0</span><small>Edges</small></div>
+          </div>
+          <div class="graph-help">
+            Expected columns: <code>source_id</code>/<code>target_id</code>, <code>from</code>/<code>to</code>, or two returned node fields.
+          </div>
+          <div class="panel-hd mt">Cypher Starter</div>
+          <button class="snippet-btn" data-snippet="cypher-match" type="button">MATCH labeled edge</button>
+          <button class="snippet-btn" data-snippet="graph-model" type="button">Create node/edge labels</button>
+          <button class="snippet-btn" data-snippet="hybrid-vector" type="button">Hybrid search</button>
+        </div>
+        <div class="graph-main">
+          <div class="graph-toolbar">
+            <span id="graph-status">No graph loaded</span>
+          </div>
+          <canvas id="graph-canvas"></canvas>
+        </div>
+        <div class="graph-inspector" id="graph-inspector">
+          <div class="panel-hd">Inspector</div>
+          <div class="placeholder-text">Select a node or edge.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Schema -->
+    <div id="tab-schema" class="tab-pane" hidden>
+      <div class="schema-layout">
+        <div class="schema-tree-panel">
+          <div class="schema-tree-header">
+            <select id="schema-select" class="input-sm">
+              <option value="public">public</option>
+            </select>
+            <button id="refresh-schema" class="btn btn-sm">Refresh</button>
+          </div>
+          <div class="schema-tree" id="schema-tree"></div>
+        </div>
+        <div class="schema-detail" id="schema-detail">
+          <div class="placeholder-text">Select an object from the tree.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Metrics -->
+    <div id="tab-metrics" class="tab-pane" hidden>
+      <div class="metrics-content">
+        <table class="metrics-table" id="metrics-table">
+          <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+          <tbody id="metrics-tbody"></tbody>
+        </table>
+        <div class="chart-area">
+          <div class="chart-title">Queries per second</div>
+          <canvas id="metrics-canvas" width="800" height="250"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- pgAdmin -->
+    <div id="tab-tools" class="tab-pane" hidden>
+      <div class="tools-layout">
+        <div class="tools-panel">
+          <h3>pgAdmin 4 over AionDB pgwire</h3>
+          <p class="tools-lead">
+            Use pgAdmin as the real product dashboard. Keep this embedded page for AionDB-specific Cypher snippets, graph preview and engine diagnostics.
+          </p>
+          <div class="connection-grid">
+            <label>Host <input id="tool-host" value="127.0.0.1"></label>
+            <label>Port <input id="tool-port" value="5432"></label>
+            <label>Database <input id="tool-db" value="default"></label>
+            <label>User <input id="tool-user" value="dev"></label>
+          </div>
+          <div class="conn-string-row">
+            <code id="tool-conn-string"></code>
+            <button id="copy-conn" class="btn btn-sm" type="button">Copy</button>
+          </div>
+        </div>
+        <div class="tool-grid">
+          <div class="tool-card">
+            <h4>Start pgAdmin profile</h4>
+            <p>Run <code>make dashboard-pgadmin</code>. The compose profile imports <code>integrations/pgadmin/servers.json</code> and connects to AionDB over pgwire.</p>
+          </div>
+          <div class="tool-card">
+            <h4>Use pgAdmin Query Tool</h4>
+            <p>Run SQL and AionDB Cypher text through the same pgwire connection. Generic dashboards do not need a custom binary protocol.</p>
+          </div>
+          <div class="tool-card">
+            <h4>AionDB extension layer</h4>
+            <p>Use this embedded dashboard for Cypher starters, graph preview, vector/graph examples and AionDB capability metadata.</p>
+          </div>
+          <div class="tool-card">
+            <h4>Next integration point</h4>
+            <p>Fork or extend pgAdmin with AionDB snippets, Cypher highlighting and graph rendering once the pgwire admin path is the default.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Statusbar -->
+    <div class="statusbar" id="statusbar">
+      <span id="status-conn" class="status-item">Connected</span>
+      <span class="status-sep">|</span>
+      <span id="status-db" class="status-item"></span>
+      <span class="status-sep">|</span>
+      <span id="status-support" class="status-item" title=""></span>
+      <span class="status-spacer"></span>
+      <span id="status-rows" class="status-item"></span>
+      <span class="status-sep" id="status-sep-time" hidden>|</span>
+      <span id="status-time" class="status-item"></span>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

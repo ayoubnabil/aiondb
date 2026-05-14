@@ -1,0 +1,25 @@
+[package]
+name = "aiondb-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-ha = { path = "../aiondb-ha" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+aiondb-admission = { path = "../aiondb-admission" }
+aiondb-ha = { path = "../aiondb-ha" }
+aiondb-shard = { path = "../aiondb-shard" }
+aiondb-tx = { path = "../aiondb-tx" }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util", "net", "io-util"] }
+
+[lints]
+workspace = true

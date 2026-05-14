@@ -1,0 +1,170 @@
+# AionDB git hygiene
+#
+# Keep source, docs, config templates, CI, and reproducible project metadata.
+# Exclude local secrets, generated outputs, downloaded fixtures, caches, and
+# runtime data that must not be pushed.
+
+# Rust / Cargo build outputs
+/target/
+**/target/
+*.rlib
+*.rmeta
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Keep project Cargo config when present
+!.cargo/
+!.cargo/config.toml
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.crt
+*.csr
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+secrets/
+.secrets/
+
+# Database/runtime state
+/data/
+/db/
+/var/
+/state/
+/storage/
+/backups/
+**/backups/
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.pid
+*.sock
+*.wal
+*.sst
+*.tbl
+*.dump
+*.backup
+
+# Generated documentation/site output
+/docs/_site/
+/docs/dist/
+/docs/build/
+/site/
+/public/
+
+# Downloaded compatibility fixtures and generated test output
+# Keep only the runner crate; fixtures fetched via scripts/fetch-pg-regress.sh
+/.pg-regress/*
+!/.pg-regress/sqllogictest/
+/.pg-regress/sqllogictest/*
+!/.pg-regress/sqllogictest/select4.test
+!/.pg-regress/Cargo.toml
+!/.pg-regress/Cargo.lock
+!/.pg-regress/src/
+!/.pg-regress/policy/
+!/.pg-regress/run_all_safe.sh
+!/.pg-regress/run_with_progress.sh
+/.cypher-tck/
+/testing/tmp/
+/testing/output/
+/testing/results/
+**/results/
+**/*.out
+**/*.diffs
+
+# Benchmarks: keep benchmark source, ignore local data/results/tools
+/benchmarks/.state/
+/benchmarks/.data/
+/benchmarks/.tools/
+/benchmarks/**/target/
+/benchmarks/**/*.log
+/benchmarks/**/*.csv
+/benchmarks/**/*.tsv
+/benchmarks/**/*.jsonl
+/benchmarks/**/*.parquet
+/benchmarks/**/*.tgz
+/benchmarks/**/*.tar
+/benchmarks/**/*.tar.gz
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+env/
+
+# Node / frontend caches
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.pnpm-store/
+.next/
+.nuxt/
+.svelte-kit/
+dist/
+build/
+coverage/
+
+# Local tooling and assistant state
+/.agents/
+/.codex/
+/.claude/
+/.codex-*.png
+/.codex-site-*.png
+/.aider*
+.cursor/
+.idea/
+.vscode/
+
+# Local scratch artifacts and reports
+/tmp/
+/scratch/
+/history.txt
+/API_REPORT_*.md
+/DEDUP_REPORT_*.md
+/SECURITY_FINDINGS_*.md
+/benchmark-*.png
+/pg_regress_runs/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# Logs
+*.log
+logs/
+
+# Audit, PoCs, local txt notes
+/audit/
+**/poc/
+**/findings/
+*.txt
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

@@ -1,0 +1,23 @@
+[package]
+name = "aiondb-fragment-transport"
+description = "Remote fragment execution transport for distributed AionDB queries"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-plan = { path = "../aiondb-plan" }
+aiondb-executor = { path = "../aiondb-executor" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rustls = { workspace = true }
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+subtle.workspace = true
+
+[lints]
+workspace = true

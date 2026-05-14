@@ -1,0 +1,52 @@
+services:
+  aiondb:
+    image: ${AIONDB_IMAGE:-ghcr.io/ayoubnabil/aiondb:main}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AIONDB_PGWIRE_PORT:-5432}:5432"
+    environment:
+      # No default fallbacks: compose fails closed if these are unset.
+      # Copy .env.example to .env and fill in your own values.
+      AIONDB_BOOTSTRAP_USER: ${AIONDB_BOOTSTRAP_USER:?Set AIONDB_BOOTSTRAP_USER in .env}
+      AIONDB_BOOTSTRAP_PASSWORD: ${AIONDB_BOOTSTRAP_PASSWORD:?Set AIONDB_BOOTSTRAP_PASSWORD in .env}
+      AIONDB_ALLOW_UNENCRYPTED_STORAGE: "true"
+      AIONDB_STORAGE_BACKEND: durable
+      AIONDB_PGWIRE_TLS_MODE: disable
+      AIONDB_ALLOW_PLAINTEXT_PUBLIC: "1"
+    volumes:
+      - aiondb-data:/var/lib/aiondb/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9187/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  aiondb-studio:
+    profiles:
+      - studio
+    image: ${AIONDB_STUDIO_IMAGE:-ghcr.io/ayoubnabil/aiondb-studio:main}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AIONDB_STUDIO_PORT:-8082}:8081"
+    environment:
+      AIONDB_STUDIO_DATABASE_URL: ${AIONDB_STUDIO_DATABASE_URL:?Set AIONDB_STUDIO_DATABASE_URL in .env to postgres://<user>:<password>@aiondb:5432/default?sslmode=disable}
+    command:
+      - "--lock-session"
+      - "--open-retry=30"
+      - "--open-retry-delay=1"
+      - "--no-ssh"
+      - "--query-timeout=60"
+      - "--queries-dir=/opt/aiondb-studio/queries"
+    depends_on:
+      aiondb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  aiondb-data:

@@ -1,0 +1,256 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  hygiene:
+    name: Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - run: python3 scripts/check_github_actions_pins.py
+      - run: python3 scripts/validate_container_profile.py
+      - run: docker compose --env-file .env.example config >/dev/null
+      - run: docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.build.yml config >/dev/null
+
+  xtask-gates:
+    name: Xtask Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo run --locked -q -p xtask -- workspace-lints
+      - run: cargo run --locked -q -p xtask -- file-limits
+      - run: cargo run --locked -q -p xtask -- runtime-crash-lints
+      - run: cargo run --locked -q -p xtask -- storage-upgrade-matrix
+
+  adr-gates:
+    name: ADR Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      # ADR-0003: pas de nouveau CommandNoOp sans RFC
+      - run: cargo run --locked -q -p xtask -- check-noops
+      # Stop compat-layer growth: any new `try_execute_compat_*` or any
+      # growth of `COMPAT_TAG_MATRIX` beyond the 27/55 baseline demands an
+      # ADR explaining why. See `xtask/src/check_compat_hooks.rs`.
+      - run: cargo run --locked -q -p xtask -- check-compat-hooks
+      # ADR-0001/0004/0005/0006/0007/0009/0010/0011/0012: 9 lints structurels
+      - run: cargo run --locked -q -p xtask -- check-adr
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo check --locked --workspace --all-targets
+
+  test-workspace:
+    name: Test (Workspace sans engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AIONDB_PERF_BUDGET_MULTIPLIER: "2"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo test --locked --workspace --tests --exclude aiondb-engine
+
+  test-engine:
+    name: Test (Engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AIONDB_PERF_BUDGET_MULTIPLIER: "2"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo test --locked -p aiondb-engine --tests
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  doc:
+    name: Doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - run: cargo doc --locked --workspace --no-deps
+
+  product-surface:
+    name: Product Surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Run product smoke gate
+        run: make product-smoke
+      - name: Upload local release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aiondb-local-release-artifacts
+          path: target/release-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Run cargo audit
+        run: cargo audit
+
+  deny:
+    name: License & Supply Chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.0 --locked
+      - name: Run cargo deny
+        run: |
+          cargo deny check advisories -W unmaintained -W yanked -W notice
+          cargo deny check bans licenses sources
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      AIONDB_PERF_BUDGET_MULTIPLIER: "2"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.5 --locked
+      - name: Select coverage threshold profile
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "AIONDB_COVERAGE_THRESHOLD=25" >> "$GITHUB_ENV"
+          else
+            echo "AIONDB_COVERAGE_THRESHOLD=20" >> "$GITHUB_ENV"
+          fi
+      - name: Generate LCOV report
+        run: ./scripts/coverage.sh --lcov
+      - name: Enforce coverage thresholds
+        run: ./scripts/coverage-check.sh --threshold "$AIONDB_COVERAGE_THRESHOLD"
+
+  compat-smoke:
+    name: Compatibility Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Run pg-regress smoke gate
+        run: cargo run --locked -q --manifest-path .pg-regress/Cargo.toml --bin feature-test
+      - name: Run sqllogictest smoke gate
+        env:
+          AIONDB_SLT_JOBS: "1"
+        run: cargo run --locked -q -p aiondb-sqllogictest -- --engine aiondb --strict --filter repro_join71 --limit 1 testing/aiondb-sqllogictest/slt
+
+  ecosystem-compat:
+    name: Ecosystem Compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Install ecosystem dependencies
+        run: |
+          python3 -m pip install "psycopg==3.3.3" "sqlalchemy==2.0.48"
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          mkdir -p target/compat/node-tools
+          npm init -y --prefix target/compat/node-tools
+          npm install --prefix target/compat/node-tools --save-exact "pg@8.20.0" "prisma@7.6.0"
+          echo "NODE_PATH=$GITHUB_WORKSPACE/target/compat/node-tools/node_modules" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/target/compat/node-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Run ecosystem compatibility matrix
+        run: cargo run --locked -q -p xtask -- ecosystem-compat --strict --report target/compat/ecosystem-compat.ci.json
+
+  cypher-tck:
+    name: Cypher TCK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@bd41891a8e7f4b8649f6d684415e1a6155fe4e22 # 1.83.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Select TCK profile
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "AIONDB_TCK_MODE=full" >> "$GITHUB_ENV"
+            echo "AIONDB_TCK_MIN_PASS_RATE=12.0" >> "$GITHUB_ENV"
+          else
+            echo "AIONDB_TCK_MODE=smoke" >> "$GITHUB_ENV"
+            echo "AIONDB_TCK_MIN_PASS_RATE=55.0" >> "$GITHUB_ENV"
+          fi
+      - name: Run Cypher TCK gate
+        run: bash ./scripts/cypher-tck-check.sh --mode "$AIONDB_TCK_MODE" --min-pass-rate "$AIONDB_TCK_MIN_PASS_RATE"

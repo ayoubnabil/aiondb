@@ -1,0 +1,62 @@
+{
+  "missing_suite_lower_bound_rate": 70.0,
+  "max_drop_pp": {
+    "pr": 1.0,
+    "main": 0.5
+  },
+  "overall_rate_min": {
+    "pr": 88.5,
+    "main": 89.0
+  },
+  "p0": {
+    "enforce": false,
+    "warn_if_crash_count_above": 10
+  },
+  "suites": {
+    "psql": {
+      "baseline_rate": 50.7,
+      "pr_floor": 49.0,
+      "main_target": 50.7
+    },
+    "merge": {
+      "baseline_rate": 51.6,
+      "pr_floor": 50.0,
+      "main_target": 51.6
+    },
+    "create_role": {
+      "baseline_rate": 52.6,
+      "pr_floor": 51.0,
+      "main_target": 52.6
+    },
+    "geometry": {
+      "baseline_rate": 58.0,
+      "pr_floor": 56.0,
+      "main_target": 58.0
+    },
+    "object_address": {
+      "baseline_rate": 60.5,
+      "pr_floor": 59.0,
+      "main_target": 60.5
+    },
+    "tablesample": {
+      "baseline_rate": 60.7,
+      "pr_floor": 59.0,
+      "main_target": 60.7
+    },
+    "polymorphism": {
+      "baseline_rate": 62.4,
+      "pr_floor": 61.0,
+      "main_target": 62.4
+    },
+    "privileges": {
+      "baseline_rate": 64.9,
+      "pr_floor": 63.0,
+      "main_target": 64.9
+    },
+    "rowsecurity": {
+      "baseline_rate": 67.0,
+      "pr_floor": 65.0,
+      "main_target": 67.0
+    }
+  }
+}

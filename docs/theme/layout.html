@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }} - aiondb</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400&family=JetBrains+Mono:wght@400&display=swap" />
+  <link rel="icon" media="(prefers-color-scheme: light)" type="image/png" href="/aiondb-logo-light.png" />
+  <link rel="icon" media="(prefers-color-scheme: dark)" type="image/png" href="/aiondb-logo-dark.png" />
+  <link rel="icon" type="image/png" href="/aiondb-logo-light.png" />
+  <link rel="stylesheet" href="/style.css?v=bench-ui-20260512-soft" />
+</head>
+<body>
+  <canvas id="bg-canvas" aria-hidden="true"></canvas>
+  <header class="site-header">
+    <div class="site-header-inner">
+      <a class="brand" href="/">
+        <picture class="brand-mark">
+          <source media="(prefers-color-scheme: dark)" srcset="/aiondb-logo-dark.png" />
+          <img src="/aiondb-logo-light.png" alt="AionDB logo" />
+        </picture>
+        aiondb
+        <span class="brand-tag">v0.1 alpha</span>
+      </a>
+      <nav class="top-nav">
+        {{ top_nav }}
+      </nav>
+    </div>
+  </header>
+
+  <main class="layout {{ body_class }}">
+    {{ sidebar }}
+    <article class="content">
+      {{ content }}
+    </article>
+  </main>
+
+  <footer id="site-footer" class="site-footer">
+    <div class="site-footer-inner">
+      <span>aiondb / sql database in rust</span>
+      <span>busl 1.1</span>
+    </div>
+  </footer>
+  <script src="/bg.js" defer></script>
+  <script src="/nav.js" defer></script>
+  <script src="/copy-code.js" defer></script>
+</body>
+</html>

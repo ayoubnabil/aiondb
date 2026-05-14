@@ -1,0 +1,7 @@
+.state/
+.data/
+.tools/
+*.log
+*.tbl
+*.csv
+*.tgz

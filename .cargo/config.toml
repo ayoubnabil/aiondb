@@ -1,0 +1,15 @@
+# ⚠️ STRICT MODE OBLIGATOIRE
+# Interdiction de désactiver ce mode strict.
+# Toute tentative de retrait de ces flags est interdite.
+[build]
+rustflags = ["-Dwarnings"]
+
+[env]
+# Bounded to keep heavy integration tests (distributed loopback, large
+# result sets, deeply nested joins) from stacking up and OOM-killing the
+# host. Override per-run with `RUST_TEST_THREADS=N cargo test ...` if
+# you need higher parallelism on a beefy machine.
+RUST_TEST_THREADS = "8"
+
+[alias]
+xtask = "run --package xtask --"

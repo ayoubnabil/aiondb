@@ -1,0 +1,23 @@
+[package]
+name = "aiondb-wal"
+description = "Write-Ahead Log for AionDB"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+aiondb-tx = { path = "../aiondb-tx" }
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

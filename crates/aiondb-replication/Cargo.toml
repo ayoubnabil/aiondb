@@ -1,0 +1,31 @@
+[package]
+name = "aiondb-replication"
+description = "WAL streaming replication driver and replay tracker for AionDB"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+aiondb-ha = { path = "../aiondb-ha" }
+aiondb-security = { path = "../aiondb-security" }
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+aiondb-wal = { path = "../aiondb-wal" }
+md-5.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+aiondb-core = { path = "../aiondb-core" }
+md-5.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+[lints]
+workspace = true

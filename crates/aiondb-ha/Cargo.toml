@@ -1,0 +1,23 @@
+[package]
+name = "aiondb-ha"
+description = "High-availability and automatic failover for AionDB"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-core = { path = "../aiondb-core" }
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util", "net", "io-util"] }
+
+[lints]
+workspace = true

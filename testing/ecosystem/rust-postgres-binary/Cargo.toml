@@ -1,0 +1,13 @@
+[package]
+name = "aiondb-rust-postgres-binary-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+postgres = "0.19"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"

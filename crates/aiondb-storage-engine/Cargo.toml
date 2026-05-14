@@ -1,0 +1,23 @@
+[package]
+name = "aiondb-storage-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-buffer-pool = { path = "../aiondb-buffer-pool" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-gpu = { path = "../aiondb-gpu" }
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+aiondb-tx = { path = "../aiondb-tx" }
+aiondb-vector = { path = "../aiondb-vector" }
+aiondb-wal = { path = "../aiondb-wal" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing.workspace = true
+parking_lot = "0.12"
+rayon = { workspace = true }
+
+[lints]
+workspace = true

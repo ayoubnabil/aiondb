@@ -1,0 +1,174 @@
+[workspace]
+members = [
+    "crates/aiondb-core",
+    "crates/aiondb-config",
+    "crates/aiondb-security",
+    "crates/aiondb-auth-audit",
+    "crates/aiondb-tx",
+    "crates/aiondb-parser",
+    "crates/aiondb-plpgsql",
+    "crates/aiondb-catalog",
+    "crates/aiondb-catalog-store",
+    "crates/aiondb-schema-bridge",
+    "crates/aiondb-plan",
+    "crates/aiondb-planner",
+    "crates/aiondb-optimizer",
+    "crates/aiondb-eval",
+    "crates/aiondb-executor",
+    "crates/aiondb-storage-api",
+    "crates/aiondb-vector",
+    "crates/aiondb-graph",
+    "crates/aiondb-storage-engine",
+    "crates/aiondb-extension",
+    "crates/aiondb-api",
+    "crates/aiondb-cluster",
+    "crates/aiondb-pg-compat",
+    "crates/aiondb-pg-syntax",
+    "crates/aiondb-engine",
+    "crates/aiondb-pgwire",
+    "crates/aiondb-wal",
+    "crates/aiondb-replication",
+    "crates/aiondb-ha",
+    "crates/aiondb-shard",
+    "crates/aiondb-admission",
+    "crates/aiondb-distrib",
+    "crates/aiondb-gpu",
+    "crates/aiondb-fragment-transport",
+    "crates/aiondb-buffer-pool",
+    "crates/aiondb-embedded",
+    "crates/aiondb-server",
+    "crates/aiondb-dashboard",
+    "testing/aiondb-test-kit",
+    "testing/aiondb-sqllogictest",
+    "testing/aiondb-integrity",
+    "xtask",
+]
+exclude = [".pg-regress", ".cypher-tck"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+version = "0.1.0"
+license = "BUSL-1.1"
+authors = ["AYOUB NABIL BOUBAGRAT <ayoub4kk@gmail.com>"]
+homepage = "https://aiondb.xyz/"
+
+[workspace.lints.rust]
+# STRICT MODE (MANDATORY)
+# Any compilation attempt that produces warnings must fail.
+warnings = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+unused_imports = "deny"
+dead_code = "deny"
+
+[workspace.lints.clippy]
+# STRICT MODE (MANDATORY)
+# The pedantic level is set to deny to reject every Clippy warning.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Allow common patterns that pedantic flags unnecessarily
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+return_self_not_must_use = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+match_wildcard_for_single_variants = "allow"
+redundant_closure_for_method_calls = "allow"
+items_after_statements = "allow"
+struct_excessive_bools = "allow"
+wildcard_imports = "allow"
+needless_pass_by_value = "allow"
+# Style / test lints that add noise without improving correctness
+unreadable_literal = "allow"
+float_cmp = "allow"
+approx_constant = "allow"
+default_trait_access = "allow"
+match_same_arms = "allow"
+trivially_copy_pass_by_ref = "allow"
+doc_markdown = "allow"
+redundant_else = "allow"
+collapsible_else_if = "allow"
+manual_is_multiple_of = "allow"
+manual_repeat_n = "allow"
+useless_conversion = "allow"
+nonminimal_bool = "allow"
+unnecessary_map_or = "allow"
+map_unwrap_or = "allow"
+elidable_lifetime_names = "allow"
+manual_clamp = "allow"
+manual_midpoint = "allow"
+uninlined_format_args = "allow"
+single_match = "allow"
+missing_fields_in_debug = "allow"
+needless_borrow = "allow"
+only_used_in_recursion = "allow"
+redundant_closure = "allow"
+semicolon_if_nothing_returned = "allow"
+collapsible_match = "allow"
+clone_on_copy = "allow"
+assigning_clones = "allow"
+replace_box = "allow"
+manual_let_else = "allow"
+manual_range_patterns = "allow"
+items_after_test_module = "allow"
+# API design: methods use &self for consistency/future extension
+self_only_used_in_recursion = "allow"
+unused_self = "allow"
+# Common test patterns
+field_reassign_with_default = "allow"
+no_effect_underscore_binding = "allow"
+unnecessary_wraps = "allow"
+format_push_string = "allow"
+type_complexity = "allow"
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bincode = "1"
+bytes = "1"
+getrandom = "0.3"
+half = { version = "2", features = ["std", "serde"] }
+hmac = "0.12"
+lz4_flex = "0.11"
+md-5 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+rayon = "1.10"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+subtle = "2.6"
+time = { version = ">=0.3.47, <0.4", default-features = false, features = ["std", "parsing", "formatting", "large-dates", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net", "io-util", "fs"] }
+tokio-rustls = "0.26"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "set-header", "compression-gzip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
+zeroize = "1.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Profiling-friendly release: same optimization level as `release` but keeps
+# DWARF debug info so `perf record` and `cargo flamegraph` resolve symbols.
+# Use `cargo build --profile=profrel -p aiondb-server`.
+[profile.profrel]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

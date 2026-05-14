@@ -1,0 +1,16 @@
+[package]
+name = "aiondb-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-cluster = { path = "../aiondb-cluster" }
+aiondb-core = { path = "../aiondb-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

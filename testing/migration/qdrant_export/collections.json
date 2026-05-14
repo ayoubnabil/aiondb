@@ -1,0 +1,69 @@
+{
+  "collections": [
+    {
+      "name": "docs",
+      "config": {
+        "params": {
+          "vectors": {
+            "size": 3,
+            "distance": "Cosine"
+          }
+        }
+      },
+      "points": [
+        {
+          "id": 1,
+          "vector": [0.1, 0.2, 0.3],
+          "payload": {
+            "tenant": "alpha",
+            "views": 10,
+            "published": true,
+            "tags": ["pg", "vector"]
+          }
+        },
+        {
+          "id": 2,
+          "vector": [0.4, 0.5, 0.6],
+          "payload": {
+            "tenant": "beta",
+            "views": 25,
+            "published": false,
+            "tags": ["graph"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "images",
+      "config": {
+        "params": {
+          "vectors": {
+            "image": {
+              "size": 4,
+              "distance": "Dot"
+            },
+            "text": {
+              "size": 3,
+              "distance": "Cosine"
+            }
+          }
+        }
+      },
+      "points": [
+        {
+          "id": "img-1",
+          "vector": {
+            "image": [0.1, 0.2, 0.3, 0.4],
+            "text": [0.5, 0.6, 0.7]
+          },
+          "payload": {
+            "tenant": "alpha",
+            "width": 640,
+            "height": 480,
+            "labels": ["screen", "diagram"]
+          }
+        }
+      ]
+    }
+  ]
+}

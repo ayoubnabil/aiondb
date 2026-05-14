@@ -1,0 +1,32 @@
+[package]
+name = "aiondb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "aiondb"
+path = "src/main.rs"
+
+[dependencies]
+aiondb-cluster = { path = "../aiondb-cluster" }
+aiondb-config = { path = "../aiondb-config" }
+aiondb-engine = { path = "../aiondb-engine" }
+aiondb-fragment-transport = { path = "../aiondb-fragment-transport" }
+aiondb-ha = { path = "../aiondb-ha" }
+aiondb-pgwire = { path = "../aiondb-pgwire" }
+aiondb-replication = { path = "../aiondb-replication" }
+aiondb-storage-engine = { path = "../aiondb-storage-engine" }
+aiondb-wal = { path = "../aiondb-wal" }
+axum.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

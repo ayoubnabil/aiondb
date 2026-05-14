@@ -1,0 +1,16 @@
+[package]
+name = "aiondb-optimizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-eval = { path = "../aiondb-eval" }
+aiondb-plan = { path = "../aiondb-plan" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

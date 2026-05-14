@@ -1,0 +1,69 @@
+[package]
+name = "aiondb-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# === Planning pipeline ===
+aiondb-parser = { path = "../aiondb-parser" }
+aiondb-plan = { path = "../aiondb-plan" }
+aiondb-planner = { path = "../aiondb-planner" }
+aiondb-plpgsql = { path = "../aiondb-plpgsql" }
+aiondb-optimizer = { path = "../aiondb-optimizer" }
+
+# === Execution pipeline ===
+aiondb-executor = { path = "../aiondb-executor" }
+aiondb-eval = { path = "../aiondb-eval" }
+
+# === Catalog pipeline ===
+aiondb-catalog = { path = "../aiondb-catalog" }
+aiondb-catalog-store = { path = "../aiondb-catalog-store" }
+aiondb-schema-bridge = { path = "../aiondb-schema-bridge" }
+
+# === Storage pipeline ===
+aiondb-storage-api = { path = "../aiondb-storage-api" }
+aiondb-storage-engine = { path = "../aiondb-storage-engine" }
+aiondb-shard = { path = "../aiondb-shard" }
+aiondb-wal = { path = "../aiondb-wal" }
+
+# === Security ===
+aiondb-auth-audit = { path = "../aiondb-auth-audit" }
+aiondb-security = { path = "../aiondb-security" }
+
+# === High Availability ===
+aiondb-ha = { path = "../aiondb-ha" }
+
+# === GPU Acceleration ===
+aiondb-gpu = { path = "../aiondb-gpu" }
+
+# === Infrastructure ===
+aiondb-config = { path = "../aiondb-config" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-tx = { path = "../aiondb-tx" }
+aiondb-extension = { path = "../aiondb-extension" }
+aiondb-fragment-transport = { path = "../aiondb-fragment-transport" }
+
+# === Cluster-level catalog (ADR-0014) ===
+aiondb-cluster = { path = "../aiondb-cluster" }
+
+# === PG compatibility façade ===
+aiondb-pg-compat = { path = "../aiondb-pg-compat" }
+
+# === Third-party ===
+getrandom.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot = "0.12"
+
+[dev-dependencies]
+time.workspace = true
+
+[lints]
+workspace = true

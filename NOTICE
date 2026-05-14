@@ -1,0 +1,23 @@
+AionDB
+Copyright (c) 2026 AYOUB NABIL BOUBAGRAT.
+
+AionDB core is licensed under:
+
+- Business Source License 1.1 (BUSL-1.1), see LICENSE.
+- Change License: Apache License 2.0, as stated in LICENSE.
+- Commercial license by separate written agreement, see COMMERCIAL-LICENSE.md.
+
+Third-party components keep their original notices and licenses.
+
+AionDB Studio includes code derived from pgweb:
+
+  pgweb
+  Copyright (c) 2014-2026 Sergey Sosedoff
+  License: MIT
+  Upstream: https://github.com/sosedoff/pgweb
+
+See THIRD_PARTY_LICENSES.md and vendored license files for additional
+third-party notices, including:
+
+- `integrations/aiondb-studio/THIRD_PARTY_NOTICES.md`
+- `testing/cypher-tck/NOTICE`

@@ -1,0 +1,17 @@
+[package]
+name = "aiondb-auth-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aiondb-config = { path = "../aiondb-config" }
+aiondb-core = { path = "../aiondb-core" }
+aiondb-security = { path = "../aiondb-security" }
+
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

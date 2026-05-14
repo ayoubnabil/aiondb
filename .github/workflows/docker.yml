@@ -1,0 +1,68 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  docker-image:
+    name: Docker Image (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aiondb
+            context: .
+          - name: aiondb-studio
+            context: ./integrations/aiondb-studio
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Compute image metadata
+        id: meta
+        shell: bash
+        run: |
+          image_repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.name }}"
+          sha_tag="sha-${GITHUB_SHA::12}"
+          tags=("$image_repo:$sha_tag")
+          if [[ "$GITHUB_REF_TYPE" == "branch" && "$GITHUB_REF_NAME" == "main" ]]; then
+            tags+=("$image_repo:main")
+          fi
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build image
+        shell: bash
+        run: |
+          build_args=()
+          while IFS= read -r tag; do
+            build_args+=("-t" "$tag")
+          done <<< "${{ steps.meta.outputs.tags }}"
+          docker build "${build_args[@]}" "${{ matrix.context }}"
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
