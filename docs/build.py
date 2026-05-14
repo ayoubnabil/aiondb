@@ -381,6 +381,10 @@ def build_top_nav(pages: Iterable[Page], current: Page) -> str:
     for _, _, href, label, active in entries:
         cls = "is-active" if active else ""
         items.append(f'<a class="nav-link {cls}" href="{href}">{html.escape(label)}</a>')
+    items.append(
+        '<a class="nav-link" href="https://github.com/ayoubnabil/aiondb" '
+        'target="_blank" rel="noopener noreferrer">GitHub</a>'
+    )
     return "\n".join(items)
 
 
