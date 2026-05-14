@@ -44,6 +44,7 @@ order: 0
 <div class="orm-card"><img src="/orm-sequelize.svg" alt="" /><div><strong>Sequelize</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><img src="/orm-knexdotjs.svg" alt="" /><div><strong>Knex.js</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><img src="/orm-sqlalchemy.svg" alt="" /><div><strong>SQLAlchemy</strong><span>verified ORM</span></div></div>
+<div class="orm-card"><span aria-hidden="true">dj</span><div><strong>Django</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><span aria-hidden="true">{}</span><div><strong>Alembic</strong><span>verified migrations</span></div></div>
 <div class="orm-card"><span aria-hidden="true">psql</span><div><strong>psycopg</strong><span>verified driver</span></div></div>
 <div class="orm-card"><img src="/orm-prisma.svg" alt="" /><div><strong>Prisma</strong><span>verified ORM</span></div></div>
@@ -51,11 +52,12 @@ order: 0
 <div class="orm-card"><img src="/orm-sequelize.svg" alt="" /><div><strong>Sequelize</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><img src="/orm-knexdotjs.svg" alt="" /><div><strong>Knex.js</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><img src="/orm-sqlalchemy.svg" alt="" /><div><strong>SQLAlchemy</strong><span>verified ORM</span></div></div>
+<div class="orm-card"><span aria-hidden="true">dj</span><div><strong>Django</strong><span>verified ORM</span></div></div>
 <div class="orm-card"><span aria-hidden="true">{}</span><div><strong>Alembic</strong><span>verified migrations</span></div></div>
 <div class="orm-card"><span aria-hidden="true">psql</span><div><strong>psycopg</strong><span>verified driver</span></div></div>
 </div>
 </div>
-<p class="orm-note">Django is the only excluded ORM today: its harness catches a NOT NULL migration enforcement gap.</p>
+<p class="orm-note">The official compatibility gate now includes Django migrations, NOT NULL enforcement, composite UNIQUE checks, rollback, and schema introspection.</p>
 </div>
 
 <div class="home-section">

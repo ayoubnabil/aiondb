@@ -23,6 +23,7 @@ Primary harnesses kept on purpose:
 Currently wired directly into `xtask`:
 - `python/psycopg_smoke.py`
 - `python/sqlalchemy_orm_compat.py`
+- `python/django_orm_compat.py`
 - `node/node_postgres_smoke.mjs`
 - `diesel-smoke/src/main.rs`
 - `psql/smoke.sql`

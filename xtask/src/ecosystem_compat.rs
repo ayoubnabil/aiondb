@@ -383,6 +383,11 @@ fn suite_definitions() -> &'static [SuiteDefinition] {
             run: run_sqlalchemy_suite,
         },
         SuiteDefinition {
+            name: "django",
+            description: "Django ORM migrations, introspection, constraints and rollback",
+            run: run_django_suite,
+        },
+        SuiteDefinition {
             name: "node-postgres",
             description: "node-postgres prepared parameters, rollback semantics and introspection",
             run: run_node_postgres_suite,
@@ -650,6 +655,16 @@ fn run_sqlalchemy_suite(ctx: &SuiteContext) -> SuiteRecord {
                 ctx.sqlalchemy_database_url.clone(),
             ),
         ],
+    )
+}
+
+fn run_django_suite(ctx: &SuiteContext) -> SuiteRecord {
+    run_python_json_suite(
+        ctx,
+        "django",
+        &["django", "psycopg"],
+        "testing/ecosystem/python/django_orm_compat.py",
+        &[("DJANGO_DATABASE_URL", ctx.database_url.clone())],
     )
 }
 

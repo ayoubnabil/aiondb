@@ -17,7 +17,6 @@
 //! reason about and easy to test independently of the rest of the
 //! cluster runtime.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::watch;
@@ -231,14 +230,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<JoinHandle<LeaseholderExit>>();
 };
-
-// Force `Arc` import to remain used even after we trim it later; this
-// is the canonical way to hint at a future shared-state field without
-// pulling in dead-code warnings.
-#[allow(dead_code)]
-fn _arc_anchor<T: Send + Sync>() -> Arc<T> {
-    unimplemented!()
-}
 
 #[cfg(test)]
 mod tests {

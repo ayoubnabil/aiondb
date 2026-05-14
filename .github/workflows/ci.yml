@@ -224,7 +224,7 @@ jobs:
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
       - name: Install ecosystem dependencies
         run: |
-          python3 -m pip install "psycopg==3.3.3" "sqlalchemy==2.0.48"
+          python3 -m pip install "Django==6.0.5" "psycopg==3.3.3" "sqlalchemy==2.0.48"
           sudo apt-get update
           sudo apt-get install -y postgresql-client
           mkdir -p target/compat/node-tools
