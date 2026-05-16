@@ -26,6 +26,7 @@ use super::{u32_to_usize, u64_to_f64, usize_to_f64, GraphViewV2Ext};
 
 const DEFAULT_EIGENVECTOR_MAX_ITERATIONS: usize = 100;
 const DEFAULT_EIGENVECTOR_TOLERANCE: f64 = 1e-8;
+const CENTRALITY_PAR_MIN_SOURCES: usize = 4;
 
 /// Default Katz attenuation factor. Must be below `1 / spectral_radius` for
 /// convergence; `0.1` is safe for the vast majority of real graphs.
@@ -36,6 +37,11 @@ pub const DEFAULT_KATZ_BETA: f64 = 1.0;
 #[inline]
 fn u32_to_f64(value: u32) -> f64 {
     f64::from(value)
+}
+
+#[inline]
+fn use_parallel_sources(source_count: usize) -> bool {
+    rayon::current_num_threads() > 1 && source_count >= CENTRALITY_PAR_MIN_SOURCES
 }
 
 struct ClosenessWorkspace {
@@ -141,26 +147,35 @@ pub fn betweenness_centrality<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     // `with_min_len(4)` lets rayon stay on a single worker for very small
     // graphs (where the per-source BFS is cheap and the fan-out would
     // dominate) while still distributing work across cores for big graphs.
-    (0..n_u32)
-        .into_par_iter()
-        .with_min_len(4)
-        .fold(
-            || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
-            |(mut cb, mut workspace), s| {
-                betweenness_from_source(&adjacency, &mut workspace, s, &mut cb);
-                (cb, workspace)
-            },
-        )
-        .reduce(
-            || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
-            |(mut a, workspace), (b, _)| {
-                for (ai, bi) in a.iter_mut().zip(b.iter()) {
-                    *ai += *bi;
-                }
-                (a, workspace)
-            },
-        )
-        .0
+    if use_parallel_sources(n) {
+        (0..n_u32)
+            .into_par_iter()
+            .with_min_len(4)
+            .fold(
+                || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
+                |(mut cb, mut workspace), s| {
+                    betweenness_from_source(&adjacency, &mut workspace, s, &mut cb);
+                    (cb, workspace)
+                },
+            )
+            .reduce(
+                || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
+                |(mut a, workspace), (b, _)| {
+                    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                        *ai += *bi;
+                    }
+                    (a, workspace)
+                },
+            )
+            .0
+    } else {
+        let mut cb = vec![0.0_f64; n];
+        let mut workspace = BetweennessWorkspace::new(n);
+        for s in 0..n_u32 {
+            betweenness_from_source(&adjacency, &mut workspace, s, &mut cb);
+        }
+        cb
+    }
 }
 
 /// Approximate betweenness centrality from a deterministic random sample of
@@ -203,26 +218,35 @@ pub fn betweenness_centrality_sampled<G: GraphViewV2 + ?Sized>(
     perm.truncate(k);
 
     let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.out_neighbors(u)).collect();
-    let cb = (0..k)
-        .into_par_iter()
-        .with_min_len(4)
-        .fold(
-            || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
-            |(mut cb, mut workspace), i| {
-                betweenness_from_source(&adjacency, &mut workspace, perm[i], &mut cb);
-                (cb, workspace)
-            },
-        )
-        .reduce(
-            || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
-            |(mut a, workspace), (b, _)| {
-                for (ai, bi) in a.iter_mut().zip(b.iter()) {
-                    *ai += *bi;
-                }
-                (a, workspace)
-            },
-        )
-        .0;
+    let cb = if use_parallel_sources(k) {
+        (0..k)
+            .into_par_iter()
+            .with_min_len(4)
+            .fold(
+                || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
+                |(mut cb, mut workspace), i| {
+                    betweenness_from_source(&adjacency, &mut workspace, perm[i], &mut cb);
+                    (cb, workspace)
+                },
+            )
+            .reduce(
+                || (vec![0.0_f64; n], BetweennessWorkspace::new(n)),
+                |(mut a, workspace), (b, _)| {
+                    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                        *ai += *bi;
+                    }
+                    (a, workspace)
+                },
+            )
+            .0
+    } else {
+        let mut cb = vec![0.0_f64; n];
+        let mut workspace = BetweennessWorkspace::new(n);
+        for &source in &perm {
+            betweenness_from_source(&adjacency, &mut workspace, source, &mut cb);
+        }
+        cb
+    };
 
     let scale = usize_to_f64(n) / usize_to_f64(k);
     cb.into_iter().map(|x| x * scale).collect()
