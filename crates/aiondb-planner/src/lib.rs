@@ -25,6 +25,7 @@
 )]
 
 pub mod binder;
+mod cypher_procedure;
 pub mod information_schema;
 pub mod logical_builder;
 pub mod pg_catalog;
@@ -767,8 +768,8 @@ impl Planner {
         use aiondb_plan::graph::{
             CypherCreateClause, CypherDeleteClause, CypherDeleteTarget, CypherMatchClause,
             CypherMergeClause, CypherNodePattern, CypherPattern, CypherPipelineOp,
-            CypherPropertyExpr, CypherQueryPlan, CypherRelDirection, CypherRelPattern,
-            CypherSetItem, CypherUnionPlan, CypherUnwindClause, CypherWithClause,
+            CypherProcedureCall, CypherPropertyExpr, CypherQueryPlan, CypherRelDirection,
+            CypherRelPattern, CypherSetItem, CypherUnionPlan, CypherUnwindClause, CypherWithClause,
         };
 
         // Use the standalone type_check_expression for Cypher expressions.
@@ -1070,8 +1071,24 @@ impl Planner {
                 }
                 binder::BoundCypherClauseRef::Call(idx) => {
                     let call = take_clause(&mut bound_calls, idx, "CALL")?;
-                    let subquery = self.build_cypher_plan(*call.query, txn_id)?;
-                    pipeline.push(CypherPipelineOp::CallSubquery(Box::new(subquery)));
+                    match call {
+                        binder::BoundCypherCall::Subquery(call) => {
+                            let subquery = self.build_cypher_plan(*call.query, txn_id)?;
+                            pipeline.push(CypherPipelineOp::CallSubquery(Box::new(subquery)));
+                        }
+                        binder::BoundCypherCall::Procedure(call) => {
+                            let args = call
+                                .args
+                                .iter()
+                                .map(tc_expr)
+                                .collect::<DbResult<Vec<_>>>()?;
+                            pipeline.push(CypherPipelineOp::ProcedureCall(CypherProcedureCall {
+                                procedure: call.procedure,
+                                args,
+                                yields: call.yields,
+                            }));
+                        }
+                    }
                 }
             }
         }

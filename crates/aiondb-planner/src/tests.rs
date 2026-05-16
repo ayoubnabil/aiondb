@@ -1253,21 +1253,221 @@ fn cypher_call_is_rejected_in_native_pipeline() {
 }
 
 #[test]
-fn cypher_foreach_is_rejected_in_native_pipeline() {
+fn cypher_graph_algorithm_call_is_planned_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "CALL graph.pageRank() YIELD nodeId, score RETURN nodeId, score",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::ProcedureCall(call)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected graph procedure call in Cypher pipeline");
+            };
+            assert_eq!(call.procedure, "graph.pageRank");
+            assert!(call.args.is_empty());
+            assert_eq!(call.yields, vec!["nodeId", "score"]);
+            assert_eq!(plan.returns.len(), 2);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_graph_algorithm_call_defaults_to_registry_yields() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan =
+        plan_with_catalog("CALL graph.pageRank() RETURN nodeId, score", &planner).expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::ProcedureCall(call)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected graph procedure call in Cypher pipeline");
+            };
+            assert_eq!(call.procedure, "graph.pageRank");
+            assert_eq!(call.yields, vec!["nodeId", "score"]);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_graph_algorithm_call_rejects_unknown_yield() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let error = plan_with_catalog(
+        "CALL graph.pageRank() YIELD missingColumn RETURN missingColumn",
+        &planner,
+    )
+    .expect_err("error");
+
+    assert_eq!(error.sqlstate(), SqlState::SyntaxError);
+    assert!(error.to_string().contains("cannot YIELD `missingColumn`"));
+}
+
+#[test]
+fn cypher_graph_algorithm_call_rejects_args_not_declared_by_registry() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let error = plan_with_catalog(
+        "CALL graph.degreeCentrality(1) YIELD nodeId, score RETURN nodeId, score",
+        &planner,
+    )
+    .expect_err("error");
+
+    assert_eq!(error.sqlstate(), SqlState::SyntaxError);
+    assert!(
+        error
+            .to_string()
+            .contains("CALL graph.degreeCentrality does not accept algorithm config arguments"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn cypher_graph_pair_algorithm_call_is_planned_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "CALL graph.nodeSimilarity(1, 'jaccard') YIELD node1Id, node2Id, score RETURN node1Id, node2Id, score",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::ProcedureCall(call)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected graph procedure call in Cypher pipeline");
+            };
+            assert_eq!(call.procedure, "graph.nodeSimilarity");
+            assert_eq!(call.args.len(), 2);
+            assert_eq!(call.yields, vec!["node1Id", "node2Id", "score"]);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_graph_path_algorithm_call_is_planned_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "CALL graph.shortestPath(1, 2) YIELD sourceNodeId, targetNodeId, distance, path RETURN sourceNodeId, targetNodeId, distance, path",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::ProcedureCall(call)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected graph procedure call in Cypher pipeline");
+            };
+            assert_eq!(call.procedure, "graph.shortestPath");
+            assert_eq!(call.args.len(), 2);
+            assert_eq!(
+                call.yields,
+                vec!["sourceNodeId", "targetNodeId", "distance", "path"]
+            );
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_graph_weighted_dijkstra_call_is_planned_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "CALL graph.dijkstra(1, 2, 10, 'weight') YIELD sourceNodeId, targetNodeId, totalCost, path RETURN sourceNodeId, targetNodeId, totalCost, path",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::ProcedureCall(call)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected graph procedure call in Cypher pipeline");
+            };
+            assert_eq!(call.procedure, "graph.dijkstra");
+            assert_eq!(call.args.len(), 4);
+            assert_eq!(
+                call.yields,
+                vec!["sourceNodeId", "targetNodeId", "totalCost", "path"]
+            );
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_foreach_is_lowered_in_native_pipeline() {
     let planner = Planner::new(Arc::new(TestCatalog));
     let statement = Statement::Cypher(CypherStatement {
         clauses: vec![CypherClause::Foreach(CypherForeachClause {
             variable: "x".to_owned(),
-            expr: Expr::Literal(Literal::Integer(1), Span::default()),
+            expr: Expr::Array {
+                elements: vec![Expr::Literal(Literal::Integer(1), Span::default())],
+                span: Span::default(),
+            },
             clauses: Vec::new(),
             span: Span::default(),
         })],
         union: None,
         span: Span::default(),
     });
-    let error = plan_statement_with_catalog(&statement, &planner).expect_err("error");
-    assert_eq!(error.sqlstate(), SqlState::FeatureNotSupported);
-    assert!(error.to_string().contains("FOREACH"));
+    let plan = plan_statement_with_catalog(&statement, &planner).expect("plan");
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let foreach = plan
+                .pipeline
+                .iter()
+                .find_map(|op| match op {
+                    aiondb_plan::graph::CypherPipelineOp::Foreach(f) => Some(f),
+                    _ => None,
+                })
+                .expect("FOREACH pipeline op");
+            assert_eq!(foreach.variable, "x");
+            assert!(foreach.body.is_empty());
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_foreach_with_set_body_parses_and_lowers() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) FOREACH (x IN [1, 2] | SET n.touched = x) RETURN n",
+        &planner,
+    )
+    .expect("plan");
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let foreach = plan
+                .pipeline
+                .iter()
+                .find_map(|op| match op {
+                    aiondb_plan::graph::CypherPipelineOp::Foreach(f) => Some(f),
+                    _ => None,
+                })
+                .expect("FOREACH pipeline op");
+            assert_eq!(foreach.variable, "x");
+            assert_eq!(foreach.body.len(), 1);
+            assert!(matches!(
+                &foreach.body[0],
+                aiondb_plan::graph::CypherForeachOp::Set(set)
+                    if set.variable == "n" && set.property.as_deref() == Some("touched")
+            ));
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
 }
 
 #[test]

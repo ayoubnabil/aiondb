@@ -193,14 +193,29 @@ impl Binder {
                     if let Some(subquery) = c.subquery.as_deref() {
                         let bound = self.bind_cypher_query(subquery, txn_id)?;
                         clause_order.push(BoundCypherClauseRef::Call(calls.len()));
-                        calls.push(BoundCypherCallSubquery {
+                        calls.push(BoundCypherCall::Subquery(BoundCypherCallSubquery {
                             query: Box::new(bound),
-                        });
+                        }));
                     } else {
-                        return Err(DbError::feature_not_supported(format!(
-                            "CALL {} — procedure calls are not yet supported in the direct pipeline",
-                            c.procedure
-                        )));
+                        let Some(procedure) =
+                            crate::cypher_procedure::resolve_graph_procedure_call(
+                                &c.procedure,
+                                &c.yields,
+                                c.args.len(),
+                            )?
+                        else {
+                            return Err(DbError::feature_not_supported(format!(
+                                "CALL {} — procedure calls are not yet supported in the direct pipeline",
+                                c.procedure
+                            )));
+                        };
+
+                        clause_order.push(BoundCypherClauseRef::Call(calls.len()));
+                        calls.push(BoundCypherCall::Procedure(BoundCypherProcedureCall {
+                            procedure: procedure.name,
+                            args: c.args.clone(),
+                            yields: procedure.yields,
+                        }));
                     }
                 }
                 CypherClause::Foreach(_) => {

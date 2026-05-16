@@ -117,6 +117,16 @@ pub fn estimate_pattern_cost(
     total_cost
 }
 
+fn estimate_pattern_cost_with_existing_bindings(
+    pattern: &CypherPattern,
+    stats: &GraphStats,
+    filters: &[TypedExpr],
+    bound_variables: &HashMap<String, f64>,
+) -> f64 {
+    let mut bound_variables = bound_variables.clone();
+    estimate_single_pattern_cost(pattern, stats, filters, &mut bound_variables)
+}
+
 /// Estimate cost for a single path pattern.
 fn estimate_single_pattern_cost(
     pattern: &CypherPattern,
@@ -134,12 +144,15 @@ fn estimate_single_pattern_cost(
     let first_node = &pattern.nodes[0];
     let first_card = node_cardinality(first_node, stats, filters);
 
+    let mut current_card = first_card;
+
     if let Some(ref var) = first_node.variable {
         if let Some(&existing_card) = bound_variables.get(var) {
             // Variable already bound from a previous pattern -- use the smaller
             // cardinality (intersection semantics).
             let effective = existing_card.min(first_card);
             cost += effective;
+            current_card = effective;
         } else {
             cost += first_card;
             bound_variables.insert(var.clone(), first_card);
@@ -147,8 +160,6 @@ fn estimate_single_pattern_cost(
     } else {
         cost += first_card;
     }
-
-    let mut current_card = first_card;
 
     // Walk the chain of relationships.
     for (i, rel) in pattern.relationships.iter().enumerate() {
@@ -178,11 +189,20 @@ fn estimate_single_pattern_cost(
             next_card *= PROPERTY_FILTER_SELECTIVITY;
         }
 
+        if let Some(ref var) = next_node.variable {
+            if let Some(&existing_card) = bound_variables.get(var) {
+                next_card = next_card.min(existing_card);
+            }
+        }
+
         next_card = next_card.max(1.0);
         current_card = next_card;
 
         if let Some(ref var) = next_node.variable {
-            bound_variables.insert(var.clone(), current_card);
+            bound_variables
+                .entry(var.clone())
+                .and_modify(|existing| *existing = existing.min(current_card))
+                .or_insert(current_card);
         }
     }
 
@@ -383,7 +403,10 @@ impl GraphOptimizer {
                 CypherPipelineOp::CallSubquery(subquery) => {
                     self.optimize_cypher_query_in_place(subquery);
                 }
-                CypherPipelineOp::Unwind(_) | CypherPipelineOp::With(_) => {}
+                CypherPipelineOp::Unwind(_)
+                | CypherPipelineOp::With(_)
+                | CypherPipelineOp::ProcedureCall(_)
+                | CypherPipelineOp::Foreach(_) => {}
             }
         }
 
@@ -422,33 +445,47 @@ impl GraphOptimizer {
             return;
         }
 
-        let mut indices: Vec<usize> = (0..match_clause.patterns.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let cost_a = estimate_pattern_cost(
-                std::slice::from_ref(&match_clause.patterns[a]),
-                &self.stats,
-                filters,
-            );
-            let cost_b = estimate_pattern_cost(
-                std::slice::from_ref(&match_clause.patterns[b]),
-                &self.stats,
-                filters,
-            );
-            cost_a
-                .partial_cmp(&cost_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let original_patterns = match_clause.patterns.clone();
+        let mut remaining: Vec<usize> = (0..original_patterns.len()).collect();
+        let mut reordered = Vec::with_capacity(original_patterns.len());
+        let mut bound_variables = HashMap::new();
 
-        // Check if already in optimal order.
-        let is_identity = indices.iter().enumerate().all(|(i, &v)| i == v);
-        if is_identity {
-            return;
+        while !remaining.is_empty() {
+            let (best_pos, best_index) = remaining
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    let cost_left = estimate_pattern_cost_with_existing_bindings(
+                        &original_patterns[**left],
+                        &self.stats,
+                        filters,
+                        &bound_variables,
+                    );
+                    let cost_right = estimate_pattern_cost_with_existing_bindings(
+                        &original_patterns[**right],
+                        &self.stats,
+                        filters,
+                        &bound_variables,
+                    );
+                    cost_left
+                        .partial_cmp(&cost_right)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(pos, &index)| (pos, index))
+                .expect("remaining pattern indices should not be empty");
+
+            estimate_single_pattern_cost(
+                &original_patterns[best_index],
+                &self.stats,
+                filters,
+                &mut bound_variables,
+            );
+            reordered.push(original_patterns[best_index].clone());
+            remaining.remove(best_pos);
         }
 
-        // Reorder patterns according to sorted indices.
-        let original_patterns: Vec<CypherPattern> = match_clause.patterns.clone();
-        for (dest, &src) in indices.iter().enumerate() {
-            match_clause.patterns[dest] = original_patterns[src].clone();
+        if reordered != match_clause.patterns {
+            match_clause.patterns = reordered;
         }
     }
 
@@ -997,6 +1034,47 @@ mod tests {
         assert_eq!(
             match_clause.patterns[0].nodes[0].label.as_deref(),
             Some("Movie")
+        );
+    }
+
+    #[test]
+    fn pattern_reorder_prefers_pattern_that_reuses_bound_variable() {
+        let stats = make_stats();
+        let optimizer = GraphOptimizer::new(stats);
+
+        let mut anchor = make_pattern(vec![make_node(Some("c"), Some("City"))], vec![]);
+        anchor.nodes[0].properties.push(CypherPropertyExpr {
+            key: "name".into(),
+            value: TypedExpr::literal(Value::Text("Paris".into()), DataType::Text, false),
+        });
+
+        let dependent = make_pattern(
+            vec![
+                make_node(Some("c"), None),
+                make_node(Some("m"), Some("Movie")),
+            ],
+            vec![make_rel(
+                None,
+                Some("ACTED_IN"),
+                CypherRelDirection::Outgoing,
+            )],
+        );
+        let independent = make_pattern(vec![make_node(Some("m2"), Some("Movie"))], vec![]);
+
+        let mut match_clause = make_match(vec![anchor, independent, dependent]);
+        optimizer.reorder_patterns(&mut match_clause, &[]);
+
+        assert_eq!(
+            match_clause.patterns[0].nodes[0].variable.as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            match_clause.patterns[1].nodes[0].variable.as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            match_clause.patterns[2].nodes[0].variable.as_deref(),
+            Some("m2")
         );
     }
 

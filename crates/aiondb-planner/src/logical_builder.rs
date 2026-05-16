@@ -1633,14 +1633,37 @@ impl LogicalBuilder {
                         let subplan = self.build_cypher_query_plan(subquery, catalog, txn_id)?;
                         pipeline.push(graph::CypherPipelineOp::CallSubquery(Box::new(subplan)));
                     } else {
-                        return Err(unsupported_native_cypher_feature(format!(
-                            "CALL {}",
-                            call.procedure
-                        )));
+                        let Some(procedure) =
+                            crate::cypher_procedure::resolve_graph_procedure_call(
+                                &call.procedure,
+                                &call.yields,
+                                call.args.len(),
+                            )?
+                        else {
+                            return Err(unsupported_native_cypher_feature(format!(
+                                "CALL {}",
+                                call.procedure
+                            )));
+                        };
+                        let args = call
+                            .args
+                            .iter()
+                            .map(|expr| {
+                                self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                            })
+                            .collect::<DbResult<Vec<_>>>()?;
+                        pipeline.push(graph::CypherPipelineOp::ProcedureCall(
+                            graph::CypherProcedureCall {
+                                procedure: procedure.name,
+                                args,
+                                yields: procedure.yields,
+                            },
+                        ));
                     }
                 }
-                CypherClause::Foreach(_) => {
-                    return Err(unsupported_native_cypher_feature("FOREACH"));
+                CypherClause::Foreach(fc) => {
+                    let foreach = self.build_cypher_foreach(fc, catalog, txn_id)?;
+                    pipeline.push(graph::CypherPipelineOp::Foreach(Box::new(foreach)));
                 }
             }
         }
@@ -1669,6 +1692,95 @@ impl LogicalBuilder {
             limit,
             distinct,
             union,
+        })
+    }
+
+    fn build_cypher_foreach(
+        &self,
+        fc: &aiondb_parser::CypherForeachClause,
+        catalog: &dyn CatalogReader,
+        txn_id: TxnId,
+    ) -> DbResult<aiondb_plan::graph::CypherForeachPlan> {
+        use aiondb_parser::CypherClause;
+        use aiondb_plan::graph;
+
+        let expr = self.cypher_expr_to_typed_with_subqueries(&fc.expr, catalog, txn_id)?;
+        let mut body = Vec::new();
+
+        for clause in &fc.clauses {
+            match clause {
+                CypherClause::Set(s) => {
+                    let mut set_items = Vec::new();
+                    for item in &s.items {
+                        self.collect_cypher_set_items(item, &mut set_items)?;
+                    }
+                    for set_item in set_items {
+                        body.push(graph::CypherForeachOp::Set(set_item));
+                    }
+                }
+                CypherClause::Remove(r) => {
+                    for item in &r.items {
+                        match item {
+                            aiondb_parser::CypherRemoveItem::Property {
+                                variable,
+                                property,
+                                ..
+                            } => {
+                                body.push(graph::CypherForeachOp::Set(graph::CypherSetItem {
+                                    variable: variable.clone(),
+                                    property: Some(property.clone()),
+                                    expr: TypedExpr::literal(Value::Null, DataType::Text, true),
+                                    table_id: None,
+                                }));
+                            }
+                            aiondb_parser::CypherRemoveItem::Label { .. } => {
+                                return Err(unsupported_native_cypher_feature(
+                                    "REMOVE <variable>:<label> inside FOREACH",
+                                ));
+                            }
+                        }
+                    }
+                }
+                CypherClause::Create(c) => {
+                    body.push(graph::CypherForeachOp::Create(
+                        self.build_cypher_create(c, catalog, txn_id)?,
+                    ));
+                }
+                CypherClause::Merge(m) => {
+                    body.push(graph::CypherForeachOp::Merge(Box::new(
+                        self.build_cypher_merge(m, catalog, txn_id)?,
+                    )));
+                }
+                CypherClause::Delete(d) => {
+                    body.push(graph::CypherForeachOp::Delete(graph::CypherDeleteClause {
+                        detach: d.detach,
+                        variables: d
+                            .variables
+                            .iter()
+                            .map(|v| graph::CypherDeleteTarget {
+                                variable: v.clone(),
+                                connected_edge_table_ids: Vec::new(),
+                            })
+                            .collect(),
+                    }));
+                }
+                CypherClause::Foreach(nested) => {
+                    body.push(graph::CypherForeachOp::Foreach(Box::new(
+                        self.build_cypher_foreach(nested, catalog, txn_id)?,
+                    )));
+                }
+                _ => {
+                    return Err(unsupported_native_cypher_feature(
+                        "only SET, REMOVE, CREATE, MERGE, DELETE and nested FOREACH are allowed inside FOREACH",
+                    ));
+                }
+            }
+        }
+
+        Ok(graph::CypherForeachPlan {
+            variable: fc.variable.clone(),
+            expr,
+            body,
         })
     }
 

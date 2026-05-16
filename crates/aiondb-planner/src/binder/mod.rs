@@ -564,7 +564,7 @@ pub struct BoundCypherQuery {
     pub merges: Vec<BoundCypherMerge>,
     pub sets: Vec<BoundCypherSetItem>,
     pub deletes: Vec<BoundCypherDelete>,
-    pub calls: Vec<BoundCypherCallSubquery>,
+    pub calls: Vec<BoundCypherCall>,
     pub return_clause: Option<BoundCypherReturn>,
     pub clause_order: Vec<BoundCypherClauseRef>,
     pub union: Option<Box<BoundCypherUnion>>,
@@ -646,6 +646,19 @@ pub struct BoundCypherDelete {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundCypherCallSubquery {
     pub query: Box<BoundCypherQuery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundCypherCall {
+    Subquery(BoundCypherCallSubquery),
+    Procedure(BoundCypherProcedureCall),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundCypherProcedureCall {
+    pub procedure: String,
+    pub args: Vec<Expr>,
+    pub yields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

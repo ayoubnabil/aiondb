@@ -1774,7 +1774,9 @@ impl Optimizer {
                     self.collect_graph_stats_for_cypher_query(txn_id, subquery, stats)?;
                 }
                 aiondb_plan::graph::CypherPipelineOp::Unwind(_)
-                | aiondb_plan::graph::CypherPipelineOp::With(_) => {}
+                | aiondb_plan::graph::CypherPipelineOp::With(_)
+                | aiondb_plan::graph::CypherPipelineOp::ProcedureCall(_)
+                | aiondb_plan::graph::CypherPipelineOp::Foreach(_) => {}
             }
         }
         if let Some(union) = &plan.union {

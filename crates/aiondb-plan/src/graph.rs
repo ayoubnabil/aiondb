@@ -63,7 +63,37 @@ pub enum CypherPipelineOp {
     Unwind(CypherUnwindClause),
     With(Box<CypherWithClause>),
     Match(CypherMatchClause),
+    ProcedureCall(CypherProcedureCall),
     CallSubquery(Box<CypherQueryPlan>),
+    Foreach(Box<CypherForeachPlan>),
+}
+
+/// `FOREACH (var IN list | <update clauses>)` -- runs the body update clauses
+/// once per element of `expr`, binding `variable` to each element. FOREACH
+/// never changes the outer binding cardinality; it only performs side effects.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CypherForeachPlan {
+    pub variable: String,
+    pub expr: TypedExpr,
+    pub body: Vec<CypherForeachOp>,
+}
+
+/// A single update clause allowed inside a FOREACH body.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum CypherForeachOp {
+    Set(CypherSetItem),
+    Create(CypherCreateClause),
+    Merge(Box<CypherMergeClause>),
+    Delete(CypherDeleteClause),
+    Foreach(Box<CypherForeachPlan>),
+}
+
+/// `CALL graph.*(...) YIELD ...` procedure invocation.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CypherProcedureCall {
+    pub procedure: String,
+    pub args: Vec<TypedExpr>,
+    pub yields: Vec<String>,
 }
 
 /// `UNWIND expr AS variable`
