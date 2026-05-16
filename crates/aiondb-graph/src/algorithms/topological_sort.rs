@@ -60,6 +60,12 @@ pub fn topological_sort<G: GraphViewV2 + ?Sized>(graph: &G) -> TopologicalSort {
             ready.push(std::cmp::Reverse(usize_to_u32(idx)));
         }
     }
+    if ready.is_empty() {
+        return TopologicalSort {
+            order: Vec::new(),
+            is_dag: false,
+        };
+    }
 
     let mut order = Vec::with_capacity(n);
     while let Some(std::cmp::Reverse(node)) = ready.pop() {
