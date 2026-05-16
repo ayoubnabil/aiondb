@@ -1712,6 +1712,55 @@ fn cypher_three_hop_id_lookup_uses_adjacency_chain() {
 }
 
 #[test]
+fn cypher_anchored_path_counts_use_adjacency_chain() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_count_fast (id INT NOT NULL); \
+             CREATE TABLE knows_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_count_fast ON people_count_fast; \
+             CREATE EDGE LABEL knows_count_fast ON knows_count_fast_edges SOURCE person_count_fast TARGET person_count_fast; \
+             INSERT INTO people_count_fast VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9); \
+             INSERT INTO knows_count_fast_edges VALUES \
+                (1, 2), (1, 3), \
+                (2, 4), (2, 5), (3, 6), \
+                (4, 7), (5, 8), (6, 9)",
+        )
+        .expect("seed graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_count_fast {id: 1})-[:knows_count_fast]->(b:person_count_fast) \
+             RETURN count(b)",
+        ),
+        2,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_count_fast {id: 1})-[:knows_count_fast]->(b:person_count_fast)-[:knows_count_fast]->(c:person_count_fast) \
+             RETURN count(c)",
+        ),
+        3,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_count_fast {id: 1})-[:knows_count_fast]->(b:person_count_fast)-[:knows_count_fast]->(c:person_count_fast)-[:knows_count_fast]->(d:person_count_fast) \
+             RETURN count(d)",
+        ),
+        3,
+    );
+}
+
+#[test]
 fn cypher_unanchored_group_count_uses_target_property() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");

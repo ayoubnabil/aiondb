@@ -1717,6 +1717,18 @@ fn column_ref_name(expr: &TypedExpr) -> Option<&str> {
     }
 }
 
+fn count_return_variable(expr: &TypedExpr) -> Option<&str> {
+    let TypedExprKind::AggCount {
+        expr: Some(expr),
+        distinct: false,
+        filter: None,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    column_ref_name(expr)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1861,6 +1873,23 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    fn fast_graph_adjacency_neighbor_count(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<u64> {
+        let cursor = self.storage_dml.adjacency_neighbor_cursor(
+            context.txn_id,
+            &context.snapshot,
+            edge_table_id,
+            node_id,
+            outgoing,
+        )?;
+        Ok(usize_to_u64(cursor.remaining_hint()))
     }
 
     fn fast_graph_id_lookup_cache_get(
@@ -2223,6 +2252,9 @@ impl Executor {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_one_hop_endpoint_id_lookup(plan, context)? {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_execute_fast_anchored_path_count(plan, context)? {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_two_hop_id_lookup(plan, context)? {
@@ -2667,6 +2699,190 @@ impl Executor {
         }
         let columns = plan.returns.iter().map(|r| r.field.clone()).collect();
         Ok(Some(ExecutionResult::Query { columns, rows }))
+    }
+
+    fn try_execute_fast_anchored_path_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        let hops = pattern.relationships.len();
+        if pattern.path_function.is_some()
+            || !(1..=3).contains(&hops)
+            || pattern.nodes.len() != hops + 1
+        {
+            return Ok(None);
+        }
+
+        let Some(start) = pattern.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(end) = pattern.nodes.last() else {
+            return Ok(None);
+        };
+        let Some(start_variable) = start.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        if count_return_variable(&plan.returns[0].expr)
+            .map_or(true, |name| !name.eq_ignore_ascii_case(end_variable))
+        {
+            return Ok(None);
+        }
+        if start.table_id.is_none()
+            || pattern
+                .nodes
+                .iter()
+                .skip(1)
+                .any(|node| node.table_id.is_none() || !node.properties.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let Some(edge_table_id) = pattern.relationships.first().and_then(|rel| rel.table_id) else {
+            return Ok(None);
+        };
+        if pattern.relationships.iter().any(|rel| {
+            rel.table_id != Some(edge_table_id)
+                || rel.direction != CypherRelDirection::Outgoing
+                || rel.variable.is_some()
+                || rel.min_hops.is_some()
+                || rel.max_hops.is_some()
+                || !rel.properties.is_empty()
+        }) {
+            return Ok(None);
+        }
+
+        let Some(mut start_id) =
+            extract_start_id_literal(start, match_clause.filter.as_ref(), start_variable)
+        else {
+            return Ok(None);
+        };
+        normalize_int_key(&mut start_id);
+
+        let count = match hops {
+            1 => match self.fast_graph_adjacency_neighbor_count(
+                context,
+                edge_table_id,
+                &start_id,
+                true,
+            ) {
+                Ok(count) => count,
+                Err(_) => return Ok(None),
+            },
+            2 => {
+                let middle_ids = match self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &start_id,
+                    true,
+                ) {
+                    Ok(ids) => ids,
+                    Err(_) => return Ok(None),
+                };
+                let mut count = 0u64;
+                for mut middle_id in middle_ids {
+                    context.check_deadline()?;
+                    if middle_id.is_null() {
+                        continue;
+                    }
+                    normalize_int_key(&mut middle_id);
+                    let degree = match self.fast_graph_adjacency_neighbor_count(
+                        context,
+                        edge_table_id,
+                        &middle_id,
+                        true,
+                    ) {
+                        Ok(count) => count,
+                        Err(_) => return Ok(None),
+                    };
+                    count = count.saturating_add(degree);
+                }
+                count
+            }
+            3 => {
+                let first_ids = match self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &start_id,
+                    true,
+                ) {
+                    Ok(ids) => ids,
+                    Err(_) => return Ok(None),
+                };
+                let mut count = 0u64;
+                for mut first_id in first_ids {
+                    context.check_deadline()?;
+                    if first_id.is_null() {
+                        continue;
+                    }
+                    normalize_int_key(&mut first_id);
+                    let second_ids = match self.fast_graph_adjacency_neighbors_cached(
+                        context,
+                        edge_table_id,
+                        &first_id,
+                        true,
+                    ) {
+                        Ok(ids) => ids,
+                        Err(_) => return Ok(None),
+                    };
+                    for mut second_id in second_ids {
+                        context.check_deadline()?;
+                        if second_id.is_null() {
+                            continue;
+                        }
+                        normalize_int_key(&mut second_id);
+                        let degree = match self.fast_graph_adjacency_neighbor_count(
+                            context,
+                            edge_table_id,
+                            &second_id,
+                            true,
+                        ) {
+                            Ok(count) => count,
+                            Err(_) => return Ok(None),
+                        };
+                        count = count.saturating_add(degree);
+                    }
+                }
+                count
+            }
+            _ => return Ok(None),
+        };
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
     }
 
     fn try_execute_fast_two_hop_id_lookup(
