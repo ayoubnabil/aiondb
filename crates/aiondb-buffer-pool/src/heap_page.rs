@@ -890,10 +890,11 @@ mod tests {
         assert_eq!(u16::from_le_bytes(buf[24..26].try_into().unwrap()), 1);
 
         // ItemId at the start of the line pointer area decodes to (upper, len, NORMAL).
-        let raw_item =
-            u32::from_le_bytes(buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + ITEM_ID_SIZE]
+        let raw_item = u32::from_le_bytes(
+            buf[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + ITEM_ID_SIZE]
                 .try_into()
-                .unwrap());
+                .unwrap(),
+        );
         let item = ItemId::from_le_bytes(raw_item.to_le_bytes());
         assert_eq!(item.offset() as usize, upper);
         assert_eq!(item.length() as usize, tuple.len());
