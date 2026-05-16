@@ -25,8 +25,8 @@ Patch releases, documentation updates, security fixes, and narrowly scoped compa
 
 | Tag | Theme | Big objective | Required evidence |
 | --- | --- | --- | --- |
-| `v0.2` | Credibility challenge | Prove AionDB is a real PostgreSQL-wire database foundation: stable storage, WAL contracts, real drivers, honest type behavior, and reproducible evaluation. | Storage contract tests, WAL contract tests, upgrade path, type matrix, driver smoke results, baseline benchmark reports. |
-| `v0.3` | Graph engine challenge | Build a serious graph engine: core graph algorithms, path queries, graph indexes, and public benchmarks against Neo4j-class workloads. | Graph algorithm suite, Cypher/SQL-PGQ compatibility notes, traversal benchmarks, memory profiles, correctness corpus. |
+| `v0.2` | Neo4j-class graph credibility | Prove AionDB is a real PostgreSQL-wire database foundation while pushing the graph surface toward Neo4j-class maturity in language, algorithms, benchmarks, migration, and operations. | Storage/WAL contract tests, graph algorithm corpus, Neo4j-class benchmark reports, type matrix, driver smoke results. |
+| `v0.3` | PostgreSQL ecosystem challenge | Make real application stacks work: extended protocol, prepared statements, ORMs, migrations, catalogs, and SQLSTATE behavior. | Protocol transcript tests, ORM reports, migration-tool fixtures, catalog introspection corpus, SQLSTATE reference. |
 | `v0.4` | PostgreSQL-class query engine | Push joins, planning, execution, and EXPLAIN toward PostgreSQL-class behavior on pinned SQL workloads. | Join benchmark corpus, optimizer regression suite, statistics fixtures, EXPLAIN JSON snapshots, spill and memory tests. |
 | `v0.5` | Distributed SQL challenge | Move from single-node credibility to distributed SQL: sharding, distributed transactions, replica placement, and correctness drills against CockroachDB/Yugabyte-style expectations. | Jepsen-style scenarios, distributed transaction tests, shard rebalancing drills, replication lag metrics, failure recovery reports. |
 | `v0.6` | Hybrid graph/vector/SQL | Make hybrid queries the differentiator: relational filters, graph traversal, and vector scoring in one planner and one dataset. | Hybrid query corpus, recall/latency reports, graph semantics tests, vector benchmark matrix, planner explainability docs. |
@@ -49,9 +49,11 @@ Every milestone should satisfy the same basic bar before its tag is credible:
 - Benchmarks must be reproducible from a fresh checkout or explicitly marked as exploratory.
 - Unsupported behavior must fail clearly or be documented as undefined for that release.
 
-## v0.2 — Credibility challenge
+## v0.2 — Neo4j-class graph credibility
 
-The v0.2 target is to prove that AionDB is not a prototype hidden behind a demo query. A technical evaluator should be able to clone the project, run the server, connect through real PostgreSQL clients, inspect the storage contract, exercise WAL behavior, and understand exactly which parts are stable or unsupported.
+The v0.2 target is to prove that AionDB is not a prototype hidden behind a demo query. A technical evaluator should be able to clone the project, run the server, connect through real PostgreSQL clients, inspect the storage contract, exercise WAL behavior, and evaluate a graph surface that is intentionally aimed at Neo4j-class maturity.
+
+The graph goal in v0.2 is not a vague "graph support" checkbox. It is a product challenge: make AionDB credible against Neo4j-class expectations across graph modeling, traversal semantics, algorithm coverage, performance evidence, migration guidance, and operational visibility. Claims must still be backed by published workloads and pinned product versions.
 
 ### Storage format
 
@@ -99,6 +101,41 @@ The v0.2 target is to prove that AionDB is not a prototype hidden behind a demo 
 - Enough catalog behavior for drivers and simple tools to introspect tables, columns, indexes, constraints, roles, and database names.
 - Unsupported catalog rows are omitted or explicitly marked rather than fabricated.
 
+### Neo4j-class graph maturity target
+
+- SQL/PGQ support broad enough for serious graph workloads.
+- Cypher-compatible migration subset for teams coming from Neo4j, clearly marked where compatibility stops.
+- Stable node, edge, label, property, path, and projection semantics.
+- Clear behavior for null endpoints, duplicate edges, self loops, multi-label entities, and path uniqueness.
+- Graph catalog and introspection views that make graph schemas understandable to tools.
+
+### Graph algorithm coverage
+
+- Breadth-first search and depth-first traversal with bounded depth.
+- Shortest path: unweighted BFS, bidirectional BFS, and weighted Dijkstra.
+- All-shortest-path variants where the result cardinality is bounded by explicit limits.
+- Connected components, weakly connected components, strongly connected components.
+- PageRank, degree centrality, closeness centrality, betweenness centrality with documented approximation modes.
+- Triangle counting, community detection baseline, top-k neighbors, k-hop neighborhood expansion.
+- Memory, timeout, and result-cardinality controls for every heavy algorithm.
+
+### Graph performance and migration evidence
+
+- Public benchmark suite with pinned Neo4j and AionDB versions.
+- Workloads covering sparse graphs, dense hubs, weighted graphs, knowledge graphs, social graphs, and mixed property filters.
+- Metrics: latency distribution, throughput, memory use, ingest rate, index build time, result correctness, and recovery behavior.
+- Neo4j import path for label-property graphs.
+- Cypher-to-AionDB migration guidance for supported query shapes.
+- Clear separation between workloads where AionDB is faster, comparable, or still behind.
+- No broad claim of matching Neo4j maturity without reproducible evidence.
+
+### Graph operations evidence
+
+- Graph-specific metrics for traversal depth, frontier size, index hit rate, algorithm memory, timeout aborts, and result truncation.
+- Runbooks for graph index rebuild, corrupted graph index state, heavy algorithm throttling, and migration rollback.
+- Backup and restore coverage for graph labels, adjacency indexes, graph metadata, and materialized algorithm state where supported.
+- Failure drills that prove graph workloads recover cleanly after crashes, failover, and interrupted index builds.
+
 ### Baseline benchmark target
 
 - Public baseline scripts for startup, simple inserts, point reads, range scans, WAL append, checkpoint, and restart recovery.
@@ -110,6 +147,7 @@ The v0.2 target is to prove that AionDB is not a prototype hidden behind a demo 
 ### Documentation bar
 
 - Storage format and WAL contract pages are treated as release artifacts.
+- The [v0.2 Evidence](/documentation/evaluate/v0-2-evidence.html) checklist names the required release evidence.
 - Limitations are documented before release notes make broad claims.
 - The roadmap links ambitious future work to concrete prerequisites already delivered in v0.2.
 - Examples must be runnable with normal PostgreSQL clients where possible.
@@ -121,62 +159,58 @@ The v0.2 target is to prove that AionDB is not a prototype hidden behind a demo 
 - The docs explain which PostgreSQL types, casts, binary formats, and wire behaviors are supported.
 - Driver smoke tests produce a public matrix with exact versions and reduced failing cases for unsupported behavior.
 - The release avoids broad "PostgreSQL compatible" language unless the claim is backed by a named compatibility suite.
+- Graph benchmark reports compare against pinned Neo4j-class baselines without hiding dataset, configuration, or unsupported cases.
+- Core graph algorithms have correctness fixtures and resource-limit tests.
+- Neo4j migration guidance exists for supported label-property graph shapes.
 - Baseline performance and recovery reports are reproducible and honest about where AionDB is still behind.
-- The release gives later graph, query-engine, distributed, hybrid, and HA milestones a stable base instead of moving the lower-level contract every time.
+- The release gives later query-engine, distributed, hybrid, durability, and HA milestones a stable base instead of moving the lower-level contract every time.
 
-## v0.3 — Graph engine challenge
+## v0.3 — PostgreSQL ecosystem challenge
 
-The v0.3 target is to make graph a first-class reason to use AionDB. The goal is not merely to expose graph syntax over tables; it is to build a graph execution engine with enough algorithm coverage and performance evidence to be compared against Neo4j-class workloads.
+The v0.3 target is to make real application stacks work through the PostgreSQL surface. After v0.2 proves the foundation and graph ambition, v0.3 pressure-tests the protocol, catalog, type, driver, ORM, migration, and error behavior that normal applications depend on.
 
-### Graph model and syntax
+### Wire protocol
 
-- SQL/PGQ alignment for `MATCH ... PATTERN` over relational tables.
-- Cypher-inspired compatibility subset documented where it improves migration from existing graph workloads.
-- Explicit node labels, edge labels, edge direction, endpoint nullability, and property mapping.
-- Graph catalog views that explain how graph labels map to underlying tables and indexes.
-- Deterministic semantics for duplicate edges, null endpoints, self loops, and multi-label entities.
+- Extended query parity: Parse, Bind, Describe, Execute, Sync, Flush, Close, command tags, row descriptions in text and binary.
+- Named prepared statements and named portals.
+- `COPY FROM STDIN` and `COPY TO STDOUT`, text and binary.
+- Cursor support: `DECLARE CURSOR`, `FETCH`, `MOVE`, `CLOSE`.
+- Cancel protocol and clear error behavior under interrupted queries.
+- Notice and notification frames where the supported SQL surface needs them.
 
-### Algorithm coverage
+### Authentication
 
-- Breadth-first search and depth-first traversal with bounded depth.
-- Shortest path: unweighted BFS, bidirectional BFS, and weighted Dijkstra.
-- All-shortest-path variants where the result cardinality is bounded by explicit limits.
-- Connected components, weakly connected components, strongly connected components.
-- PageRank, degree centrality, closeness centrality, betweenness centrality with documented approximation modes.
-- Triangle counting, community detection baseline, top-k neighbors, k-hop neighborhood expansion.
-- Cycle detection and path uniqueness modes.
+- `SCRAM-SHA-256` as default mechanism.
+- `pg_hba`-style configuration file with method per host/user/database.
+- Cleartext only behind a non-default flag with a loud warning.
 
-### Graph performance work
+### Prepared statements and plan cache
 
-- Adjacency storage tuned for hot traversal paths.
-- Compressed adjacency lists for high-degree nodes.
-- Direction-specific indexes for outgoing, incoming, and bidirectional traversals.
-- Batch traversal execution that avoids per-edge executor overhead.
-- Cost model for choosing index traversal, adjacency scan, or relational prefiltering.
-- Memory budget controls for path expansion, centrality, and all-shortest-path workloads.
+- Plan cache keyed by SQL text and parameter type OIDs.
+- Plan invalidation on DDL.
+- Documented parameter inference and unknown type behavior.
+- Reduced tests for binary/text parameter formats used by common drivers.
 
-### Neo4j-class benchmark target
+### ORM compatibility
 
-- Public benchmark suite with pinned Neo4j and AionDB versions.
-- Workloads covering shortest path, k-hop traversal, centrality, community detection, write-heavy edge ingestion, and mixed property filters.
-- Datasets that include sparse graphs, dense hubs, social-network shapes, knowledge-graph shapes, and weighted road-network shapes.
-- Metrics: latency distribution, throughput, memory use, load time, index build time, result correctness, and failure modes under limits.
-- No claim of beating Neo4j unless the published benchmark supports it for a named workload.
+- SQLAlchemy, Django ORM, Prisma, Drizzle, Diesel, ActiveRecord, Hibernate.
+- Schema introspection, table CRUD, basic relations, transaction commit and rollback, error mapping.
+- Public compatibility report per ORM with versions pinned.
+- Reduced SQL fixtures for every unsupported generated query.
 
-### Driver and tool surface
+### Migration tools
 
-- Graph queries remain accessible through normal PostgreSQL clients.
-- Result shapes are stable enough for application code and benchmarks.
-- Error messages distinguish unsupported syntax, unsupported algorithm modes, and resource-limit aborts.
-- Documentation includes migration examples from table-only schemas and graph-native schemas.
+- `sqlx`, Alembic, Django migrate, Prisma migrate, Flyway, Liquibase.
+- Create table, alter column, add index, drop column, foreign key, generated column where supported.
+- Unsupported migration operations fail with a precise SQLSTATE and a documented limitation.
 
 ### Exit criteria
 
-- AionDB can run a serious graph benchmark suite from a fresh checkout.
-- Core graph algorithms have correctness fixtures and resource-limit tests.
-- Graph performance reports compare against pinned Neo4j-class baselines without hiding dataset or configuration details.
-- The planner can explain traversal order, index choices, and memory budget decisions.
-- Unsupported graph features are explicit; the release does not imply full Cypher or full SQL/PGQ compatibility without evidence.
+- Common drivers can connect, prepare statements, bind parameters, execute transactions, recover from errors, and close resources cleanly.
+- ORM schema introspection works for the supported catalog subset without hand-written compatibility shims in application code.
+- Migration tools can run a documented subset of create, alter, index, constraint, and drop workflows.
+- Protocol traces are stable enough that regressions can be diagnosed from captured frontend/backend message sequences.
+- Unsupported protocol features return precise errors rather than hanging clients or producing misleading metadata.
 
 ## v0.4 — PostgreSQL-class query engine
 

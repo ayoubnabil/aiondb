@@ -21,7 +21,7 @@ CREATE NODE LABEL person ON persons;
 
 A node label gives a table a graph identity. Rows remain ordinary table rows.
 
-Use one node label when a table has one graph role. If a future model supports multiple labels or conditional labels, document the predicate and update behavior explicitly. For v0.1, keep modeling simple enough that the equivalent SQL is obvious.
+Use one node label when a table has one graph role. If a future model supports multiple labels or conditional labels, document the predicate and update behavior explicitly. For alpha releases, keep modeling simple enough that the equivalent SQL is obvious.
 
 ## Edge labels
 
@@ -72,6 +72,49 @@ LIMIT 10;
 
 Supported graph syntax is evolving. If a graph query does not work, rewrite it as SQL joins and keep the reduced graph repro for compatibility work.
 
+## Path queries
+
+AionDB supports bounded variable-length path shapes and shortest-path functions for the Cypher subset used by the executor:
+
+```sql
+MATCH p = shortestPath((a:person {id: 1})-[:friends*..5]->(b:person {id: 9}))
+RETURN p;
+
+MATCH p = allShortestPaths((a:person {id: 1})-[:friends*..5]->(b:person {id: 9}))
+RETURN p;
+```
+
+Named paths render as alternating node and relationship values. `shortestPath` returns one path; `allShortestPaths` returns every shortest variant up to the configured result and memory limits.
+
+Current limits:
+
+- shortest-path functions require exactly two node patterns and one typed relationship pattern;
+- path search should be bounded with an explicit maximum hop count for serious workloads;
+- named multi-segment variable-length paths are not supported yet;
+- deep traversals are subject to query deadline, result-row, workset, and memory limits.
+
+## Graph algorithm procedures
+
+Graph algorithms are exposed through `CALL graph.*` procedures over the current graph projection:
+
+```sql
+CALL graph.pageRank()
+YIELD nodeId, score
+RETURN nodeId, score
+ORDER BY score DESC
+LIMIT 10;
+
+CALL graph.dijkstra(1, 9, 8, 'weight')
+YIELD path, cost
+RETURN path, cost;
+```
+
+The procedure registry includes traversal, shortest path, centrality, community, similarity, link-prediction, embedding, and structural algorithms. Names are case-insensitive and many procedures also accept `gds.*` aliases for Neo4j Graph Data Science-style migration experiments.
+
+Projection data is derived from graph labels and adjacency indexes. The executor can reuse persisted projection cache entries, and it rebuilds from adjacency data when a cache entry is stale, corrupt, or from an unsupported version.
+
+Treat procedure output as part of the alpha graph surface: pin the exact procedure name, arguments, yielded columns, data shape, and expected rows in tests before depending on it.
+
 ## Nullable endpoints
 
 If an edge backing table allows nullable endpoints, decide whether those rows are valid relationships before relying on traversal behavior. In most application models, an edge with `source_id IS NULL` or `target_id IS NULL` should not produce a relationship.
@@ -118,6 +161,8 @@ Dropping labels removes graph metadata. It does not drop the backing table data.
 - Use graph labels to describe relationships, not to duplicate state.
 - Index endpoint columns used by frequent traversals.
 - Validate variable-length or multi-hop patterns before relying on performance.
+- Prefer explicit result limits for path and algorithm queries that can grow quickly.
+- Keep `EXPLAIN` output with benchmark artifacts when comparing graph plans.
 
 ## Evaluation checklist
 

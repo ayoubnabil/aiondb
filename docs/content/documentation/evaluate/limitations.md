@@ -5,7 +5,7 @@ order: 80
 
 # Limitations
 
-AionDB v0.1 is an alpha. This page is part of the product contract: it is better to state limits clearly than to let users discover them through failed migrations.
+AionDB is still an alpha. This page is part of the product contract: it is better to state limits clearly than to let users discover them through failed migrations.
 
 ## Not a PostgreSQL replacement
 
@@ -23,11 +23,11 @@ Examples to test explicitly:
 
 ## Not production-ready by default
 
-The v0.1 release is for evaluation. Treat production usage as experimental unless you have validated your own workload, durability expectations, backup strategy, failure behavior, and driver stack.
+Alpha releases are for evaluation. Treat production usage as experimental unless you have validated your own workload, durability expectations, backup strategy, failure behavior, and driver stack.
 
-Do not use v0.1 as the only copy of important data. Keep reproducible imports, fixtures, or upstream source data so a test environment can be rebuilt from scratch.
+Do not use an alpha release as the only copy of important data. Keep reproducible imports, fixtures, or upstream source data so a test environment can be rebuilt from scratch.
 
-Production readiness is not one feature. It requires a complete story for installation, upgrades, backups, monitoring, security, operational incidents, and long-term compatibility. v0.1 does not claim that full story.
+Production readiness is not one feature. It requires a complete story for installation, upgrades, backups, monitoring, security, operational incidents, and long-term compatibility. Alpha releases do not claim that full story.
 
 Internal testing, fuzzing, and compatibility validation are progressing, but that is still not enough for a public production-ready claim.
 
@@ -47,13 +47,21 @@ For alpha evaluations, prefer one of these workflows:
 
 Graph labels, edge label mapping, vector operators, vector indexing, and hybrid planning should be validated on the exact workload you care about. Syntax and planner behavior may still change across alpha releases.
 
-The safest way to use graph and vector features in v0.1 is to keep an equivalent relational SQL query nearby. That gives you a correctness reference when graph syntax, traversal planning, or vector index behavior changes.
+The safest way to use graph and vector features in alpha releases is to keep an equivalent relational SQL query nearby. That gives you a correctness reference when graph syntax, traversal planning, or vector index behavior changes.
 
 Deep traversals, variable-length paths, filtered vector search, and mixed graph/vector planning should be treated as areas to benchmark and validate carefully. They are exactly the areas where a multi-model engine needs the most optimizer work.
 
-## Distributed and HA work is not the v0.1 contract
+Current graph boundaries:
 
-Some internal modules exist for clustering, transport, high availability, or distributed execution. Their presence does not mean the public product is a production distributed database in v0.1.
+- `shortestPath` and `allShortestPaths` are supported for one typed relationship pattern between two node patterns.
+- Named paths are supported for ordinary paths, `shortestPath`, and `allShortestPaths`, but named multi-segment variable-length paths are not supported yet.
+- `CALL graph.*` exposes a broad algorithm registry, but procedure compatibility should be pinned by name, arguments, yielded columns, and expected rows.
+- Graph procedures use projection cache data where possible and rebuild from adjacency data when needed; this is not a substitute for published operational runbooks.
+- Neo4j-class claims require reproducible benchmark artifacts. Do not generalize from one graph shape to all graph workloads.
+
+## Distributed and HA work is not the current alpha contract
+
+Some internal modules exist for clustering, transport, high availability, or distributed execution. Their presence does not mean the public product is a production distributed database in the current alpha line.
 
 Do not build a public availability claim from module names. A production HA claim needs documented replication mode, failure behavior, recovery procedure, monitoring, and tests.
 
@@ -63,9 +71,9 @@ Performance varies by workload. Any comparison to another database should includ
 
 Avoid claims such as "faster than database X" without disclosing protocol path and durability settings. A local embedded call, pgwire TCP query, HTTP query, WebSocket query, and batched prepared statement are different measurements.
 
-## Good v0.1 use cases
+## Good alpha use cases
 
-Use v0.1 for:
+Use alpha releases for:
 
 - evaluating the SQL/graph/vector model;
 - testing PostgreSQL driver compatibility;
@@ -73,7 +81,7 @@ Use v0.1 for:
 - inspecting the architecture;
 - building demos where data can be recreated.
 
-Avoid v0.1 for:
+Avoid alpha releases for:
 
 - primary production storage;
 - compliance-sensitive workloads;

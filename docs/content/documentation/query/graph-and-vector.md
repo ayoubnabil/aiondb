@@ -28,7 +28,7 @@ CREATE NODE LABEL Person ON people;
 CREATE EDGE LABEL knows ON knows SOURCE Person TARGET Person;
 ```
 
-The current v0.1 model is explicit. If a relationship is stored in a backing table, the graph label tells AionDB how to read that relationship.
+The current alpha model is explicit. If a relationship is stored in a backing table, the graph label tells AionDB how to read that relationship. The storage layer maintains adjacency indexes for edge labels so traversal and graph procedures do not have to fall back to full edge-table scans in the common path.
 
 ## Why graph labels are catalog objects
 
@@ -58,7 +58,21 @@ That design keeps the relational column as the source of truth while still enabl
 
 This matters because duplicate edge tables create application friction. If `tickets.assigned_to` is already the true relationship, forcing the application to also maintain a `ticket_employee_edges` table introduces write duplication, triggers, or eventual inconsistency.
 
-For v0.1, check the graph reference and parser support before relying on endpoint mapping syntax. The architectural direction is clear, but public syntax should match the current binary.
+Check the graph reference and parser support before relying on endpoint mapping syntax in a release. The architectural direction is clear, but public syntax should match the current binary.
+
+## Graph execution surface
+
+The graph executor supports:
+
+- Cypher-style `MATCH` over node and edge labels;
+- bounded variable-length relationships;
+- `shortestPath` and `allShortestPaths` over one typed relationship pattern;
+- named path rendering for ordinary paths, `shortestPath`, and `allShortestPaths`;
+- `CALL graph.*` algorithm procedures over the current graph projection;
+- persisted graph projection cache reuse with rebuild on stale or invalid cache data;
+- `EXPLAIN` graph-access lines that show whether the plan is using row-store fallback, traversal-store adjacency, or projection data.
+
+The remaining alpha boundaries are mostly compatibility and evidence work: broader Cypher coverage, SQL/PGQ naming, graph-specific operational metrics, and reproducible Neo4j-class benchmark reports.
 
 ## Vector data
 
@@ -103,14 +117,14 @@ This shape is important because filtering can change the best plan. The engine m
 
 ## Hybrid queries
 
-The long-term target is a single plan that can combine:
+The target is a single plan that can combine:
 
 - selective SQL predicates;
 - graph traversal;
 - vector similarity;
 - ordinary joins and projections.
 
-For v0.1, validate hybrid graph/vector support on the exact workload you care about and read query plans when comparing behavior.
+Validate hybrid graph/vector support on the exact workload you care about and read query plans when comparing behavior.
 
 ## Correctness strategy
 

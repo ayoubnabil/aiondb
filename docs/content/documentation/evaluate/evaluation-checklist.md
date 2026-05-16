@@ -45,11 +45,15 @@ Those four files make the evaluation portable.
 - Create node labels over existing tables.
 - Create edge labels over relationship tables.
 - Run the same relationship query as SQL joins and as graph patterns where supported.
+- Run one bounded variable-length path query and record the expected path count.
+- Run `shortestPath` and `allShortestPaths` on a small fixture where the expected paths are obvious.
+- Run at least one `CALL graph.*` procedure and pin the yielded columns.
+- Save `EXPLAIN` output for graph `MATCH` and graph procedure calls.
 - Insert vector columns with the intended dimension.
 - Run brute-force vector distance queries.
 - Add HNSW indexes only after correctness is clear.
 
-Decision point: if graph/vector behavior is promising but incomplete, decide whether SQL fallbacks are acceptable. For v0.1, a working SQL fallback is part of a credible adoption path.
+Decision point: if graph/vector behavior is promising but incomplete, decide whether SQL fallbacks are acceptable. For alpha releases, a working SQL fallback is part of a credible adoption path.
 
 ## Driver compatibility
 
@@ -87,6 +91,7 @@ Minimum benchmark disclosure:
 
 ## Release readiness
 
+- v0.2 evidence checklist has been reviewed.
 - README explains the project in under one minute.
 - Documentation has a working tutorial.
 - Installation docs cover source, local archive, container, and service template paths.

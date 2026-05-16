@@ -43,6 +43,7 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 
 - [Core Concepts](/documentation/learn/core-concepts.html): the mental model behind tables, labels, vectors, catalog state, and alpha boundaries.
 - [Architecture](/documentation/learn/architecture.html): how the server, engine, catalog, storage, and WAL fit together.
+- [Storage Format](/documentation/learn/storage-format.html) and [WAL Contract](/documentation/learn/wal-contract.html): the v0.2 storage and write-ahead-log contracts.
 - [Query Lifecycle](/documentation/learn/query-lifecycle.html): what happens between a client query and execution.
 - [Tradeoffs](/documentation/learn/tradeoffs.html): workloads where AionDB is a good fit, and workloads where it is not.
 
@@ -62,6 +63,7 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 ## Evaluate
 
 - [Benchmarks](/documentation/evaluate/benchmarks.html), [Benchmark Results](/documentation/evaluate/benchmark-results.html), [Benchmark Reproducibility](/documentation/evaluate/benchmark-reproducibility.html), and [Performance Tuning](/documentation/evaluate/performance-tuning.html): running fair local comparisons and reading visual result snapshots.
+- [v0.2 Evidence](/documentation/evaluate/v0-2-evidence.html): the storage, WAL, driver, type, and baseline benchmark evidence expected before broad v0.2 claims.
 - [Testing](/documentation/evaluate/testing.html), [Evaluation Checklist](/documentation/evaluate/evaluation-checklist.html), [Product Hardening Plan](/documentation/evaluate/product-hardening-plan.html), and [Migration Guide](/documentation/evaluate/migration-guide.html): deciding whether a workload is ready to try.
 - [Limitations](/documentation/evaluate/limitations.html), [Error Reference](/documentation/evaluate/error-reference.html), [FAQ](/documentation/evaluate/faq.html), and [Glossary](/documentation/evaluate/glossary.html): boundaries and terminology.
 
