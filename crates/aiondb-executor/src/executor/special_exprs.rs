@@ -4634,7 +4634,7 @@ enum GraphNeighborSeen {
 
 impl GraphNeighborSeen {
     fn new(limit: Option<usize>, capacity_hint: usize) -> Self {
-        if limit.is_some_and(|limit| limit <= 16) {
+        if limit.is_some_and(|limit| limit <= 16) || capacity_hint <= 16 {
             Self::Tiny(Vec::with_capacity(capacity_hint))
         } else {
             Self::Hash(std::collections::HashSet::with_capacity(capacity_hint))
@@ -4642,13 +4642,22 @@ impl GraphNeighborSeen {
     }
 
     fn insert(&mut self, id: i64) -> bool {
+        const TINY_SEEN_LIMIT: usize = 16;
+
         match self {
             Self::Tiny(ids) => {
                 if ids.contains(&id) {
                     false
-                } else {
+                } else if ids.len() < TINY_SEEN_LIMIT {
                     ids.push(id);
                     true
+                } else {
+                    let mut promoted =
+                        std::collections::HashSet::with_capacity(TINY_SEEN_LIMIT * 2);
+                    promoted.extend(ids.drain(..));
+                    let inserted = promoted.insert(id);
+                    *self = Self::Hash(promoted);
+                    inserted
                 }
             }
             Self::Hash(ids) => ids.insert(id),
@@ -4705,6 +4714,40 @@ fn push_bigint_neighbor_with_seen<O: GraphNeighborOutput>(
         output.push_id(id);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod graph_neighbor_seen_tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_seen_starts_tiny_and_promotes_after_small_threshold() {
+        let mut seen = GraphNeighborSeen::new(None, 16);
+        for id in 0..16 {
+            assert!(seen.insert(id));
+        }
+        assert!(!seen.insert(15));
+        assert!(seen.insert(16));
+        match seen {
+            GraphNeighborSeen::Hash(ids) => {
+                assert_eq!(ids.len(), 17);
+                assert!(ids.contains(&0));
+                assert!(ids.contains(&16));
+            }
+            GraphNeighborSeen::Tiny(_) => panic!("expected promotion to hash set"),
+        }
+    }
+
+    #[test]
+    fn small_limited_seen_keeps_tiny_dedup_path() {
+        let mut seen = GraphNeighborSeen::new(Some(4), 4);
+        assert!(seen.insert(7));
+        assert!(!seen.insert(7));
+        match seen {
+            GraphNeighborSeen::Tiny(ids) => assert_eq!(ids, vec![7]),
+            GraphNeighborSeen::Hash(_) => panic!("small limited seen should stay tiny"),
+        }
+    }
 }
 
 fn compute_vector_distance(
