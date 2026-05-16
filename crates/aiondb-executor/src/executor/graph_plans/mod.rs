@@ -1785,6 +1785,84 @@ impl Executor {
         Ok(values)
     }
 
+    fn fast_graph_push_adjacency_neighbor_ids(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+        remaining: Option<usize>,
+        output: &mut Vec<Value>,
+    ) -> DbResult<()> {
+        let Some(max_new) = remaining else {
+            let values = self.fast_graph_adjacency_neighbors_cached(
+                context,
+                edge_table_id,
+                node_id,
+                outgoing,
+            )?;
+            output.extend(values.into_iter().filter(|value| !value.is_null()));
+            return Ok(());
+        };
+        if max_new == 0 {
+            return Ok(());
+        }
+
+        let start_len = output.len();
+        let generation = self.storage_dml.cache_generation();
+        let cache_key = generation
+            .and_then(|_| build_hash_key(node_id).ok())
+            .map(|node_key| GraphAdjacencyNeighborsCacheKey {
+                edge_table_id,
+                node_key,
+                outgoing,
+            });
+
+        if let (Some(cache_key), Some(generation)) = (&cache_key, generation) {
+            let cache = self
+                .graph_adjacency_neighbors_cache
+                .read()
+                .map_err(|error| {
+                    DbError::internal(format!("graph adjacency cache poisoned: {error}"))
+                })?;
+            if let Some((cached_generation, values)) = cache.get(cache_key) {
+                if *cached_generation == generation {
+                    for value in values {
+                        if value.is_null() {
+                            continue;
+                        }
+                        output.push(value.clone());
+                        if output.len() - start_len >= max_new {
+                            break;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut cursor = self.storage_dml.adjacency_neighbor_cursor(
+            context.txn_id,
+            &context.snapshot,
+            edge_table_id,
+            node_id,
+            outgoing,
+        )?;
+        while let Some(value) = cursor.next_neighbor() {
+            context.check_deadline()?;
+            if value.is_null() {
+                continue;
+            }
+            ensure_graph_workset_capacity(context, output.len(), "adjacency neighbor traversal")?;
+            context.track_memory(estimate_value_bytes(&value).saturating_add(32))?;
+            output.push(value);
+            if output.len() - start_len >= max_new {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn fast_graph_id_lookup_cache_get(
         &self,
         edge_table_id: RelationId,
@@ -2361,17 +2439,21 @@ impl Executor {
             return Ok(Some(ExecutionResult::Query { columns, rows }));
         }
 
-        let mut ids = match self.fast_graph_adjacency_neighbors_cached(
-            context,
-            edge_table_id,
-            &start_id,
-            true,
-        ) {
-            Ok(tuple_ids) => tuple_ids,
-            Err(_) => return Ok(None),
-        };
-
-        ids.retain(|id| !id.is_null());
+        let mut ids = Vec::with_capacity(limit.unwrap_or(0).min(1024));
+        let remaining = if ordered { None } else { limit };
+        if self
+            .fast_graph_push_adjacency_neighbor_ids(
+                context,
+                edge_table_id,
+                &start_id,
+                true,
+                remaining,
+                &mut ids,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
 
         if !plan.order_by.is_empty() {
             ids.sort_by(|left, right| {
@@ -2497,17 +2579,24 @@ impl Executor {
 
         let mut ids = Vec::new();
         for outgoing in lookup_outgoing {
-            let mut neighbors = match self.fast_graph_adjacency_neighbors_cached(
-                context,
-                edge_table_id,
-                &anchor_id,
-                outgoing,
-            ) {
-                Ok(ids) => ids,
-                Err(_) => return Ok(None),
+            let remaining = if ordered {
+                None
+            } else {
+                limit.map(|limit| limit.saturating_sub(ids.len()))
             };
-            neighbors.retain(|id| !id.is_null());
-            ids.append(&mut neighbors);
+            if self
+                .fast_graph_push_adjacency_neighbor_ids(
+                    context,
+                    edge_table_id,
+                    &anchor_id,
+                    outgoing,
+                    remaining,
+                    &mut ids,
+                )
+                .is_err()
+            {
+                return Ok(None);
+            }
             if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
                 break;
             }
@@ -2655,23 +2744,23 @@ impl Executor {
                 continue;
             }
             normalize_int_key(&mut middle_id);
-            let next_ids = match self.fast_graph_adjacency_neighbors_cached(
-                context,
-                edge_table_id,
-                &middle_id,
-                true,
-            ) {
-                Ok(ids) => ids,
-                Err(_) => return Ok(None),
+            let remaining = if ordered {
+                None
+            } else {
+                limit.map(|limit| limit.saturating_sub(ids.len()))
             };
-            for next_id in next_ids {
-                if next_id.is_null() {
-                    continue;
-                }
-                ids.push(next_id);
-                if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
-                    break;
-                }
+            if self
+                .fast_graph_push_adjacency_neighbor_ids(
+                    context,
+                    edge_table_id,
+                    &middle_id,
+                    true,
+                    remaining,
+                    &mut ids,
+                )
+                .is_err()
+            {
+                return Ok(None);
             }
             if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
                 break;
@@ -2827,23 +2916,26 @@ impl Executor {
                     continue;
                 }
                 normalize_int_key(&mut second_id);
-                let mut third_ids = match self.fast_graph_adjacency_neighbors_cached(
-                    context,
-                    first_rel_table_id,
-                    &second_id,
-                    true,
-                ) {
-                    Ok(ids) => ids,
-                    Err(_) => return Ok(None),
+                let remaining = if ordered {
+                    None
+                } else {
+                    limit.map(|limit| limit.saturating_sub(ids.len()))
                 };
-                for third_id in third_ids.drain(..) {
-                    if third_id.is_null() {
-                        continue;
-                    }
-                    ids.push(third_id);
-                    if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
-                        break 'outer;
-                    }
+                if self
+                    .fast_graph_push_adjacency_neighbor_ids(
+                        context,
+                        first_rel_table_id,
+                        &second_id,
+                        true,
+                        remaining,
+                        &mut ids,
+                    )
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+                if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
+                    break 'outer;
                 }
             }
         }
@@ -4164,19 +4256,21 @@ impl Executor {
                 continue;
             }
             normalize_int_key(&mut middle_id);
-            let next_ids = match self.fast_graph_adjacency_neighbors_cached(
-                context,
-                edge_table_id,
-                &middle_id,
-                true,
-            ) {
-                Ok(ids) => ids,
-                Err(_) => return Ok(None),
-            };
+            let mut next_ids = Vec::with_capacity(limit.saturating_sub(rows.len()).min(1024));
+            if self
+                .fast_graph_push_adjacency_neighbor_ids(
+                    context,
+                    edge_table_id,
+                    &middle_id,
+                    true,
+                    Some(limit.saturating_sub(rows.len())),
+                    &mut next_ids,
+                )
+                .is_err()
+            {
+                return Ok(None);
+            }
             for next_id in next_ids {
-                if next_id.is_null() {
-                    continue;
-                }
                 let row = Row::new(vec![next_id]);
                 result_bytes =
                     ensure_result_bytes_fit_and_track_query_row(context, &row, result_bytes)?;
