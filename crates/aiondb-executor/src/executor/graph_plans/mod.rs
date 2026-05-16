@@ -1729,6 +1729,20 @@ fn count_return_variable(expr: &TypedExpr) -> Option<&str> {
     column_ref_name(expr)
 }
 
+fn count_distinct_id_return_variable(expr: &TypedExpr) -> Option<&str> {
+    let TypedExprKind::AggCount {
+        expr: Some(expr),
+        distinct: true,
+        filter: None,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let name = column_ref_name(expr)?;
+    let (variable, property) = name.rsplit_once('.')?;
+    property.eq_ignore_ascii_case("id").then_some(variable)
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1890,6 +1904,175 @@ impl Executor {
             outgoing,
         )?;
         Ok(usize_to_u64(cursor.remaining_hint()))
+    }
+
+    fn fast_graph_add_count_frontier_node(
+        context: &ExecutionContext,
+        frontier: &mut HashMap<ValueHashKey, (Value, u64)>,
+        mut node_id: Value,
+        multiplicity: u64,
+    ) -> DbResult<()> {
+        if node_id.is_null() || multiplicity == 0 {
+            return Ok(());
+        }
+        normalize_int_key(&mut node_id);
+        let key = build_hash_key(&node_id)?;
+        match frontier.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let count = &mut entry.get_mut().1;
+                *count = count.saturating_add(multiplicity);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                context.track_memory(estimate_value_bytes(&node_id).saturating_add(64))?;
+                entry.insert((node_id, multiplicity));
+            }
+        }
+        Ok(())
+    }
+
+    fn fast_graph_count_fixed_outgoing_paths(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        start_id: &Value,
+        hops: usize,
+    ) -> DbResult<u64> {
+        if hops == 0 {
+            return Ok(0);
+        }
+        if hops == 1 {
+            return self.fast_graph_adjacency_neighbor_count(
+                context,
+                edge_table_id,
+                start_id,
+                true,
+            );
+        }
+        if hops == 2 {
+            let middle_ids =
+                self.fast_graph_adjacency_neighbors_cached(context, edge_table_id, start_id, true)?;
+            let mut count = 0u64;
+            for mut middle_id in middle_ids {
+                context.check_deadline()?;
+                if middle_id.is_null() {
+                    continue;
+                }
+                normalize_int_key(&mut middle_id);
+                let degree = self.fast_graph_adjacency_neighbor_count(
+                    context,
+                    edge_table_id,
+                    &middle_id,
+                    true,
+                )?;
+                count = count.saturating_add(degree);
+            }
+            return Ok(count);
+        }
+        if hops == 3 {
+            let first_ids =
+                self.fast_graph_adjacency_neighbors_cached(context, edge_table_id, start_id, true)?;
+            let mut count = 0u64;
+            for mut first_id in first_ids {
+                context.check_deadline()?;
+                if first_id.is_null() {
+                    continue;
+                }
+                normalize_int_key(&mut first_id);
+                let second_ids = self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &first_id,
+                    true,
+                )?;
+                for mut second_id in second_ids {
+                    context.check_deadline()?;
+                    if second_id.is_null() {
+                        continue;
+                    }
+                    normalize_int_key(&mut second_id);
+                    let degree = self.fast_graph_adjacency_neighbor_count(
+                        context,
+                        edge_table_id,
+                        &second_id,
+                        true,
+                    )?;
+                    count = count.saturating_add(degree);
+                }
+            }
+            return Ok(count);
+        }
+
+        let mut frontier = HashMap::new();
+        Self::fast_graph_add_count_frontier_node(context, &mut frontier, start_id.clone(), 1)?;
+        for _ in 1..hops {
+            let mut next = HashMap::new();
+            for (node_id, multiplicity) in frontier.into_values() {
+                context.check_deadline()?;
+                let neighbors = self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &node_id,
+                    true,
+                )?;
+                for neighbor_id in neighbors {
+                    Self::fast_graph_add_count_frontier_node(
+                        context,
+                        &mut next,
+                        neighbor_id,
+                        multiplicity,
+                    )?;
+                }
+            }
+            if next.is_empty() {
+                return Ok(0);
+            }
+            frontier = next;
+        }
+
+        let mut count = 0u64;
+        for (node_id, multiplicity) in frontier.into_values() {
+            context.check_deadline()?;
+            let degree =
+                self.fast_graph_adjacency_neighbor_count(context, edge_table_id, &node_id, true)?;
+            count = count.saturating_add(multiplicity.saturating_mul(degree));
+        }
+        Ok(count)
+    }
+
+    fn fast_graph_count_distinct_fixed_outgoing_end_ids(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        start_id: &Value,
+        hops: usize,
+    ) -> DbResult<u64> {
+        if hops == 0 {
+            return Ok(0);
+        }
+
+        let mut frontier = HashMap::new();
+        Self::fast_graph_add_count_frontier_node(context, &mut frontier, start_id.clone(), 1)?;
+        for _ in 0..hops {
+            let mut next = HashMap::new();
+            for (node_id, _) in frontier.into_values() {
+                context.check_deadline()?;
+                let neighbors = self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &node_id,
+                    true,
+                )?;
+                for neighbor_id in neighbors {
+                    Self::fast_graph_add_count_frontier_node(context, &mut next, neighbor_id, 1)?;
+                }
+            }
+            if next.is_empty() {
+                return Ok(0);
+            }
+            frontier = next;
+        }
+
+        Ok(usize_to_u64(frontier.len()))
     }
 
     fn fast_graph_id_lookup_cache_get(
@@ -2731,10 +2914,7 @@ impl Executor {
         }
         let pattern = &match_clause.patterns[0];
         let hops = pattern.relationships.len();
-        if pattern.path_function.is_some()
-            || !(1..=3).contains(&hops)
-            || pattern.nodes.len() != hops + 1
-        {
+        if pattern.path_function.is_some() || hops == 0 || pattern.nodes.len() != hops + 1 {
             return Ok(None);
         }
 
@@ -2750,9 +2930,11 @@ impl Executor {
         let Some(end_variable) = end.variable.as_deref() else {
             return Ok(None);
         };
-        if count_return_variable(&plan.returns[0].expr)
-            .map_or(true, |name| !name.eq_ignore_ascii_case(end_variable))
-        {
+        let count_all_end = count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable));
+        let count_distinct_end_id = count_distinct_id_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable));
+        if !count_all_end && !count_distinct_end_id {
             return Ok(None);
         }
         if start.table_id.is_none()
@@ -2786,93 +2968,19 @@ impl Executor {
         };
         normalize_int_key(&mut start_id);
 
-        let count = match hops {
-            1 => match self.fast_graph_adjacency_neighbor_count(
+        let count_result = if count_distinct_end_id {
+            self.fast_graph_count_distinct_fixed_outgoing_end_ids(
                 context,
                 edge_table_id,
                 &start_id,
-                true,
-            ) {
-                Ok(count) => count,
-                Err(_) => return Ok(None),
-            },
-            2 => {
-                let middle_ids = match self.fast_graph_adjacency_neighbors_cached(
-                    context,
-                    edge_table_id,
-                    &start_id,
-                    true,
-                ) {
-                    Ok(ids) => ids,
-                    Err(_) => return Ok(None),
-                };
-                let mut count = 0u64;
-                for mut middle_id in middle_ids {
-                    context.check_deadline()?;
-                    if middle_id.is_null() {
-                        continue;
-                    }
-                    normalize_int_key(&mut middle_id);
-                    let degree = match self.fast_graph_adjacency_neighbor_count(
-                        context,
-                        edge_table_id,
-                        &middle_id,
-                        true,
-                    ) {
-                        Ok(count) => count,
-                        Err(_) => return Ok(None),
-                    };
-                    count = count.saturating_add(degree);
-                }
-                count
-            }
-            3 => {
-                let first_ids = match self.fast_graph_adjacency_neighbors_cached(
-                    context,
-                    edge_table_id,
-                    &start_id,
-                    true,
-                ) {
-                    Ok(ids) => ids,
-                    Err(_) => return Ok(None),
-                };
-                let mut count = 0u64;
-                for mut first_id in first_ids {
-                    context.check_deadline()?;
-                    if first_id.is_null() {
-                        continue;
-                    }
-                    normalize_int_key(&mut first_id);
-                    let second_ids = match self.fast_graph_adjacency_neighbors_cached(
-                        context,
-                        edge_table_id,
-                        &first_id,
-                        true,
-                    ) {
-                        Ok(ids) => ids,
-                        Err(_) => return Ok(None),
-                    };
-                    for mut second_id in second_ids {
-                        context.check_deadline()?;
-                        if second_id.is_null() {
-                            continue;
-                        }
-                        normalize_int_key(&mut second_id);
-                        let degree = match self.fast_graph_adjacency_neighbor_count(
-                            context,
-                            edge_table_id,
-                            &second_id,
-                            true,
-                        ) {
-                            Ok(count) => count,
-                            Err(_) => return Ok(None),
-                        };
-                        count = count.saturating_add(degree);
-                    }
-                }
-                count
-            }
-            _ => return Ok(None),
+                hops,
+            )
+        } else {
+            self.fast_graph_count_fixed_outgoing_paths(context, edge_table_id, &start_id, hops)
+        };
+        let count = match count_result {
+            Ok(count) => count,
+            Err(_) => return Ok(None),
         };
 
         let row = Row::new(vec![Value::BigInt(

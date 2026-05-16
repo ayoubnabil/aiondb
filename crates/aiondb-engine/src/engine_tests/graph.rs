@@ -1723,11 +1723,14 @@ fn cypher_anchored_path_counts_use_adjacency_chain() {
              CREATE TABLE knows_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
              CREATE NODE LABEL person_count_fast ON people_count_fast; \
              CREATE EDGE LABEL knows_count_fast ON knows_count_fast_edges SOURCE person_count_fast TARGET person_count_fast; \
-             INSERT INTO people_count_fast VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9); \
+             INSERT INTO people_count_fast VALUES \
+                (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14); \
              INSERT INTO knows_count_fast_edges VALUES \
                 (1, 2), (1, 3), \
                 (2, 4), (2, 5), (3, 6), \
-                (4, 7), (5, 8), (6, 9)",
+                (4, 7), (5, 8), (6, 9), \
+                (7, 10), (8, 11), (9, 12), \
+                (10, 13), (11, 14)",
         )
         .expect("seed graph");
 
@@ -1757,6 +1760,73 @@ fn cypher_anchored_path_counts_use_adjacency_chain() {
              RETURN count(d)",
         ),
         3,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_count_fast {id: 1})-[:knows_count_fast]->(b:person_count_fast)-[:knows_count_fast]->(c:person_count_fast)-[:knows_count_fast]->(d:person_count_fast)-[:knows_count_fast]->(e:person_count_fast) \
+             RETURN count(e)",
+        ),
+        3,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_count_fast {id: 1})-[:knows_count_fast]->(b:person_count_fast)-[:knows_count_fast]->(c:person_count_fast)-[:knows_count_fast]->(d:person_count_fast)-[:knows_count_fast]->(e:person_count_fast)-[:knows_count_fast]->(f:person_count_fast) \
+             RETURN count(f)",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn cypher_anchored_distinct_path_counts_use_adjacency_chain() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_distinct_count_fast (id INT NOT NULL); \
+             CREATE TABLE knows_distinct_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_distinct_count_fast ON people_distinct_count_fast; \
+             CREATE EDGE LABEL knows_distinct_count_fast ON knows_distinct_count_fast_edges SOURCE person_distinct_count_fast TARGET person_distinct_count_fast; \
+             INSERT INTO people_distinct_count_fast VALUES (1), (2), (3), (4), (5), (6), (7); \
+             INSERT INTO knows_distinct_count_fast_edges VALUES \
+                (1, 2), (1, 3), \
+                (2, 4), (3, 4), (3, 5), \
+                (4, 6), (5, 6), (5, 7)",
+        )
+        .expect("seed graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_distinct_count_fast {id: 1})-[:knows_distinct_count_fast]->(b:person_distinct_count_fast)-[:knows_distinct_count_fast]->(c:person_distinct_count_fast) \
+             RETURN count(c)",
+        ),
+        3,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_distinct_count_fast {id: 1})-[:knows_distinct_count_fast]->(b:person_distinct_count_fast)-[:knows_distinct_count_fast]->(c:person_distinct_count_fast) \
+             RETURN count(DISTINCT c.id)",
+        ),
+        2,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_distinct_count_fast {id: 1})-[:knows_distinct_count_fast]->(b:person_distinct_count_fast)-[:knows_distinct_count_fast]->(c:person_distinct_count_fast)-[:knows_distinct_count_fast]->(d:person_distinct_count_fast) \
+             RETURN count(DISTINCT d.id)",
+        ),
+        2,
     );
 }
 
