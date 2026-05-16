@@ -29,6 +29,13 @@ use aiondb_graph_api::GraphViewV2;
 
 use super::{u32_to_usize, usize_to_u32, GraphViewV2Ext};
 
+const TRIANGLE_PAR_MIN_NODES: usize = 4096;
+
+#[inline]
+fn use_parallel_triangle(n: usize) -> bool {
+    rayon::current_num_threads() > 1 && n >= TRIANGLE_PAR_MIN_NODES
+}
+
 #[inline]
 fn u64_to_f64(value: u64) -> f64 {
     // IEEE-754 narrowing convert. Triangle counts here are dominated by graph
@@ -58,29 +65,39 @@ pub fn triangle_count<G: GraphViewV2 + ?Sized>(graph: &G) -> u64 {
     if n < 3 {
         return 0;
     }
+    let n_usize = u32_to_usize(n);
+    let use_parallel = use_parallel_triangle(n_usize);
 
-    let sorted = sorted_neighbor_lists(graph);
+    let forward = sorted_forward_neighbor_lists(graph, use_parallel);
 
     // Each source-node contribution is independent — sum reduces in parallel.
     // u64 addition is associative and commutative, so the result is identical
     // regardless of how rayon partitions the range.
-    (0..n)
-        .into_par_iter()
-        .with_min_len(16)
-        .map(|u| {
-            let neighbors_u = &sorted[u32_to_usize(u)];
-            let mut local: u64 = 0;
-            for &v in neighbors_u {
-                if v <= u {
-                    continue;
+    if use_parallel {
+        (0..n)
+            .into_par_iter()
+            .with_min_len(16)
+            .map(|u| {
+                let neighbors_u = &forward[u32_to_usize(u)];
+                let mut local: u64 = 0;
+                for &v in neighbors_u {
+                    let neighbors_v = &forward[u32_to_usize(v)];
+                    local = local.saturating_add(count_common_neighbors(neighbors_u, neighbors_v));
                 }
-                let neighbors_v = &sorted[u32_to_usize(v)];
-                local =
-                    local.saturating_add(count_common_neighbors_after(neighbors_u, neighbors_v, v));
+                local
+            })
+            .sum()
+    } else {
+        let mut total = 0u64;
+        for u in 0..n {
+            let neighbors_u = &forward[u32_to_usize(u)];
+            for &v in neighbors_u {
+                let neighbors_v = &forward[u32_to_usize(v)];
+                total = total.saturating_add(count_common_neighbors(neighbors_u, neighbors_v));
             }
-            local
-        })
-        .sum()
+        }
+        total
+    }
 }
 
 /// Count the number of triangles each node participates in.
@@ -100,40 +117,50 @@ pub fn node_triangle_count<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<u32> {
     if n < 3 {
         return vec![0u32; n_usize];
     }
+    let use_parallel = use_parallel_triangle(n_usize);
 
-    let sorted = sorted_neighbor_lists(graph);
+    let forward = sorted_forward_neighbor_lists(graph, use_parallel);
 
     // Source nodes are processed in parallel. Each worker writes its triangle
     // credits into a thread-local dense vector; we then element-wise reduce
     // them, so there is no shared mutable state during the scatter.
     // `with_min_len` keeps tiny graphs close to sequential cost by preventing
     // per-element fan-out that would allocate one dense Vec per source.
-    (0..n)
-        .into_par_iter()
-        .with_min_len(32)
-        .fold(
-            || vec![0u32; n_usize],
-            |mut local, u| {
-                let neighbors_u = &sorted[u32_to_usize(u)];
-                for &v in neighbors_u {
-                    if v <= u {
-                        continue;
+    if use_parallel {
+        (0..n)
+            .into_par_iter()
+            .with_min_len(32)
+            .fold(
+                || vec![0u32; n_usize],
+                |mut local, u| {
+                    let neighbors_u = &forward[u32_to_usize(u)];
+                    for &v in neighbors_u {
+                        let neighbors_v = &forward[u32_to_usize(v)];
+                        add_triangle_credits(&mut local, u, v, neighbors_u, neighbors_v);
                     }
-                    let neighbors_v = &sorted[u32_to_usize(v)];
-                    add_triangle_credits_after(&mut local, u, v, neighbors_u, neighbors_v);
-                }
-                local
-            },
-        )
-        .reduce(
-            || vec![0u32; n_usize],
-            |mut a, b| {
-                for (ai, bi) in a.iter_mut().zip(b.iter()) {
-                    *ai = ai.saturating_add(*bi);
-                }
-                a
-            },
-        )
+                    local
+                },
+            )
+            .reduce(
+                || vec![0u32; n_usize],
+                |mut a, b| {
+                    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                        *ai = ai.saturating_add(*bi);
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut counts = vec![0u32; n_usize];
+        for u in 0..n {
+            let neighbors_u = &forward[u32_to_usize(u)];
+            for &v in neighbors_u {
+                let neighbors_v = &forward[u32_to_usize(v)];
+                add_triangle_credits(&mut counts, u, v, neighbors_u, neighbors_v);
+            }
+        }
+        counts
+    }
 }
 
 /// Compute the local clustering coefficient for every node.
@@ -161,16 +188,25 @@ pub fn local_clustering_coefficient<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f
         .map(|v| u64::from(graph.degree(usize_to_u32(v))))
         .collect();
 
-    tri.par_iter()
-        .zip(degrees.par_iter())
-        .map(|(t, d)| {
-            if *d < 2 {
-                return 0.0_f64;
-            }
-            let possible = *d * (*d - 1);
-            f64::from(t.saturating_mul(2)) / u64_to_f64(possible)
-        })
-        .collect()
+    if use_parallel_triangle(n) {
+        tri.par_iter()
+            .zip(degrees.par_iter())
+            .map(|(t, d)| local_clustering_value(t, d))
+            .collect()
+    } else {
+        tri.iter()
+            .zip(degrees.iter())
+            .map(|(t, d)| local_clustering_value(t, d))
+            .collect()
+    }
+}
+
+fn local_clustering_value(t: &u32, d: &u64) -> f64 {
+    if *d < 2 {
+        return 0.0_f64;
+    }
+    let possible = *d * (*d - 1);
+    f64::from(t.saturating_mul(2)) / u64_to_f64(possible)
 }
 
 /// Compute the global clustering coefficient (transitivity).
@@ -194,9 +230,10 @@ pub fn global_clustering_coefficient<G: GraphViewV2 + ?Sized>(graph: &G) -> f64 
     let mut triplets: u64 = 0;
     for v in 0..n {
         let d = u64::from(graph.degree(v));
-        if d >= 2 {
-            triplets = triplets.saturating_add(d * (d - 1) / 2);
+        if d < 2 {
+            continue;
         }
+        triplets = triplets.saturating_add(d * (d - 1) / 2);
     }
 
     if triplets == 0 {
@@ -210,34 +247,53 @@ pub fn global_clustering_coefficient<G: GraphViewV2 + ?Sized>(graph: &G) -> f64 
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Build sorted neighbor lists for every node.
-fn sorted_neighbor_lists<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<Vec<u32>> {
+/// Build sorted forward neighbor lists (`neighbor > node`) for every node.
+fn sorted_forward_neighbor_lists<G: GraphViewV2 + ?Sized>(
+    graph: &G,
+    use_parallel: bool,
+) -> Vec<Vec<u32>> {
     let n = u32_to_usize(graph.node_count());
-    // Snapshot the borrowed slices first, then sort/dedup in parallel. The
-    // owned sorted lists are required by the algorithm regardless; the
-    // snapshot just lets the parallel phase work on plain slices.
+    // Snapshot the borrowed slices first, then orient/sort/dedup. Keeping only
+    // forward neighbors canonicalizes each undirected edge once and avoids a
+    // per-edge partition step in the triangle loops.
     let raw: Vec<&[u32]> = (0..usize_to_u32(n))
         .map(|v| graph.out_neighbors(v))
         .collect();
-    raw.par_iter()
-        .map(|nbrs| {
-            let mut owned = nbrs.to_vec();
-            owned.sort_unstable();
-            owned.dedup();
-            owned
-        })
-        .collect()
+    if use_parallel {
+        raw.par_iter()
+            .enumerate()
+            .map(|(node, nbrs)| {
+                let node = usize_to_u32(node);
+                let mut owned = nbrs
+                    .iter()
+                    .copied()
+                    .filter(|neighbor| *neighbor > node)
+                    .collect::<Vec<_>>();
+                owned.sort_unstable();
+                owned.dedup();
+                owned
+            })
+            .collect()
+    } else {
+        raw.iter()
+            .enumerate()
+            .map(|(node, nbrs)| {
+                let node = usize_to_u32(node);
+                let mut owned = nbrs
+                    .iter()
+                    .copied()
+                    .filter(|neighbor| *neighbor > node)
+                    .collect::<Vec<_>>();
+                owned.sort_unstable();
+                owned.dedup();
+                owned
+            })
+            .collect()
+    }
 }
 
-fn first_strictly_greater(sorted: &[u32], threshold: u32) -> usize {
-    sorted.partition_point(|&node| node <= threshold)
-}
-
-fn count_common_neighbors_after(a: &[u32], b: &[u32], threshold: u32) -> u64 {
-    let (mut i, mut j) = (
-        first_strictly_greater(a, threshold),
-        first_strictly_greater(b, threshold),
-    );
+fn count_common_neighbors(a: &[u32], b: &[u32]) -> u64 {
+    let (mut i, mut j) = (0usize, 0usize);
     let mut count = 0u64;
 
     while i < a.len() && j < b.len() {
@@ -255,17 +311,8 @@ fn count_common_neighbors_after(a: &[u32], b: &[u32], threshold: u32) -> u64 {
     count
 }
 
-fn add_triangle_credits_after(
-    local: &mut [u32],
-    u_node: u32,
-    v_node: u32,
-    u_adj: &[u32],
-    v_adj: &[u32],
-) {
-    let (mut ai, mut bj) = (
-        first_strictly_greater(u_adj, v_node),
-        first_strictly_greater(v_adj, v_node),
-    );
+fn add_triangle_credits(local: &mut [u32], u_node: u32, v_node: u32, u_adj: &[u32], v_adj: &[u32]) {
+    let (mut ai, mut bj) = (0usize, 0usize);
     let (ui, vi) = (u32_to_usize(u_node), u32_to_usize(v_node));
 
     while ai < u_adj.len() && bj < v_adj.len() {
