@@ -1793,6 +1793,41 @@ fn cypher_deep_id_lookup_uses_adjacency_chain() {
 }
 
 #[test]
+fn cypher_anchored_edge_property_count_uses_adjacency_edges() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_edge_weight_fast (id INT NOT NULL); \
+             CREATE TABLE knows_edge_weight_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_edge_weight_fast ON people_edge_weight_fast; \
+             CREATE EDGE LABEL knows_edge_weight_fast ON knows_edge_weight_fast_edges SOURCE person_edge_weight_fast TARGET person_edge_weight_fast; \
+             INSERT INTO people_edge_weight_fast VALUES (1), (2), (3), (4), (5); \
+             INSERT INTO knows_edge_weight_fast_edges VALUES \
+                (1, 2, 7), (1, 3, 9), (1, 4, 7), (2, 5, 7)",
+        )
+        .expect("seed weighted graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_edge_weight_fast {id: 1})-[r:knows_edge_weight_fast]->(b:person_edge_weight_fast) \
+         WHERE r.weight = 7 RETURN count(b)",
+    );
+    assert_eq!(rows, vec![Row::new(vec![Value::BigInt(2)])]);
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_edge_weight_fast {id: 1})-[r:knows_edge_weight_fast]->(b:person_edge_weight_fast) \
+         WHERE r.weight = 9 RETURN count(b)",
+    );
+    assert_eq!(rows, vec![Row::new(vec![Value::BigInt(1)])]);
+}
+
+#[test]
 fn cypher_anchored_path_counts_use_adjacency_chain() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
