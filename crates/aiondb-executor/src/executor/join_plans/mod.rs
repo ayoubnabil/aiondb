@@ -1514,9 +1514,10 @@ impl Executor {
                         "join child materialization exceeded row cap; consider adding filters or indexes",
                     ));
                 }
-                for row in &rows {
-                    context.track_memory(estimate_row_bytes(row))?;
-                }
+                const GRAPH_NEIGHBOR_ROW_BYTES: u64 = 8;
+                context.track_memory(
+                    usize_to_u64(rows.len()).saturating_mul(GRAPH_NEIGHBOR_ROW_BYTES),
+                )?;
                 return Ok((rows, output_fields.len()));
             }
         }
