@@ -157,30 +157,24 @@ pub fn pagerank<G: GraphViewV2 + ?Sized>(
         if let Some(reverse_adjacency) = reverse_adjacency.as_ref() {
             if use_parallel {
                 new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
-                    let incoming_sum = reverse_adjacency[v]
-                        .iter()
-                        .map(|&u| {
-                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                            scores
-                                .get(u_idx)
-                                .zip(inv_out_degrees.get(u_idx))
-                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
-                        })
-                        .sum::<f64>();
+                    let mut incoming_sum = 0.0;
+                    for &u in reverse_adjacency[v] {
+                        let u_idx = u as usize;
+                        if u_idx < n {
+                            incoming_sum += scores[u_idx] * inv_out_degrees[u_idx];
+                        }
+                    }
                     *ns = base + dangling_share + damping * incoming_sum;
                 });
             } else {
                 for (v, ns) in new_scores.iter_mut().enumerate() {
-                    let incoming_sum = reverse_adjacency[v]
-                        .iter()
-                        .map(|&u| {
-                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                            scores
-                                .get(u_idx)
-                                .zip(inv_out_degrees.get(u_idx))
-                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
-                        })
-                        .sum::<f64>();
+                    let mut incoming_sum = 0.0;
+                    for &u in reverse_adjacency[v] {
+                        let u_idx = u as usize;
+                        if u_idx < n {
+                            incoming_sum += scores[u_idx] * inv_out_degrees[u_idx];
+                        }
+                    }
                     *ns = base + dangling_share + damping * incoming_sum;
                 }
             }
@@ -388,31 +382,25 @@ pub fn personalized_pagerank<G: GraphViewV2 + ?Sized>(
         if let Some(reverse_adjacency) = reverse_adjacency.as_ref() {
             if use_parallel {
                 new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
-                    let incoming_sum = reverse_adjacency[v]
-                        .iter()
-                        .map(|&u| {
-                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                            scores
-                                .get(u_idx)
-                                .zip(inv_out_degrees.get(u_idx))
-                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
-                        })
-                        .sum::<f64>();
+                    let mut incoming_sum = 0.0;
+                    for &u in reverse_adjacency[v] {
+                        let u_idx = u as usize;
+                        if u_idx < n {
+                            incoming_sum += scores[u_idx] * inv_out_degrees[u_idx];
+                        }
+                    }
                     *ns = (1.0 - damping) * restart[v]
                         + damping * (dangling_sum * restart[v] + incoming_sum);
                 });
             } else {
                 for (v, ns) in new_scores.iter_mut().enumerate() {
-                    let incoming_sum = reverse_adjacency[v]
-                        .iter()
-                        .map(|&u| {
-                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                            scores
-                                .get(u_idx)
-                                .zip(inv_out_degrees.get(u_idx))
-                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
-                        })
-                        .sum::<f64>();
+                    let mut incoming_sum = 0.0;
+                    for &u in reverse_adjacency[v] {
+                        let u_idx = u as usize;
+                        if u_idx < n {
+                            incoming_sum += scores[u_idx] * inv_out_degrees[u_idx];
+                        }
+                    }
                     *ns = (1.0 - damping) * restart[v]
                         + damping * (dangling_sum * restart[v] + incoming_sum);
                 }
