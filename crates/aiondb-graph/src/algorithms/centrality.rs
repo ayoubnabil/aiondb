@@ -309,21 +309,23 @@ pub fn closeness_centrality<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.out_neighbors(u)).collect();
 
     // Each source's BFS is independent; collect by index for determinism.
-    (0..n_u32)
-        .into_par_iter()
-        .with_min_len(8)
-        .map_init(
-            || ClosenessWorkspace::new(n),
-            |workspace, s| {
-                let (reachable, total_dist) = bfs_distances(&adjacency, workspace, s);
-                if reachable > 1 && total_dist > 0 {
-                    u32_to_f64(reachable - 1) / u64_to_f64(total_dist)
-                } else {
-                    0.0_f64
-                }
-            },
-        )
-        .collect()
+    if use_parallel_sources(n) {
+        (0..n_u32)
+            .into_par_iter()
+            .with_min_len(8)
+            .map_init(
+                || ClosenessWorkspace::new(n),
+                |workspace, s| closeness_from_source(&adjacency, workspace, s),
+            )
+            .collect()
+    } else {
+        let mut workspace = ClosenessWorkspace::new(n);
+        let mut scores = Vec::with_capacity(n);
+        for source in 0..n_u32 {
+            scores.push(closeness_from_source(&adjacency, &mut workspace, source));
+        }
+        scores
+    }
 }
 
 /// Closeness centrality with the **Wasserman–Faust** normalization.
@@ -349,23 +351,28 @@ pub fn closeness_centrality_wf<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     let denom = u64_to_f64((n - 1) as u64);
     let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.out_neighbors(u)).collect();
 
-    (0..n_u32)
-        .into_par_iter()
-        .with_min_len(8)
-        .map_init(
-            || ClosenessWorkspace::new(n),
-            |workspace, s| {
-                let (reachable, total_dist) = bfs_distances(&adjacency, workspace, s);
-                if reachable > 1 && total_dist > 0 {
-                    let base = u32_to_f64(reachable - 1) / u64_to_f64(total_dist);
-                    let coverage = u32_to_f64(reachable - 1) / denom;
-                    base * coverage
-                } else {
-                    0.0_f64
-                }
-            },
-        )
-        .collect()
+    if use_parallel_sources(n) {
+        (0..n_u32)
+            .into_par_iter()
+            .with_min_len(8)
+            .map_init(
+                || ClosenessWorkspace::new(n),
+                |workspace, s| closeness_wf_from_source(&adjacency, workspace, s, denom),
+            )
+            .collect()
+    } else {
+        let mut workspace = ClosenessWorkspace::new(n);
+        let mut scores = Vec::with_capacity(n);
+        for source in 0..n_u32 {
+            scores.push(closeness_wf_from_source(
+                &adjacency,
+                &mut workspace,
+                source,
+                denom,
+            ));
+        }
+        scores
+    }
 }
 
 /// Compute harmonic centrality for all nodes.
@@ -386,14 +393,23 @@ pub fn harmonic_centrality<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     }
 
     let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.out_neighbors(u)).collect();
-    (0..n_u32)
-        .into_par_iter()
-        .with_min_len(8)
-        .map_init(
-            || ClosenessWorkspace::new(n),
-            |workspace, source| harmonic_from_source(&adjacency, workspace, source),
-        )
-        .collect()
+    if use_parallel_sources(n) {
+        (0..n_u32)
+            .into_par_iter()
+            .with_min_len(8)
+            .map_init(
+                || ClosenessWorkspace::new(n),
+                |workspace, source| harmonic_from_source(&adjacency, workspace, source),
+            )
+            .collect()
+    } else {
+        let mut workspace = ClosenessWorkspace::new(n);
+        let mut scores = Vec::with_capacity(n);
+        for source in 0..n_u32 {
+            scores.push(harmonic_from_source(&adjacency, &mut workspace, source));
+        }
+        scores
+    }
 }
 
 /// Compute eigenvector centrality with power iteration.
@@ -552,6 +568,35 @@ fn bfs_distances(
     }
 
     (reachable, total_dist)
+}
+
+fn closeness_from_source(
+    adjacency: &[&[u32]],
+    workspace: &mut ClosenessWorkspace,
+    source: u32,
+) -> f64 {
+    let (reachable, total_dist) = bfs_distances(adjacency, workspace, source);
+    if reachable > 1 && total_dist > 0 {
+        u32_to_f64(reachable - 1) / u64_to_f64(total_dist)
+    } else {
+        0.0
+    }
+}
+
+fn closeness_wf_from_source(
+    adjacency: &[&[u32]],
+    workspace: &mut ClosenessWorkspace,
+    source: u32,
+    denom: f64,
+) -> f64 {
+    let (reachable, total_dist) = bfs_distances(adjacency, workspace, source);
+    if reachable > 1 && total_dist > 0 {
+        let base = u32_to_f64(reachable - 1) / u64_to_f64(total_dist);
+        let coverage = u32_to_f64(reachable - 1) / denom;
+        base * coverage
+    } else {
+        0.0
+    }
 }
 
 fn harmonic_from_source(
