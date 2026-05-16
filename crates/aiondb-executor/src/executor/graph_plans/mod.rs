@@ -1933,7 +1933,7 @@ impl Executor {
         target_table_id: RelationId,
         filter_column_name: &str,
         filter_value: &Value,
-    ) -> DbResult<Option<HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>>> {
+    ) -> DbResult<Option<Arc<HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>>>> {
         let Some(target_table) = self
             .catalog_reader
             .get_table_by_id(context.txn_id, target_table_id)?
@@ -1961,6 +1961,33 @@ impl Executor {
         else {
             return Ok(None);
         };
+        let cache_key = self
+            .storage_dml
+            .cache_generation()
+            .and_then(|_| build_hash_key(filter_value).ok())
+            .map(|filter_value| GraphTargetFilterIdsCacheKey {
+                target_table_id,
+                id_ordinal,
+                filter_ordinal,
+                filter_value,
+            });
+        if let (Some(cache_key), Some(generation)) =
+            (&cache_key, self.storage_dml.cache_generation())
+        {
+            let cached = self
+                .graph_target_filter_ids_cache
+                .read()
+                .map_err(|error| {
+                    DbError::internal(format!("graph target filter cache poisoned: {error}"))
+                })?
+                .get(cache_key)
+                .cloned();
+            if let Some((cached_generation, allowed)) = cached {
+                if cached_generation == generation {
+                    return Ok(Some(allowed));
+                }
+            }
+        }
         let mut stream = self.resolve_scan_stream(
             context,
             target_table_id,
@@ -1995,6 +2022,21 @@ impl Executor {
             if allowed.insert(id_key) {
                 context.track_memory(estimate_value_bytes(&normalized_id).saturating_add(32))?;
             }
+        }
+        let allowed = Arc::new(allowed);
+        if let (Some(cache_key), Some(generation)) =
+            (cache_key, self.storage_dml.cache_generation())
+        {
+            let mut cache = self
+                .graph_target_filter_ids_cache
+                .write()
+                .map_err(|error| {
+                    DbError::internal(format!("graph target filter cache poisoned: {error}"))
+                })?;
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (generation, Arc::clone(&allowed)));
         }
         Ok(Some(allowed))
     }

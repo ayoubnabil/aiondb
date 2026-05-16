@@ -46,7 +46,7 @@ mod tests;
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex, RwLock},
 };
@@ -490,6 +490,15 @@ pub struct Executor {
     graph_first_col_row_cache: RwLock<HashMap<GraphFirstColRowCacheKey, (u64, Option<Row>)>>,
     graph_edge_filter_limit_rows_cache:
         RwLock<HashMap<GraphEdgeFilterLimitRowsCacheKey, (u64, Vec<Row>)>>,
+    graph_target_filter_ids_cache: RwLock<
+        HashMap<
+            GraphTargetFilterIdsCacheKey,
+            (
+                u64,
+                Arc<HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>>,
+            ),
+        >,
+    >,
     graph_algorithm_runtime_caches: GraphAlgorithmRuntimeCaches,
     hybrid_deep_graph_vector_meta_cache:
         RwLock<HashMap<HybridDeepGraphVectorMetaCacheKey, (u64, HybridDeepGraphVectorMeta)>>,
@@ -564,6 +573,14 @@ pub(super) struct GraphEdgeFilterLimitRowsCacheKey {
     pub weight_col_idx: usize,
     pub filter_value: ValueHashKey,
     pub limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct GraphTargetFilterIdsCacheKey {
+    pub target_table_id: RelationId,
+    pub id_ordinal: usize,
+    pub filter_ordinal: usize,
+    pub filter_value: ValueHashKey,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1073,6 +1090,7 @@ impl Executor {
             graph_id_lookup_result_cache: RwLock::new(HashMap::new()),
             graph_first_col_row_cache: RwLock::new(HashMap::new()),
             graph_edge_filter_limit_rows_cache: RwLock::new(HashMap::new()),
+            graph_target_filter_ids_cache: RwLock::new(HashMap::new()),
             graph_algorithm_runtime_caches: GraphAlgorithmRuntimeCaches::new(),
             hybrid_deep_graph_vector_meta_cache: RwLock::new(HashMap::new()),
             join_index_lookup_row_cache: RwLock::new(HashMap::new()),
