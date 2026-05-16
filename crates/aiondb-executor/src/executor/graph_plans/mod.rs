@@ -2604,6 +2604,11 @@ impl Executor {
             return Ok(result);
         }
         if let Some(result) =
+            self.try_execute_fast_anchored_first_edge_property_path_count(plan, context)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
             self.try_execute_fast_anchored_one_hop_edge_property_count(plan, context)?
         {
             return Ok(result);
@@ -3548,6 +3553,253 @@ impl Executor {
             if ordering == Ordering::Equal {
                 count = count.saturating_add(1);
             }
+        }
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
+    }
+
+    fn try_execute_fast_anchored_first_edge_property_path_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        let hops = pattern.relationships.len();
+        if pattern.path_function.is_some() || hops < 2 || pattern.nodes.len() != hops + 1 {
+            return Ok(None);
+        }
+
+        let Some(start) = pattern.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(end) = pattern.nodes.last() else {
+            return Ok(None);
+        };
+        let Some(start_variable) = start.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        if !count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable))
+        {
+            return Ok(None);
+        }
+        if start.table_id.is_none()
+            || end.table_id.is_none()
+            || pattern.nodes[1..].iter().any(|node| {
+                node.table_id.is_none()
+                    || !node.properties.is_empty()
+                    || node.index_scan.is_some()
+                    || !node.range_pushdown.is_empty()
+            })
+        {
+            return Ok(None);
+        }
+
+        let Some(first_rel) = pattern.relationships.first() else {
+            return Ok(None);
+        };
+        let Some(edge_table_id) = first_rel.table_id else {
+            return Ok(None);
+        };
+        if pattern.relationships.iter().any(|rel| {
+            rel.table_id != Some(edge_table_id)
+                || rel.direction != CypherRelDirection::Outgoing
+                || rel.min_hops.is_some()
+                || rel.max_hops.is_some()
+                || rel.index_scan.is_some()
+        }) {
+            return Ok(None);
+        }
+        if pattern
+            .relationships
+            .iter()
+            .skip(1)
+            .any(|rel| rel.variable.is_some() || !rel.properties.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let mut start_id = match start.properties.as_slice() {
+            [] => None,
+            [property] if property.key.eq_ignore_ascii_case("id") => literal_value(&property.value),
+            _ => return Ok(None),
+        };
+        let mut filter_column = None;
+        let mut filter_value = match first_rel.properties.as_slice() {
+            [] => None,
+            [property] => {
+                filter_column = Some(property.key.clone());
+                let Some(value) = literal_value(&property.value) else {
+                    return Ok(None);
+                };
+                Some(value)
+            }
+            _ => return Ok(None),
+        };
+
+        if let Some(filter) = match_clause.filter.as_ref() {
+            let mut conjuncts = Vec::new();
+            collect_graph_filter_conjuncts(filter, &mut conjuncts);
+            for conjunct in conjuncts {
+                if let Some(value) =
+                    exact_named_column_literal_equality(conjunct, &format!("{start_variable}.id"))
+                {
+                    match start_id.as_mut() {
+                        Some(existing) => {
+                            let mut normalized_value = value;
+                            normalize_int_key(existing);
+                            normalize_int_key(&mut normalized_value);
+                            if *existing != normalized_value {
+                                return Ok(None);
+                            }
+                        }
+                        None => start_id = Some(value),
+                    }
+                    continue;
+                }
+
+                let Some(rel_variable) = first_rel.variable.as_deref() else {
+                    return Ok(None);
+                };
+                if let Some((column, value)) =
+                    exact_variable_column_literal_equality(conjunct, rel_variable)
+                {
+                    if let Some(existing_column) = &filter_column {
+                        if !existing_column.eq_ignore_ascii_case(&column) {
+                            return Ok(None);
+                        }
+                    } else {
+                        filter_column = Some(column);
+                    }
+                    if let Some(existing) = &filter_value {
+                        let Some(ordering) = compare_runtime_values(existing, &value)? else {
+                            return Ok(None);
+                        };
+                        if ordering != Ordering::Equal {
+                            return Ok(None);
+                        }
+                    } else {
+                        filter_value = Some(value);
+                    }
+                    continue;
+                }
+
+                return Ok(None);
+            }
+        }
+
+        let Some(mut start_id) = start_id else {
+            return Ok(None);
+        };
+        normalize_int_key(&mut start_id);
+        let Some(filter_column) = filter_column else {
+            return Ok(None);
+        };
+        let Some(filter_value) = filter_value else {
+            return Ok(None);
+        };
+
+        let ((_, target_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+            context,
+            edge_table_id,
+            first_rel.rel_type.as_deref(),
+        )?;
+        let Some(edge_table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, edge_table_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(filter_col_idx) = self.find_column_index(&edge_table.columns, &filter_column)
+        else {
+            return Ok(None);
+        };
+        let Some(projected_columns) = self.table_column_ids_for_ordinals(
+            context,
+            edge_table_id,
+            &[target_col_idx, filter_col_idx],
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut edge_cursor = match self.storage_dml.adjacency_edge_cursor(
+            context.txn_id,
+            &context.snapshot,
+            edge_table_id,
+            &start_id,
+            true,
+        ) {
+            Ok(cursor) => cursor,
+            Err(_) => return Ok(None),
+        };
+        let mut count = 0u64;
+        let remaining_hops = hops - 1;
+        while let Some(edge_tuple_id) = edge_cursor.next_neighbor() {
+            context.check_deadline()?;
+            let Some(row) = self.storage_dml.fetch(
+                context.txn_id,
+                &context.snapshot,
+                edge_table_id,
+                edge_tuple_id,
+                Some(projected_columns.clone()),
+            )?
+            else {
+                continue;
+            };
+            let target_id = row.values.first().unwrap_or(&Value::Null);
+            if target_id.is_null() {
+                continue;
+            }
+            let property_value = row.values.get(1).unwrap_or(&Value::Null);
+            let Some(ordering) = compare_runtime_values(property_value, &filter_value)? else {
+                continue;
+            };
+            if ordering != Ordering::Equal {
+                continue;
+            }
+            let mut target_id = target_id.clone();
+            normalize_int_key(&mut target_id);
+            let suffix_count = self.fast_graph_count_fixed_outgoing_paths(
+                context,
+                edge_table_id,
+                &target_id,
+                remaining_hops,
+            )?;
+            count = count.saturating_add(suffix_count);
         }
 
         let row = Row::new(vec![Value::BigInt(

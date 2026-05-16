@@ -1828,6 +1828,51 @@ fn cypher_anchored_edge_property_count_uses_adjacency_edges() {
 }
 
 #[test]
+fn cypher_anchored_first_edge_property_path_count() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_first_edge_path_fast (id INT NOT NULL); \
+             CREATE TABLE knows_first_edge_path_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_first_edge_path_fast ON people_first_edge_path_fast; \
+             CREATE EDGE LABEL knows_first_edge_path_fast ON knows_first_edge_path_fast_edges SOURCE person_first_edge_path_fast TARGET person_first_edge_path_fast; \
+             INSERT INTO people_first_edge_path_fast VALUES (1), (2), (3), (4), (5), (6), (7), (8); \
+             INSERT INTO knows_first_edge_path_fast_edges VALUES \
+                (1, 2, 7), (1, 3, 7), (1, 4, 9), \
+                (2, 5, 1), (2, 6, 1), (3, 6, 1), (4, 7, 1), \
+                (5, 8, 1), (6, 8, 1), (7, 8, 1)",
+        )
+        .expect("seed first-edge weighted graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_first_edge_path_fast {id: 1})-[r:knows_first_edge_path_fast]->(b:person_first_edge_path_fast)-[:knows_first_edge_path_fast]->(c:person_first_edge_path_fast) \
+         WHERE r.weight = 7 RETURN count(c)",
+    );
+    assert_eq!(rows, vec![Row::new(vec![Value::BigInt(3)])]);
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_first_edge_path_fast {id: 1})-[:knows_first_edge_path_fast {weight: 7}]->(b:person_first_edge_path_fast)-[:knows_first_edge_path_fast]->(c:person_first_edge_path_fast)-[:knows_first_edge_path_fast]->(d:person_first_edge_path_fast) \
+         RETURN count(d)",
+    );
+    assert_eq!(rows, vec![Row::new(vec![Value::BigInt(3)])]);
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_first_edge_path_fast {id: 1})-[r:knows_first_edge_path_fast]->(b:person_first_edge_path_fast)-[:knows_first_edge_path_fast]->(c:person_first_edge_path_fast) \
+         WHERE r.weight = 9 RETURN count(c)",
+    );
+    assert_eq!(rows, vec![Row::new(vec![Value::BigInt(1)])]);
+}
+
+#[test]
 fn cypher_anchored_path_counts_use_adjacency_chain() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
