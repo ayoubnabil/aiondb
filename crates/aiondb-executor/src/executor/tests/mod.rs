@@ -12,6 +12,7 @@ use aiondb_core::{
     ColumnId, DataType, DbError, DbResult, IndexId, RelationId, Row, SchemaId, SequenceId, TupleId,
     TxnId, Value,
 };
+use aiondb_graph::{NeighborCursor, OwnedCursor};
 use aiondb_plan::{
     ColumnPlan, PhysicalPlan, ProjectionExpr, ResultField, ScanAccessPath, TypedExpr,
     UpdateAssignment,
@@ -700,8 +701,18 @@ impl CatalogTxnParticipant for MockCatalog {
 /// In-memory storage engine that stores rows per table.
 struct MockStorage {
     tables: Mutex<std::collections::HashMap<RelationId, Vec<(TupleId, Row)>>>,
+    table_descriptors:
+        Mutex<std::collections::HashMap<RelationId, aiondb_storage_api::TableStorageDescriptor>>,
     created_index_ids: Mutex<Vec<IndexId>>,
     registered_edge_tables: Mutex<Vec<(RelationId, usize, usize)>>,
+    table_scan_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
+    fetch_projection_widths: Mutex<std::collections::HashMap<RelationId, Vec<usize>>>,
+    adjacency_edge_cursor_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
+    adjacency_neighbor_cursor_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
+    adjacency_edge_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
+    adjacency_weighted_edge_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
+    graph_projection_cache: Mutex<std::collections::HashMap<(String, String, u64), Vec<u8>>>,
+    cache_generation: Mutex<Option<u64>>,
     next_tuple_id: Mutex<u64>,
     rollback_savepoint_error: Mutex<Option<DbError>>,
     release_savepoint_error: Mutex<Option<DbError>>,
@@ -711,8 +722,17 @@ impl MockStorage {
     fn new() -> Self {
         Self {
             tables: Mutex::new(std::collections::HashMap::new()),
+            table_descriptors: Mutex::new(std::collections::HashMap::new()),
             created_index_ids: Mutex::new(Vec::new()),
             registered_edge_tables: Mutex::new(Vec::new()),
+            table_scan_counts: Mutex::new(std::collections::HashMap::new()),
+            fetch_projection_widths: Mutex::new(std::collections::HashMap::new()),
+            adjacency_edge_cursor_counts: Mutex::new(std::collections::HashMap::new()),
+            adjacency_neighbor_cursor_counts: Mutex::new(std::collections::HashMap::new()),
+            adjacency_edge_counts: Mutex::new(std::collections::HashMap::new()),
+            adjacency_weighted_edge_counts: Mutex::new(std::collections::HashMap::new()),
+            graph_projection_cache: Mutex::new(std::collections::HashMap::new()),
+            cache_generation: Mutex::new(None),
             next_tuple_id: Mutex::new(1),
             rollback_savepoint_error: Mutex::new(None),
             release_savepoint_error: Mutex::new(None),
@@ -722,6 +742,101 @@ impl MockStorage {
     fn fail_next_rollback_savepoint(&self, error: DbError) {
         *self.rollback_savepoint_error.lock().unwrap() = Some(error);
     }
+
+    fn set_cache_generation(&self, generation: Option<u64>) {
+        *self.cache_generation.lock().unwrap() = generation;
+    }
+
+    fn table_scan_count(&self, table_id: RelationId) -> usize {
+        self.table_scan_counts
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn adjacency_edge_count(&self, table_id: RelationId) -> usize {
+        self.adjacency_edge_counts
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn adjacency_edge_cursor_count(&self, table_id: RelationId) -> usize {
+        self.adjacency_edge_cursor_counts
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn fetch_projection_widths(&self, table_id: RelationId) -> Vec<usize> {
+        self.fetch_projection_widths
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn adjacency_weighted_edge_count(&self, table_id: RelationId) -> usize {
+        self.adjacency_weighted_edge_counts
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn reset_graph_access_counts(&self) {
+        self.table_scan_counts.lock().unwrap().clear();
+        self.fetch_projection_widths.lock().unwrap().clear();
+        self.adjacency_edge_cursor_counts.lock().unwrap().clear();
+        self.adjacency_neighbor_cursor_counts
+            .lock()
+            .unwrap()
+            .clear();
+        self.adjacency_edge_counts.lock().unwrap().clear();
+        self.adjacency_weighted_edge_counts.lock().unwrap().clear();
+    }
+
+    fn overwrite_graph_projection_cache_payloads(
+        &self,
+        namespace: &str,
+        generation: u64,
+        payload: &[u8],
+    ) -> usize {
+        let mut cache = self.graph_projection_cache.lock().unwrap();
+        let mut replaced = 0;
+        for ((entry_namespace, _cache_key, entry_generation), entry_payload) in cache.iter_mut() {
+            if entry_namespace == namespace && *entry_generation == generation {
+                *entry_payload = payload.to_vec();
+                replaced += 1;
+            }
+        }
+        replaced
+    }
+
+    fn graph_projection_cache_payloads(&self, namespace: &str, generation: u64) -> Vec<Vec<u8>> {
+        self.graph_projection_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(
+                |((entry_namespace, _cache_key, entry_generation), payload)| {
+                    if entry_namespace == namespace && *entry_generation == generation {
+                        Some(payload.clone())
+                    } else {
+                        None
+                    }
+                },
+            )
+            .collect()
+    }
 }
 
 impl StorageDDL for MockStorage {
@@ -730,6 +845,10 @@ impl StorageDDL for MockStorage {
             .lock()
             .unwrap()
             .insert(table.table_id, Vec::new());
+        self.table_descriptors
+            .lock()
+            .unwrap()
+            .insert(table.table_id, table.clone());
         Ok(())
     }
 
@@ -748,6 +867,7 @@ impl StorageDDL for MockStorage {
 
     fn drop_table_storage(&self, _txn: TxnId, table_id: RelationId) -> DbResult<()> {
         self.tables.lock().unwrap().remove(&table_id);
+        self.table_descriptors.lock().unwrap().remove(&table_id);
         Ok(())
     }
 
@@ -757,6 +877,38 @@ impl StorageDDL for MockStorage {
 }
 
 impl StorageDML for MockStorage {
+    fn cache_generation(&self) -> Option<u64> {
+        *self.cache_generation.lock().unwrap()
+    }
+
+    fn graph_projection_cache_get(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        Ok(self
+            .graph_projection_cache
+            .lock()
+            .unwrap()
+            .get(&(namespace.to_owned(), cache_key.to_owned(), generation))
+            .cloned())
+    }
+
+    fn graph_projection_cache_put(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+        payload: &[u8],
+    ) -> DbResult<()> {
+        self.graph_projection_cache.lock().unwrap().insert(
+            (namespace.to_owned(), cache_key.to_owned(), generation),
+            payload.to_vec(),
+        );
+        Ok(())
+    }
+
     fn scan_table(
         &self,
         _txn: TxnId,
@@ -764,6 +916,12 @@ impl StorageDML for MockStorage {
         table_id: RelationId,
         _projected_columns: Option<Vec<ColumnId>>,
     ) -> DbResult<Box<dyn TupleStream>> {
+        *self
+            .table_scan_counts
+            .lock()
+            .unwrap()
+            .entry(table_id)
+            .or_default() += 1;
         let tables = self.tables.lock().unwrap();
         let records: Vec<TupleRecord> = tables
             .get(&table_id)
@@ -795,13 +953,40 @@ impl StorageDML for MockStorage {
         _snapshot: &Snapshot,
         table_id: RelationId,
         tuple_id: TupleId,
-        _projected_columns: Option<Vec<ColumnId>>,
+        projected_columns: Option<Vec<ColumnId>>,
     ) -> DbResult<Option<Row>> {
+        self.fetch_projection_widths
+            .lock()
+            .unwrap()
+            .entry(table_id)
+            .or_default()
+            .push(projected_columns.as_ref().map_or(0, Vec::len));
         let tables = self.tables.lock().unwrap();
-        Ok(tables
+        let row = tables
             .get(&table_id)
             .and_then(|rows| rows.iter().find(|(tid, _)| *tid == tuple_id))
-            .map(|(_, row)| row.clone()))
+            .map(|(_, row)| row.clone());
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Some(projected_columns) = projected_columns else {
+            return Ok(Some(row));
+        };
+        let descriptors = self.table_descriptors.lock().unwrap();
+        let Some(descriptor) = descriptors.get(&table_id) else {
+            return Ok(Some(row));
+        };
+        let projected_values = projected_columns
+            .into_iter()
+            .filter_map(|column_id| {
+                descriptor
+                    .columns
+                    .iter()
+                    .position(|column| column.column_id == column_id)
+                    .and_then(|ordinal| row.values.get(ordinal).cloned())
+            })
+            .collect();
+        Ok(Some(Row::new(projected_values)))
     }
 
     fn insert(&self, _txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId> {
@@ -856,6 +1041,245 @@ impl StorageDML for MockStorage {
             source_col_idx,
             target_col_idx,
         ));
+    }
+
+    fn adjacency_edges(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        edge_table_id: RelationId,
+    ) -> DbResult<Vec<(TupleId, Value, Value)>> {
+        *self
+            .adjacency_edge_counts
+            .lock()
+            .unwrap()
+            .entry(edge_table_id)
+            .or_default() += 1;
+        let registrations = self.registered_edge_tables.lock().unwrap();
+        let Some((_, source_col_idx, target_col_idx)) = registrations
+            .iter()
+            .find(|(table_id, _, _)| *table_id == edge_table_id)
+            .copied()
+        else {
+            return Err(DbError::feature_not_supported(
+                "adjacency edge enumeration is not available for this mock edge table",
+            ));
+        };
+        drop(registrations);
+
+        let tables = self.tables.lock().unwrap();
+        Ok(tables
+            .get(&edge_table_id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .map(|(tuple_id, row)| {
+                let source = row
+                    .values
+                    .get(source_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let target = row
+                    .values
+                    .get(target_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (*tuple_id, source, target)
+            })
+            .collect())
+    }
+
+    fn adjacency_edge_cursor(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<TupleId> + '_>> {
+        *self
+            .adjacency_edge_cursor_counts
+            .lock()
+            .unwrap()
+            .entry(edge_table_id)
+            .or_default() += 1;
+        let registrations = self.registered_edge_tables.lock().unwrap();
+        let Some((_, source_col_idx, target_col_idx)) = registrations
+            .iter()
+            .find(|(table_id, _, _)| *table_id == edge_table_id)
+            .copied()
+        else {
+            return Err(DbError::feature_not_supported(
+                "adjacency edge cursor is not available for this mock edge table",
+            ));
+        };
+        drop(registrations);
+
+        let tables = self.tables.lock().unwrap();
+        let tuple_ids = tables
+            .get(&edge_table_id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|(tuple_id, row)| {
+                let source = row.values.get(source_col_idx)?;
+                let target = row.values.get(target_col_idx)?;
+                if outgoing {
+                    (source == node_id).then_some(*tuple_id)
+                } else {
+                    (target == node_id).then_some(*tuple_id)
+                }
+            })
+            .collect();
+        Ok(Box::new(OwnedCursor::new(tuple_ids)))
+    }
+
+    fn adjacency_neighbor_cursor(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<Value> + '_>> {
+        *self
+            .adjacency_neighbor_cursor_counts
+            .lock()
+            .unwrap()
+            .entry(edge_table_id)
+            .or_default() += 1;
+        let registrations = self.registered_edge_tables.lock().unwrap();
+        let Some((_, source_col_idx, target_col_idx)) = registrations
+            .iter()
+            .find(|(table_id, _, _)| *table_id == edge_table_id)
+            .copied()
+        else {
+            return Err(DbError::feature_not_supported(
+                "adjacency neighbor cursor is not available for this mock edge table",
+            ));
+        };
+        drop(registrations);
+
+        let tables = self.tables.lock().unwrap();
+        let neighbors = tables
+            .get(&edge_table_id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|(_, row)| {
+                let source = row.values.get(source_col_idx)?;
+                let target = row.values.get(target_col_idx)?;
+                if outgoing {
+                    (source == node_id).then(|| target.clone())
+                } else {
+                    (target == node_id).then(|| source.clone())
+                }
+            })
+            .collect();
+        Ok(Box::new(OwnedCursor::new(neighbors)))
+    }
+
+    fn adjacency_weighted_edges(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        weight_column: ColumnId,
+    ) -> DbResult<Vec<(TupleId, Value, Value, Value)>> {
+        *self
+            .adjacency_weighted_edge_counts
+            .lock()
+            .unwrap()
+            .entry(edge_table_id)
+            .or_default() += 1;
+        let registrations = self.registered_edge_tables.lock().unwrap();
+        let Some((_, source_col_idx, target_col_idx)) = registrations
+            .iter()
+            .find(|(table_id, _, _)| *table_id == edge_table_id)
+            .copied()
+        else {
+            return Err(DbError::feature_not_supported(
+                "adjacency weighted edge enumeration is not available for this mock edge table",
+            ));
+        };
+        drop(registrations);
+
+        let descriptors = self.table_descriptors.lock().unwrap();
+        let weight_col_idx = descriptors
+            .get(&edge_table_id)
+            .and_then(|descriptor| {
+                descriptor
+                    .columns
+                    .iter()
+                    .position(|column| column.column_id == weight_column)
+            })
+            .ok_or_else(|| DbError::internal("mock weighted edge column id out of bounds"))?;
+        drop(descriptors);
+        let tables = self.tables.lock().unwrap();
+        Ok(tables
+            .get(&edge_table_id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .map(|(tuple_id, row)| {
+                let source = row
+                    .values
+                    .get(source_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let target = row
+                    .values
+                    .get(target_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let weight = row
+                    .values
+                    .get(weight_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (*tuple_id, source, target, weight)
+            })
+            .collect())
+    }
+
+    fn adjacency_edge_endpoints(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        edge_tuple_id: TupleId,
+    ) -> DbResult<Option<(Value, Value)>> {
+        let registrations = self.registered_edge_tables.lock().unwrap();
+        let Some((_, source_col_idx, target_col_idx)) = registrations
+            .iter()
+            .find(|(table_id, _, _)| *table_id == edge_table_id)
+            .copied()
+        else {
+            return Err(DbError::feature_not_supported(
+                "adjacency edge endpoint lookup is not available for this mock edge table",
+            ));
+        };
+        drop(registrations);
+        let tables = self.tables.lock().unwrap();
+        Ok(tables
+            .get(&edge_table_id)
+            .and_then(|rows| rows.iter().find(|(tid, _)| *tid == edge_tuple_id))
+            .map(|(_, row)| {
+                (
+                    row.values
+                        .get(source_col_idx)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    row.values
+                        .get(target_col_idx)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            }))
+    }
+
+    fn adjacency_index_available(&self, _txn: TxnId, edge_table_id: RelationId) -> bool {
+        self.registered_edge_tables
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(table_id, _, _)| *table_id == edge_table_id)
     }
 }
 

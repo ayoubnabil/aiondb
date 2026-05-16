@@ -11,6 +11,7 @@ aiondb-cluster = { path = "../aiondb-cluster" }
 aiondb-core = { path = "../aiondb-core" }
 aiondb-eval = { path = "../aiondb-eval" }
 aiondb-graph = { path = "../aiondb-graph" }
+aiondb-graph-projection = { path = "../aiondb-graph-projection" }
 aiondb-optimizer = { path = "../aiondb-optimizer" }
 aiondb-parser = { path = "../aiondb-parser" }
 aiondb-plan = { path = "../aiondb-plan" }

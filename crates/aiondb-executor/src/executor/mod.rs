@@ -19,6 +19,13 @@ mod dml_plans;
 mod fk_enforcement;
 pub mod fragment_metrics;
 mod graph_plans;
+mod graph_runtime_args;
+mod graph_runtime_caches;
+mod graph_runtime_match;
+mod graph_runtime_nodes;
+mod graph_runtime_paths;
+mod graph_runtime_shortest_path;
+mod graph_runtime_traversal;
 pub(crate) mod helpers;
 mod join_plans;
 mod metadata_helpers;
@@ -53,13 +60,18 @@ use aiondb_catalog::{
 };
 use aiondb_core::{
     ColumnId, DataType, DbError, DbResult, ErrorReport, IndexId, RelationId, Row, SchemaId,
-    SequenceId, SqlState, TidValue, TxnId, Value,
+    SequenceId, SqlState, TidValue, TupleId, TxnId, Value,
 };
 use aiondb_eval::{
     build_hash_key, coerce_value, compare_runtime_values, eval_pg_ls_dir_with_base_dir,
     eval_pg_read_binary_file_with_base_dir, eval_pg_read_file_with_base_dir, with_session_context,
     ExpressionEvaluator, ValueHashKey,
 };
+use aiondb_graph::{
+    algorithms::CsrGraph, GraphDirection, GraphProjection, GraphStats, GraphStorage, GraphViewV2,
+    HybridGraphPlan, HybridGraphSource, NeighborCursor, ProjectionSnapshot,
+};
+use aiondb_graph_projection::NamedGraphProjectionDescriptor;
 use aiondb_plan::{
     InsertOnConflict, JoinType, OnConflictActionPlan, PhysicalPlan, ProjectionExpr, ScalarFunction,
     ScanAccessPath, SetOperationType, SortExpr, TypedExpr, TypedExprKind,
@@ -79,6 +91,10 @@ pub(super) use aiondb_catalog::{
 };
 
 use self::distributed_fragments::LocalFragmentDispatcher;
+use self::graph_runtime_caches::{
+    GraphAlgorithmProjectionRuntimeCache, GraphAlgorithmRuntimeCaches,
+    GraphAlgorithmWeightedEdgesRuntimeCache,
+};
 use self::helpers::*;
 use self::metadata_helpers::*;
 
@@ -474,6 +490,7 @@ pub struct Executor {
     graph_first_col_row_cache: RwLock<HashMap<GraphFirstColRowCacheKey, (u64, Option<Row>)>>,
     graph_edge_filter_limit_rows_cache:
         RwLock<HashMap<GraphEdgeFilterLimitRowsCacheKey, (u64, Vec<Row>)>>,
+    graph_algorithm_runtime_caches: GraphAlgorithmRuntimeCaches,
     hybrid_deep_graph_vector_meta_cache:
         RwLock<HashMap<HybridDeepGraphVectorMetaCacheKey, (u64, HybridDeepGraphVectorMeta)>>,
     join_index_lookup_row_cache: RwLock<HashMap<JoinIndexLookupRowsCacheKey, (u64, Vec<Row>)>>,
@@ -547,6 +564,160 @@ pub(super) struct GraphEdgeFilterLimitRowsCacheKey {
     pub weight_col_idx: usize,
     pub filter_value: ValueHashKey,
     pub limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct GraphAlgorithmInputCacheKey {
+    pub node_labels: Vec<(String, RelationId)>,
+    pub edge_labels: Vec<GraphAlgorithmEdgeLabelCacheKey>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct GraphAlgorithmEdgeLabelCacheKey {
+    pub label: String,
+    pub table_id: RelationId,
+    pub source_label: String,
+    pub target_label: String,
+    pub endpoints: Option<(String, String)>,
+}
+
+pub(super) struct GraphAlgorithmInputCacheEntry {
+    pub cache_key: GraphAlgorithmInputCacheKey,
+    pub projection: NamedGraphProjectionDescriptor,
+    pub graph: CsrGraph,
+    pub node_ids: Vec<Value>,
+    pub node_indexes: HashMap<(u64, ValueHashKey), u32>,
+    pub node_value_indexes: HashMap<ValueHashKey, Vec<u32>>,
+    pub resolved_edges: Vec<GraphAlgorithmResolvedEdgeLabel>,
+}
+
+pub(super) struct GraphAlgorithmProjectionRef<'a> {
+    pub projection: &'a NamedGraphProjectionDescriptor,
+    pub graph: &'a CsrGraph,
+}
+
+impl GraphProjection for GraphAlgorithmProjectionRef<'_> {
+    fn projection_name(&self) -> &str {
+        &self.projection.name
+    }
+
+    fn snapshot(&self) -> &ProjectionSnapshot {
+        &self.projection.snapshot
+    }
+
+    fn stats(&self) -> GraphStats {
+        self.projection.stats
+    }
+
+    fn graph_view(&self) -> &dyn GraphViewV2 {
+        self.graph
+    }
+}
+
+impl GraphAlgorithmInputCacheEntry {
+    pub(super) fn projection_ref(&self) -> GraphAlgorithmProjectionRef<'_> {
+        GraphAlgorithmProjectionRef {
+            projection: &self.projection,
+            graph: &self.graph,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct GraphAlgorithmResolvedEdgeLabel {
+    pub label: String,
+    pub table_id: RelationId,
+    pub source_table_id: RelationId,
+    pub target_table_id: RelationId,
+    pub source_col_idx: usize,
+    pub target_col_idx: usize,
+    pub projected_columns: Vec<ColumnId>,
+    pub table_column_ids: Vec<ColumnId>,
+    pub column_name_indexes: HashMap<String, usize>,
+}
+
+pub(super) struct CurrentGraphAlgorithmCatalogSpec {
+    pub node_labels: Vec<NodeLabelDescriptor>,
+    pub edge_labels: Vec<EdgeLabelDescriptor>,
+    pub cache_key: GraphAlgorithmInputCacheKey,
+}
+
+impl CurrentGraphAlgorithmCatalogSpec {
+    pub(super) fn node_label_keys(&self) -> Vec<(String, u64)> {
+        self.cache_key
+            .node_labels
+            .iter()
+            .map(|(label, table_id)| (label.clone(), table_id.get()))
+            .collect()
+    }
+
+    pub(super) fn edge_label_keys(&self) -> Vec<(String, u64)> {
+        self.cache_key
+            .edge_labels
+            .iter()
+            .map(|edge| (edge.label.clone(), edge.table_id.get()))
+            .collect()
+    }
+
+    pub(super) fn projection_name(&self) -> String {
+        aiondb_graph_projection::cypher_native_projection_name(
+            &self.node_label_keys(),
+            &self.edge_label_keys(),
+        )
+    }
+}
+
+pub(super) struct GraphTraversalRef<S> {
+    pub snapshot: ProjectionSnapshot,
+    pub stats: GraphStats,
+    pub plan: HybridGraphPlan,
+    pub storage: S,
+}
+
+impl<S: GraphStorage> GraphTraversalRef<S> {
+    pub(super) fn snapshot(&self) -> &ProjectionSnapshot {
+        &self.snapshot
+    }
+
+    pub(super) fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    pub(super) fn uses_traversal_store(&self) -> bool {
+        self.plan.source == Some(HybridGraphSource::TraversalStore)
+    }
+}
+
+impl<S: GraphStorage> GraphStorage for GraphTraversalRef<S> {
+    fn stats(&self) -> GraphStats {
+        self.stats
+    }
+
+    fn edge_ids(
+        &self,
+        node_id: &Value,
+        direction: GraphDirection,
+    ) -> Box<dyn NeighborCursor<TupleId> + '_> {
+        self.storage.edge_ids(node_id, direction)
+    }
+
+    fn neighbor_ids(
+        &self,
+        node_id: &Value,
+        direction: GraphDirection,
+    ) -> Box<dyn NeighborCursor<Value> + '_> {
+        self.storage.neighbor_ids(node_id, direction)
+    }
+
+    fn edge_endpoints(&self, edge_id: TupleId) -> Option<(Value, Value)> {
+        self.storage.edge_endpoints(edge_id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct GraphAlgorithmWeightedEdgesCacheKey {
+    pub input: GraphAlgorithmInputCacheKey,
+    pub weight_column: String,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -741,6 +912,138 @@ impl Executor {
     const INTERNAL_SAVEPOINT_RECOVERY_MARKER: &str =
         "statement was rolled back to an internal savepoint; outer transaction remains usable";
 
+    fn graph_algorithm_projection_runtime(&self) -> &GraphAlgorithmProjectionRuntimeCache {
+        &self.graph_algorithm_runtime_caches.projection_cache
+    }
+
+    fn graph_algorithm_weighted_runtime(&self) -> &GraphAlgorithmWeightedEdgesRuntimeCache {
+        &self.graph_algorithm_runtime_caches.weighted_edges_cache
+    }
+
+    pub(super) fn graph_algorithm_cache_key(
+        node_labels: &[NodeLabelDescriptor],
+        edge_labels: &[EdgeLabelDescriptor],
+    ) -> GraphAlgorithmInputCacheKey {
+        let mut node_labels = node_labels
+            .iter()
+            .map(|label| (label.label.clone(), label.table_id))
+            .collect::<Vec<_>>();
+        node_labels
+            .sort_by(|left, right| left.0.cmp(&right.0).then(left.1.get().cmp(&right.1.get())));
+
+        let mut edge_labels = edge_labels
+            .iter()
+            .map(|label| GraphAlgorithmEdgeLabelCacheKey {
+                label: label.label.clone(),
+                table_id: label.table_id,
+                source_label: label.source_label.clone(),
+                target_label: label.target_label.clone(),
+                endpoints: label.endpoints.as_ref().map(|endpoints| {
+                    (
+                        endpoints.source_id_column.clone(),
+                        endpoints.target_id_column.clone(),
+                    )
+                }),
+            })
+            .collect::<Vec<_>>();
+        edge_labels.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then(left.table_id.get().cmp(&right.table_id.get()))
+                .then(left.source_label.cmp(&right.source_label))
+                .then(left.target_label.cmp(&right.target_label))
+                .then(left.endpoints.cmp(&right.endpoints))
+        });
+
+        GraphAlgorithmInputCacheKey {
+            node_labels,
+            edge_labels,
+        }
+    }
+
+    pub(super) fn current_graph_algorithm_catalog_spec(
+        &self,
+        txn_id: TxnId,
+    ) -> DbResult<CurrentGraphAlgorithmCatalogSpec> {
+        let node_labels = self.catalog_reader.list_node_labels(txn_id)?;
+        let edge_labels = self.catalog_reader.list_edge_labels(txn_id)?;
+        let cache_key = Self::graph_algorithm_cache_key(&node_labels, &edge_labels);
+        Ok(CurrentGraphAlgorithmCatalogSpec {
+            node_labels,
+            edge_labels,
+            cache_key,
+        })
+    }
+
+    pub(super) fn resolve_algorithm_edge_labels(
+        &self,
+        context: &ExecutionContext,
+        node_labels: &[NodeLabelDescriptor],
+        edge_labels: &[EdgeLabelDescriptor],
+    ) -> DbResult<Vec<GraphAlgorithmResolvedEdgeLabel>> {
+        let node_label_table_ids = node_labels
+            .iter()
+            .map(|label| (label.label.as_str(), label.table_id))
+            .collect::<HashMap<_, _>>();
+        edge_labels
+            .iter()
+            .map(|edge_label| {
+                let source_table_id = *node_label_table_ids
+                    .get(edge_label.source_label.as_str())
+                    .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "edge label {} references missing source node label {}",
+                        edge_label.label, edge_label.source_label
+                    ))
+                })?;
+                let target_table_id = *node_label_table_ids
+                    .get(edge_label.target_label.as_str())
+                    .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "edge label {} references missing target node label {}",
+                        edge_label.label, edge_label.target_label
+                    ))
+                })?;
+                let table = self
+                    .catalog_reader
+                    .get_table_by_id(context.txn_id, edge_label.table_id)?
+                    .ok_or_else(|| DbError::internal("edge table not found for graph builder"))?;
+                let (source_col_idx, target_col_idx) =
+                    self.resolve_edge_endpoint_columns_for_label(context, edge_label)?;
+                let table_column_ids = table
+                    .columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect::<Vec<_>>();
+                let column_name_indexes = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| (column.name.to_ascii_lowercase(), index))
+                    .collect::<HashMap<_, _>>();
+                let projected_columns = vec![
+                    *table_column_ids.get(source_col_idx).ok_or_else(|| {
+                        DbError::internal("edge source column ordinal out of bounds")
+                    })?,
+                    *table_column_ids.get(target_col_idx).ok_or_else(|| {
+                        DbError::internal("edge target column ordinal out of bounds")
+                    })?,
+                ];
+                Ok(GraphAlgorithmResolvedEdgeLabel {
+                    label: edge_label.label.clone(),
+                    table_id: edge_label.table_id,
+                    source_table_id,
+                    target_table_id,
+                    source_col_idx,
+                    target_col_idx,
+                    projected_columns,
+                    table_column_ids,
+                    column_name_indexes,
+                })
+            })
+            .collect()
+    }
+
     pub fn new(
         catalog_reader: Arc<dyn CatalogReader>,
         catalog_writer: Arc<dyn CatalogWriter>,
@@ -770,6 +1073,7 @@ impl Executor {
             graph_id_lookup_result_cache: RwLock::new(HashMap::new()),
             graph_first_col_row_cache: RwLock::new(HashMap::new()),
             graph_edge_filter_limit_rows_cache: RwLock::new(HashMap::new()),
+            graph_algorithm_runtime_caches: GraphAlgorithmRuntimeCaches::new(),
             hybrid_deep_graph_vector_meta_cache: RwLock::new(HashMap::new()),
             join_index_lookup_row_cache: RwLock::new(HashMap::new()),
             hash_join_build_side_cache: RwLock::new(HashMap::new()),

@@ -1863,18 +1863,18 @@ impl Executor {
                 seen,
             );
         }
-        match self.storage_dml.adjacency_neighbors(
+        match self.storage_dml.adjacency_neighbor_cursor(
             context.txn_id,
             &context.snapshot,
             edge_table_id,
             &probe,
             outgoing,
         ) {
-            Ok(neighbors) => {
-                if neighbors.is_empty()
+            Ok(mut neighbors) => {
+                if neighbors.remaining_hint() == 0
                     && !self
                         .storage_dml
-                        .adjacency_index_has_edges(context.txn_id, edge_table_id)
+                        .adjacency_index_available(context.txn_id, edge_table_id)
                 {
                     return self.collect_graph_neighbors_by_scan(
                         context,
@@ -1887,7 +1887,7 @@ impl Executor {
                         seen,
                     );
                 }
-                for neighbor in neighbors {
+                while let Some(neighbor) = neighbors.next_neighbor() {
                     if limit.is_some_and(|max_rows| output.len() >= max_rows) {
                         break;
                     }
@@ -1910,7 +1910,7 @@ impl Executor {
                 if tuple_ids.is_empty()
                     && !self
                         .storage_dml
-                        .adjacency_index_has_edges(context.txn_id, edge_table_id)
+                        .adjacency_index_available(context.txn_id, edge_table_id)
                 {
                     return self.collect_graph_neighbors_by_scan(
                         context,

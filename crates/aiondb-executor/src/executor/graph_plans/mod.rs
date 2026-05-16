@@ -8,11 +8,14 @@
 
 mod graph_match;
 mod graph_mutate;
+mod graph_procedure;
+mod graph_procedure_render;
+mod graph_procedure_results;
 
-use graph_mutate::{dedup_rows_by_values, value_to_bfs_key};
+use graph_mutate::dedup_rows_by_values;
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -22,17 +25,18 @@ use aiondb_catalog::{
 };
 use aiondb_core::{
     ColumnId, DataType, DbError, DbResult, IndexId, RelationId, Row, SchemaId, SequenceId,
-    SqlState, TupleId, Value,
+    SqlState, TxnId, Value,
 };
 use aiondb_eval::{build_hash_key, compare_runtime_values, ValueHashKey};
 use aiondb_graph::{
-    pattern::AdjacentEdge as GraphAdjacentEdge, shortest_path as graph_shortest_path,
-    PathElement as GraphPathElement, RowProvider as GraphRowProvider,
+    algorithms::procedures::{procedure_info, AlgorithmConfigField},
+    HybridGraphPlan, HybridGraphSource,
 };
+use aiondb_graph_projection::NamedGraphProjectionDescriptor;
 use aiondb_plan::graph::{
-    CypherCreateClause, CypherDeleteClause, CypherMatchClause, CypherMergeClause,
-    CypherNodePattern, CypherPathFunction, CypherPattern, CypherPipelineOp, CypherPropertyExpr,
-    CypherQueryPlan, CypherRelDirection, CypherRelPattern, CypherSetItem, IndexScanInfo,
+    CypherCreateClause, CypherDeleteClause, CypherForeachOp, CypherForeachPlan, CypherMatchClause,
+    CypherMergeClause, CypherNodePattern, CypherPattern, CypherPipelineOp, CypherPropertyExpr,
+    CypherQueryPlan, CypherRelDirection, CypherRelPattern, CypherSetItem,
 };
 use aiondb_plan::{ProjectionExpr, ScalarFunction, SortExpr, TypedExpr, TypedExprKind};
 
@@ -40,6 +44,10 @@ use tracing::debug;
 
 use super::*;
 pub(super) use aiondb_core::convert::usize_to_u32_saturating as usize_to_u32;
+
+pub(super) fn value_to_bfs_key(v: &Value) -> Option<ValueHashKey> {
+    graph_mutate::value_to_bfs_key(v)
+}
 #[inline]
 pub(super) fn nonneg_i64_to_usize(value: i64) -> usize {
     if value <= 0 {
@@ -68,13 +76,41 @@ pub(super) type SharedRow = Arc<Row>;
 pub(super) type SharedStrings = Arc<Vec<String>>;
 pub(super) type SharedText = Arc<str>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CypherGraphAccessClauseKind {
+    Match,
+    PipelineMatch,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CypherGraphAccessPlanHint {
+    pub clause_kind: CypherGraphAccessClauseKind,
+    pub clause_index: usize,
+    pub pattern_index: usize,
+    pub plan: HybridGraphPlan,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CypherProcedureGraphAccessPlanHint {
+    pub clause_index: usize,
+    pub procedure: String,
+    pub weighted: bool,
+    pub projection: NamedGraphProjectionDescriptor,
+    pub projection_ready: bool,
+    pub plan: HybridGraphPlan,
+}
+
 /// Format a graph node as the Cypher textual literal `(:Label[:Label2] {props})`.
 /// `column_names` and `row` come from the node's backing table; columns whose
 /// name starts with `__` are treated as system columns and skipped, plus any
 /// column whose value is NULL is omitted from the property bag. The
 /// synthetic `_default` label used to back anonymous `({prop: ...})` nodes
 /// is hidden from the output so the literal round-trips through Cypher.
-fn format_cypher_node_literal(column_names: &[String], row: &Row, labels: &[String]) -> String {
+pub(super) fn format_cypher_node_literal(
+    column_names: &[String],
+    row: &Row,
+    labels: &[String],
+) -> String {
     let mut out = String::from("(");
     let visible: Vec<&str> = labels
         .iter()
@@ -99,7 +135,11 @@ fn format_cypher_node_literal(column_names: &[String], row: &Row, labels: &[Stri
 }
 
 /// Format a graph edge as the Cypher textual literal `[:TYPE {props}]`.
-fn format_cypher_edge_literal(column_names: &[String], row: &Row, rel_type: &str) -> String {
+pub(super) fn format_cypher_edge_literal(
+    column_names: &[String],
+    row: &Row,
+    rel_type: &str,
+) -> String {
     let props = format_cypher_property_bag(column_names, row);
     if props.is_empty() {
         format!("[:{rel_type}]")
@@ -268,7 +308,7 @@ fn is_cypher_system_column(name: &str) -> bool {
     )
 }
 
-fn format_cypher_property_value(value: &Value) -> String {
+pub(super) fn format_cypher_property_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
         Value::Boolean(b) => b.to_string(),
@@ -580,26 +620,6 @@ pub(super) enum BoundValue {
 /// Strategy selector for path search.
 ///
 /// Keeping this as an explicit enum makes it easy to route future algorithms
-/// from one place (for example bidirectional BFS or weighted shortest path).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PathSearchMode {
-    SingleShortest,
-    AllShortest,
-}
-
-impl PathSearchMode {
-    pub(super) fn from_path_function(func: CypherPathFunction) -> Self {
-        match func {
-            CypherPathFunction::ShortestPath => Self::SingleShortest,
-            CypherPathFunction::AllShortestPaths => Self::AllShortest,
-        }
-    }
-
-    pub(super) fn allows_multiple_shortest_paths(self) -> bool {
-        matches!(self, Self::AllShortest)
-    }
-}
-
 pub(super) fn ensure_graph_result_row_capacity(
     context: &ExecutionContext,
     current_rows: usize,
@@ -646,182 +666,6 @@ pub(super) fn push_graph_binding(
     context.track_memory(estimate_binding_row_bytes(&binding))?;
     output.push(binding);
     Ok(())
-}
-
-struct ExecutorGraphRowProvider<'a> {
-    executor: &'a Executor,
-    context: &'a ExecutionContext,
-    edge_endpoint_overrides: HashMap<RelationId, (usize, usize)>,
-}
-
-impl<'a> GraphRowProvider for ExecutorGraphRowProvider<'a> {
-    fn scan_table(&self, table_id: RelationId) -> DbResult<Vec<Row>> {
-        let mut rows = Vec::new();
-        let mut stream = self
-            .executor
-            .scan_table_locked(self.context, table_id, None)?;
-        while let Some(record) = stream.next()? {
-            self.context.check_deadline()?;
-            rows.push(self.executor.compat_scan_row_for_table_id(
-                self.context,
-                table_id,
-                &record,
-            )?);
-        }
-        Ok(rows)
-    }
-
-    fn column_index(&self, table_id: RelationId, column: &str) -> DbResult<Option<usize>> {
-        if let Some((source_idx, target_idx)) = self.edge_endpoint_overrides.get(&table_id) {
-            if column.eq_ignore_ascii_case("source_id") {
-                return Ok(Some(*source_idx));
-            }
-            if column.eq_ignore_ascii_case("target_id") {
-                return Ok(Some(*target_idx));
-            }
-        }
-        Ok(self
-            .executor
-            .catalog_reader
-            .get_table_by_id(self.context.txn_id, table_id)?
-            .and_then(|table| {
-                table
-                    .columns
-                    .iter()
-                    .position(|entry| entry.name.eq_ignore_ascii_case(column))
-            }))
-    }
-
-    fn column_names(&self, table_id: RelationId) -> DbResult<Vec<String>> {
-        Ok(self
-            .executor
-            .catalog_reader
-            .get_table_by_id(self.context.txn_id, table_id)?
-            .map(|table| {
-                table
-                    .columns
-                    .into_iter()
-                    .map(|column| column.name)
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
-    fn adjacency_lookup_edges(
-        &self,
-        edge_table_id: RelationId,
-        node_id: &Value,
-        direction: aiondb_graph::traversal::TraversalDirection,
-    ) -> DbResult<Vec<GraphAdjacentEdge>> {
-        let directions: &[bool] = match direction {
-            aiondb_graph::traversal::TraversalDirection::Outgoing => &[true],
-            aiondb_graph::traversal::TraversalDirection::Incoming => &[false],
-            aiondb_graph::traversal::TraversalDirection::Both => &[true, false],
-        };
-
-        if self.edge_endpoint_overrides.contains_key(&edge_table_id) {
-            return self.fallback_adjacency_lookup_edges(edge_table_id, node_id, direction);
-        }
-
-        let mut result = Vec::new();
-        let mut seen = HashSet::new();
-
-        for &outgoing in directions {
-            match self.executor.storage_dml.adjacency_lookup(
-                self.context.txn_id,
-                &self.context.snapshot,
-                edge_table_id,
-                node_id,
-                outgoing,
-            ) {
-                Ok(tuple_ids) => {
-                    for tuple_id in tuple_ids {
-                        if !seen.insert(tuple_id) {
-                            continue;
-                        }
-                        let Some(row) = self.executor.storage_dml.fetch(
-                            self.context.txn_id,
-                            &self.context.snapshot,
-                            edge_table_id,
-                            tuple_id,
-                            None,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let record = aiondb_storage_api::TupleRecord {
-                            tuple_id,
-                            heap_position: tuple_id.get(),
-                            row,
-                        };
-                        result.push(GraphAdjacentEdge {
-                            row: self.executor.compat_scan_row_for_table_id(
-                                self.context,
-                                edge_table_id,
-                                &record,
-                            )?,
-                            tuple_id,
-                        });
-                    }
-                }
-                Err(error) if error.sqlstate() == SqlState::FeatureNotSupported => {
-                    return self.fallback_adjacency_lookup_edges(edge_table_id, node_id, direction);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Ok(result)
-    }
-}
-
-impl<'a> ExecutorGraphRowProvider<'a> {
-    fn fallback_adjacency_lookup_edges(
-        &self,
-        edge_table_id: RelationId,
-        node_id: &Value,
-        direction: aiondb_graph::traversal::TraversalDirection,
-    ) -> DbResult<Vec<GraphAdjacentEdge>> {
-        let (src_idx, tgt_idx) =
-            if let Some(endpoints) = self.edge_endpoint_overrides.get(&edge_table_id).copied() {
-                endpoints
-            } else {
-                let src_idx = self
-                    .column_index(edge_table_id, "source_id")?
-                    .ok_or_else(|| DbError::internal("edge table missing source_id column"))?;
-                let tgt_idx = self
-                    .column_index(edge_table_id, "target_id")?
-                    .ok_or_else(|| DbError::internal("edge table missing target_id column"))?;
-                (src_idx, tgt_idx)
-            };
-
-        let mut result = Vec::new();
-        let mut stream = self
-            .executor
-            .scan_table_locked(self.context, edge_table_id, None)?;
-        while let Some(record) = stream.next()? {
-            self.context.check_deadline()?;
-            let compat =
-                self.executor
-                    .compat_scan_row_for_table_id(self.context, edge_table_id, &record)?;
-            let src = compat.values.get(src_idx).unwrap_or(&Value::Null);
-            let tgt = compat.values.get(tgt_idx).unwrap_or(&Value::Null);
-            let matches = match direction {
-                aiondb_graph::traversal::TraversalDirection::Outgoing => src == node_id,
-                aiondb_graph::traversal::TraversalDirection::Incoming => tgt == node_id,
-                aiondb_graph::traversal::TraversalDirection::Both => {
-                    src == node_id || tgt == node_id
-                }
-            };
-            if matches {
-                result.push(GraphAdjacentEdge {
-                    row: compat,
-                    tuple_id: record.tuple_id,
-                });
-            }
-        }
-        Ok(result)
-    }
 }
 
 pub(super) fn estimate_bound_value_bytes(value: &BoundValue) -> u64 {
@@ -871,98 +715,324 @@ pub(super) fn estimate_binding_row_bytes(binding: &BindingRow) -> u64 {
     entries.fold(64, u64::saturating_add)
 }
 
-fn materialize_named_path_pattern(pattern: &CypherPattern) -> CypherPattern {
-    let Some(path_variable) = pattern.path_variable.as_deref() else {
-        return pattern.clone();
-    };
-    let mut materialized = pattern.clone();
-    let safe_name = path_variable
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
+impl Executor {
+    fn cypher_procedure_uses_weighted_projection(
+        call: &aiondb_plan::graph::CypherProcedureCall,
+    ) -> bool {
+        procedure_info(&call.procedure).is_some_and(|info| {
+            call.args
+                .iter()
+                .zip(info.args.iter())
+                .any(|(_, arg_info)| arg_info.config_field == AlgorithmConfigField::WeightColumn)
         })
-        .collect::<String>();
+    }
 
-    for (idx, node) in materialized.nodes.iter_mut().enumerate() {
-        if node.variable.is_none() {
-            node.variable = Some(format!("__path_{safe_name}_node_{idx}"));
-        }
-    }
-    for (idx, rel) in materialized.relationships.iter_mut().enumerate() {
-        if rel.variable.is_none() {
-            rel.variable = Some(format!("__path_{safe_name}_rel_{idx}"));
-        }
-    }
-    materialized
-}
-
-fn validate_named_path_pattern(pattern: &CypherPattern) -> DbResult<()> {
-    if pattern.path_variable.is_none() {
-        return Ok(());
-    }
-    if pattern.path_function.is_some() {
-        return Err(DbError::feature_not_supported(
-            "named shortestPath bindings are not supported yet",
-        ));
-    }
-    let has_variable_length = pattern
-        .relationships
-        .iter()
-        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some());
-    if has_variable_length && (pattern.relationships.len() != 1 || pattern.nodes.len() != 2) {
-        return Err(DbError::feature_not_supported(
-            "named multi-segment variable-length path bindings are not supported yet",
-        ));
-    }
-    Ok(())
-}
-
-fn bind_named_path_variable(
-    pattern: &CypherPattern,
-    mut bindings: Vec<BindingRow>,
-) -> Vec<BindingRow> {
-    let Some(path_variable) = pattern.path_variable.as_ref() else {
-        return bindings;
-    };
-    let nodes = Arc::new(
-        pattern
-            .nodes
-            .iter()
-            .filter_map(|node| node.variable.clone())
-            .collect::<Vec<_>>(),
-    );
-    let relationships = Arc::new(
-        pattern
-            .relationships
-            .iter()
-            .filter_map(|rel| rel.variable.clone())
-            .collect::<Vec<_>>(),
-    );
-    let directions = Arc::new(
-        pattern
-            .relationships
-            .iter()
-            .map(|rel| rel.direction)
-            .collect::<Vec<_>>(),
-    );
-    for binding in &mut bindings {
-        if binding.get(path_variable).is_some() {
-            continue;
-        }
-        binding.insert_binding(
-            path_variable.clone(),
-            BoundValue::Path {
-                nodes: Arc::clone(&nodes),
-                relationships: Arc::clone(&relationships),
-                directions: Arc::clone(&directions),
+    pub(super) fn describe_cypher_procedure_graph_plan(
+        &self,
+        txn_id: TxnId,
+        call: &aiondb_plan::graph::CypherProcedureCall,
+        clause_index: usize,
+    ) -> CypherProcedureGraphAccessPlanHint {
+        let weighted = Self::cypher_procedure_uses_weighted_projection(call);
+        let projection_kind = if weighted { "weighted CSR" } else { "CSR" };
+        let discovered = self.describe_current_cypher_projection_or_placeholder(txn_id, weighted);
+        let projection = discovered.descriptor;
+        let projection_ready = discovered.ready;
+        CypherProcedureGraphAccessPlanHint {
+            clause_index,
+            procedure: call.procedure.clone(),
+            weighted,
+            projection: projection.clone(),
+            projection_ready,
+            plan: HybridGraphPlan {
+                source: Some(HybridGraphSource::ProjectionStore),
+                fallback_source: Some(HybridGraphSource::RowStore),
+                estimated_rows: projection_ready.then_some(projection.stats.edge_count),
+                projection_name: Some(projection.name),
+                reason: Some(format!(
+                    "native Cypher graph procedure executes against an executor-managed {projection_kind} projection snapshot"
+                )),
             },
-        );
+        }
     }
-    bindings
+
+    pub(super) fn describe_cypher_query_graph_procedure_plans(
+        &self,
+        txn_id: TxnId,
+        query: &CypherQueryPlan,
+    ) -> Vec<CypherProcedureGraphAccessPlanHint> {
+        query
+            .pipeline
+            .iter()
+            .enumerate()
+            .filter_map(|(clause_index, op)| match op {
+                CypherPipelineOp::ProcedureCall(call) => {
+                    Some(self.describe_cypher_procedure_graph_plan(txn_id, call, clause_index))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn describe_cypher_pattern_graph_plan_for_txn(
+        &self,
+        txn_id: TxnId,
+        pattern: &CypherPattern,
+    ) -> HybridGraphPlan {
+        if pattern.relationships.is_empty() {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::RowStore),
+                fallback_source: None,
+                estimated_rows: None,
+                projection_name: None,
+                reason: Some("node-only Cypher pattern uses row-store scans".to_owned()),
+            };
+        }
+
+        let mut available_edges = 0usize;
+        let mut missing_edges = 0usize;
+        let mut estimated_rows = 0u64;
+
+        for rel in &pattern.relationships {
+            let Some(table_id) = rel.table_id else {
+                missing_edges = missing_edges.saturating_add(1);
+                continue;
+            };
+            if self.storage_dml.adjacency_index_available(txn_id, table_id) {
+                available_edges = available_edges.saturating_add(1);
+                if let Some(stats) = self.storage_dml.adjacency_index_stats(txn_id, table_id) {
+                    estimated_rows = estimated_rows.saturating_add(stats.edge_count);
+                }
+            } else {
+                missing_edges = missing_edges.saturating_add(1);
+            }
+        }
+
+        let estimated_rows = (estimated_rows > 0).then_some(estimated_rows);
+        if available_edges == 0 {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::RowStore),
+                fallback_source: None,
+                estimated_rows,
+                projection_name: None,
+                reason: Some(
+                    "relationship pattern has no native traversal store; row-store fallback only"
+                        .to_owned(),
+                ),
+            };
+        }
+        if missing_edges == 0 {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::TraversalStore),
+                fallback_source: Some(HybridGraphSource::RowStore),
+                estimated_rows,
+                projection_name: None,
+                reason: Some(
+                    "all relationship tables expose native adjacency traversal".to_owned(),
+                ),
+            };
+        }
+        HybridGraphPlan {
+            source: Some(HybridGraphSource::Hybrid),
+            fallback_source: Some(HybridGraphSource::RowStore),
+            estimated_rows,
+            projection_name: None,
+            reason: Some(
+                "some relationship tables expose native adjacency traversal and others fall back to row-store scans"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    pub(super) fn describe_cypher_match_graph_plans(
+        &self,
+        context: &ExecutionContext,
+        clause: &CypherMatchClause,
+        clause_kind: CypherGraphAccessClauseKind,
+        clause_index: usize,
+    ) -> Vec<CypherGraphAccessPlanHint> {
+        clause
+            .patterns
+            .iter()
+            .enumerate()
+            .map(|(pattern_index, pattern)| CypherGraphAccessPlanHint {
+                clause_kind: clause_kind.clone(),
+                clause_index,
+                pattern_index,
+                plan: self.describe_cypher_pattern_graph_plan_for_txn(context.txn_id, pattern),
+            })
+            .collect()
+    }
+
+    pub(super) fn describe_cypher_query_graph_plans(
+        &self,
+        context: &ExecutionContext,
+        query: &CypherQueryPlan,
+    ) -> Vec<CypherGraphAccessPlanHint> {
+        let mut hints = Vec::new();
+        for (clause_index, op) in query.pipeline.iter().enumerate() {
+            if let CypherPipelineOp::Match(clause) = op {
+                hints.extend(self.describe_cypher_match_graph_plans(
+                    context,
+                    clause,
+                    CypherGraphAccessClauseKind::PipelineMatch,
+                    clause_index,
+                ));
+            }
+        }
+        for (clause_index, clause) in query.matches.iter().enumerate() {
+            hints.extend(self.describe_cypher_match_graph_plans(
+                context,
+                clause,
+                CypherGraphAccessClauseKind::Match,
+                clause_index,
+            ));
+        }
+        hints
+    }
+
+    pub(super) fn describe_cypher_pattern_graph_plan(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+    ) -> HybridGraphPlan {
+        self.describe_cypher_pattern_graph_plan_for_txn(context.txn_id, pattern)
+    }
+
+    pub fn explain_cypher_query_graph_access_lines(
+        &self,
+        txn_id: TxnId,
+        query: &CypherQueryPlan,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        for hint in self.describe_cypher_query_graph_procedure_plans(txn_id, query) {
+            lines.push(format!(
+                "Graph Projection [ProcedureCall {}]: procedure={}, source={:?}, fallback={:?}, projection={}, snapshot_generation={}, refresh_policy={:?}, refreshed_at_epoch_millis={}, weighted={}, estimated_rows={}, node_count={}, edge_count={}, reason={}",
+                hint.clause_index,
+                hint.procedure,
+                hint.plan.source,
+                hint.plan.fallback_source,
+                hint.plan.projection_name.as_deref().unwrap_or("unknown"),
+                hint.projection.snapshot.generation,
+                hint.projection.snapshot.refresh_policy,
+                hint.projection
+                    .snapshot
+                    .refreshed_at_epoch_millis
+                    .map_or_else(|| "unknown".to_owned(), |ts| ts.to_string()),
+                hint.weighted,
+                hint.plan
+                    .estimated_rows
+                    .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                (hint.projection_ready)
+                    .then_some(hint.projection.stats)
+                    .and_then(|stats| stats.node_count)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                (hint.projection_ready)
+                    .then_some(hint.projection.stats)
+                    .map_or_else(|| "unknown".to_owned(), |stats| stats.edge_count.to_string()),
+                hint.plan.reason.unwrap_or_default()
+            ));
+        }
+        for (clause_index, op) in query.pipeline.iter().enumerate() {
+            if let CypherPipelineOp::Match(clause) = op {
+                for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+                    let plan = self.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern);
+                    lines.push(format!(
+                        "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, reason={}",
+                        "PipelineMatch",
+                        clause_index,
+                        pattern_index,
+                        plan.source,
+                        plan.fallback_source,
+                        plan.estimated_rows
+                            .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                        plan.reason.unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        for (clause_index, clause) in query.matches.iter().enumerate() {
+            for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+                let plan = self.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern);
+                lines.push(format!(
+                    "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, reason={}",
+                    "Match",
+                    clause_index,
+                    pattern_index,
+                    plan.source,
+                    plan.fallback_source,
+                    plan.estimated_rows
+                        .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                    plan.reason.unwrap_or_default()
+                ));
+            }
+        }
+        lines
+    }
+
+    pub fn explain_physical_plan_graph_access_lines(
+        &self,
+        txn_id: TxnId,
+        plan: &aiondb_plan::PhysicalPlan,
+    ) -> Vec<String> {
+        fn collect(
+            executor: &Executor,
+            txn_id: TxnId,
+            plan: &aiondb_plan::PhysicalPlan,
+            lines: &mut Vec<String>,
+        ) {
+            match plan {
+                aiondb_plan::PhysicalPlan::CypherQuery(query) => {
+                    lines.extend(
+                        executor.explain_cypher_query_graph_access_lines(txn_id, query.as_ref()),
+                    );
+                }
+                aiondb_plan::PhysicalPlan::ProjectSource { source, .. }
+                | aiondb_plan::PhysicalPlan::AggregateSource { source, .. }
+                | aiondb_plan::PhysicalPlan::PartialAggregate { source, .. }
+                | aiondb_plan::PhysicalPlan::CreateTableAs { source, .. }
+                | aiondb_plan::PhysicalPlan::InsertSelect { source, .. } => {
+                    collect(executor, txn_id, source, lines);
+                }
+                aiondb_plan::PhysicalPlan::NestedLoopJoin { left, right, .. }
+                | aiondb_plan::PhysicalPlan::HashJoin { left, right, .. }
+                | aiondb_plan::PhysicalPlan::MergeJoin { left, right, .. }
+                | aiondb_plan::PhysicalPlan::SetOperation { left, right, .. }
+                | aiondb_plan::PhysicalPlan::BroadcastHashJoin {
+                    broadcast: left,
+                    local: right,
+                    ..
+                } => {
+                    collect(executor, txn_id, left, lines);
+                    collect(executor, txn_id, right, lines);
+                }
+                aiondb_plan::PhysicalPlan::NestedLoopIndexJoin { left, .. } => {
+                    collect(executor, txn_id, left, lines);
+                }
+                aiondb_plan::PhysicalPlan::DistributedAppend { fragments, .. } => {
+                    for fragment in fragments {
+                        collect(executor, txn_id, fragment, lines);
+                    }
+                }
+                aiondb_plan::PhysicalPlan::RecursiveCte {
+                    base, recursive, ..
+                } => {
+                    collect(executor, txn_id, base, lines);
+                    collect(executor, txn_id, recursive, lines);
+                }
+                aiondb_plan::PhysicalPlan::FinalAggregate { partials, .. } => {
+                    for partial in partials {
+                        collect(executor, txn_id, partial, lines);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut lines = Vec::new();
+        collect(self, txn_id, plan, &mut lines);
+        lines
+    }
 }
 
 pub(super) fn estimate_bfs_path_bytes(path_len: usize) -> u64 {
@@ -1097,7 +1167,7 @@ fn pivot_node_score(node: &CypherNodePattern) -> u8 {
 /// the leftmost node — same-or-worse pivots leave the original
 /// left-to-right walk in place to avoid pointless reordering.
 /// Patterns of length 1 always return `None`.
-fn pick_match_pivot_index(pattern: &CypherPattern) -> Option<usize> {
+pub(super) fn pick_match_pivot_index(pattern: &CypherPattern) -> Option<usize> {
     if pattern.nodes.len() <= 1 {
         return None;
     }
@@ -1128,7 +1198,7 @@ fn pick_match_pivot_index(pattern: &CypherPattern) -> Option<usize> {
 /// Reverse a relationship's direction so the matcher walks the
 /// adjacency list backwards. `Both` stays `Both` — undirected
 /// relationships are symmetric so reversing is a no-op.
-fn flip_relationship_direction(rel: &CypherRelPattern) -> CypherRelPattern {
+pub(super) fn flip_relationship_direction(rel: &CypherRelPattern) -> CypherRelPattern {
     let mut flipped = rel.clone();
     flipped.direction = match rel.direction {
         aiondb_plan::graph::CypherRelDirection::Outgoing => {
@@ -1190,7 +1260,10 @@ fn extract_hybrid_graph_vector_filter(
     })
 }
 
-fn collect_graph_filter_conjuncts<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
+pub(super) fn collect_graph_filter_conjuncts<'a>(
+    expr: &'a TypedExpr,
+    out: &mut Vec<&'a TypedExpr>,
+) {
     let mut stack = vec![expr];
     while let Some(expr) = stack.pop() {
         if let TypedExprKind::LogicalAnd { left, right } = &expr.kind {
@@ -1202,9 +1275,9 @@ fn collect_graph_filter_conjuncts<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a Typ
     }
 }
 
-struct GraphFilterConjunct<'a> {
-    expr: &'a TypedExpr,
-    referenced_vars: Option<HashSet<String>>,
+pub(super) struct GraphFilterConjunct<'a> {
+    pub(super) expr: &'a TypedExpr,
+    pub(super) referenced_vars: Option<HashSet<String>>,
 }
 
 impl<'a> GraphFilterConjunct<'a> {
@@ -1215,7 +1288,7 @@ impl<'a> GraphFilterConjunct<'a> {
         }
     }
 
-    fn is_ready(&self, binding: &BindingRow) -> bool {
+    pub(super) fn is_ready(&self, binding: &BindingRow) -> bool {
         let Some(vars) = self.referenced_vars.as_ref() else {
             return false;
         };
@@ -1224,7 +1297,7 @@ impl<'a> GraphFilterConjunct<'a> {
     }
 }
 
-fn build_graph_filter_conjuncts(filter: &TypedExpr) -> Vec<GraphFilterConjunct<'_>> {
+pub(super) fn build_graph_filter_conjuncts(filter: &TypedExpr) -> Vec<GraphFilterConjunct<'_>> {
     let mut conjuncts = Vec::new();
     collect_graph_filter_conjuncts(filter, &mut conjuncts);
     conjuncts
@@ -1329,7 +1402,7 @@ fn collect_referenced_graph_variables(expr: &TypedExpr, vars: &mut HashSet<Strin
     }
 }
 
-fn exact_column_literal_equality(expr: &TypedExpr) -> Option<(&str, Value)> {
+pub(super) fn exact_column_literal_equality(expr: &TypedExpr) -> Option<(&str, Value)> {
     let TypedExprKind::BinaryEq { left, right } = &expr.kind else {
         return None;
     };
@@ -1351,7 +1424,7 @@ fn exact_column_literal_equality(expr: &TypedExpr) -> Option<(&str, Value)> {
 /// literals. Used by `apply_match_filter_index_hints` to drive the
 /// per-node range pushdown that `scan_node_candidates` then sends
 /// through `scan_table_multi_range_filter`.
-fn extract_column_literal_range(
+pub(super) fn extract_column_literal_range(
     expr: &TypedExpr,
 ) -> Option<(&str, std::ops::Bound<Value>, std::ops::Bound<Value>)> {
     use std::ops::Bound;
@@ -1676,13 +1749,17 @@ impl Executor {
             }
         }
 
-        let values = self.storage_dml.adjacency_neighbors(
+        let mut cursor = self.storage_dml.adjacency_neighbor_cursor(
             context.txn_id,
             &context.snapshot,
             edge_table_id,
             node_id,
             outgoing,
         )?;
+        let mut values = Vec::with_capacity(cursor.remaining_hint());
+        while let Some(value) = cursor.next_neighbor() {
+            values.push(value);
+        }
 
         if let (Some(cache_key), Some(generation)) = (cache_key, generation) {
             let mut cache = self
@@ -1980,6 +2057,40 @@ impl Executor {
     ) -> DbResult<ExecutionResult> {
         context.check_deadline()?;
 
+        for hint in self.describe_cypher_query_graph_plans(context, plan) {
+            debug!(
+                clause_kind = ?hint.clause_kind,
+                clause_index = hint.clause_index,
+                pattern_index = hint.pattern_index,
+                source = ?hint.plan.source,
+                fallback_source = ?hint.plan.fallback_source,
+                estimated_rows = hint.plan.estimated_rows,
+                reason = hint.plan.reason.as_deref().unwrap_or(""),
+                "cypher graph access plan"
+            );
+        }
+        for hint in self.describe_cypher_query_graph_procedure_plans(context.txn_id, plan) {
+            debug!(
+                clause_index = hint.clause_index,
+                procedure = %hint.procedure,
+                source = ?hint.plan.source,
+                fallback_source = ?hint.plan.fallback_source,
+                projection = hint.plan.projection_name.as_deref().unwrap_or("unknown"),
+                snapshot_generation = hint.projection.snapshot.generation,
+                refresh_policy = ?hint.projection.snapshot.refresh_policy,
+                refreshed_at_epoch_millis = hint.projection.snapshot.refreshed_at_epoch_millis,
+                weighted = hint.weighted,
+                estimated_rows = hint.plan.estimated_rows,
+                projection_ready = hint.projection_ready,
+                projection_state = ?hint.projection.state,
+                build_mode = ?hint.projection.build_mode,
+                node_count = hint.projection_ready.then_some(hint.projection.stats).and_then(|stats| stats.node_count),
+                edge_count = hint.projection_ready.then_some(hint.projection.stats).map(|stats| stats.edge_count),
+                reason = hint.plan.reason.as_deref().unwrap_or(""),
+                "cypher graph procedure plan"
+            );
+        }
+
         if let Some(result) = self.try_execute_fast_one_hop_id_lookup(plan, context)? {
             return Ok(result);
         }
@@ -2002,6 +2113,11 @@ impl Executor {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_unanchored_edge_filter_limit(plan, context)? {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_fast_unanchored_edge_eq_filter_limit(plan, context)?
+        {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_multi_out_limit(plan, context)? {
@@ -2034,8 +2150,14 @@ impl Executor {
                 CypherPipelineOp::Match(m) => {
                     bindings = self.execute_cypher_match(context, m, bindings)?;
                 }
+                CypherPipelineOp::ProcedureCall(call) => {
+                    bindings = self.execute_cypher_procedure_call(context, call, bindings)?;
+                }
                 CypherPipelineOp::CallSubquery(subquery) => {
                     bindings = self.execute_cypher_call_subquery(context, subquery, bindings)?;
+                }
+                CypherPipelineOp::Foreach(foreach) => {
+                    bindings = self.execute_cypher_foreach(context, foreach, bindings)?;
                 }
             }
         }
@@ -2923,6 +3045,160 @@ impl Executor {
         }))
     }
 
+    /// Fast-path for an unanchored single-hop pattern carrying an inline edge
+    /// property equality filter, e.g.
+    /// `MATCH (a:L)-[:T {weight: 10}]->(b:L) RETURN b.id LIMIT n`.
+    /// The `WHERE r.weight > x` shape is handled by
+    /// `try_execute_fast_unanchored_edge_filter_limit`; this covers the inline
+    /// `{prop: literal}` equality shape, which otherwise falls back to a full
+    /// per-node adjacency traversal that fetches every edge row.
+    fn try_execute_fast_unanchored_edge_eq_filter_limit(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(limit) = plan
+            .limit
+            .as_ref()
+            .and_then(literal_i64)
+            .and_then(|value| usize::try_from(value.max(0)).ok())
+        else {
+            return Ok(None);
+        };
+        if limit == 0 {
+            return Ok(Some(ExecutionResult::Query {
+                columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+                rows: Vec::new(),
+            }));
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional
+            || match_clause.patterns.len() != 1
+            || match_clause.filter.is_some()
+        {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        if pattern.path_function.is_some()
+            || pattern.nodes.len() != 2
+            || pattern.relationships.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let rel = &pattern.relationships[0];
+        // Orient to the physical edge (source -> target); the returned node is
+        // the physical target (the other endpoint is unconstrained).
+        let (phys_src, phys_tgt) = match rel.direction {
+            CypherRelDirection::Outgoing => (&pattern.nodes[0], &pattern.nodes[1]),
+            CypherRelDirection::Incoming => (&pattern.nodes[1], &pattern.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        if rel.table_id.is_none()
+            || rel.variable.is_some()
+            || rel.min_hops.is_some()
+            || rel.max_hops.is_some()
+            || phys_src.table_id.is_none()
+            || phys_tgt.table_id.is_none()
+            || !phys_src.properties.is_empty()
+            || !phys_tgt.properties.is_empty()
+            || rel.properties.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(end_var) = phys_tgt.variable.as_deref() else {
+            return Ok(None);
+        };
+        let expected_return = format!("{end_var}.id");
+        if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
+            return Ok(None);
+        }
+
+        let prop = &rel.properties[0];
+        let TypedExprKind::Literal(filter_value) = &prop.value.kind else {
+            return Ok(None);
+        };
+        let filter_value = filter_value.clone();
+
+        let Some(edge_table_id) = rel.table_id else {
+            return Ok(None);
+        };
+        let ((_, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+            context,
+            edge_table_id,
+            rel.rel_type.as_deref(),
+        )?;
+        let Some(edge_table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, edge_table_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(prop_col_idx) = self.find_column_index(&edge_table.columns, &prop.key) else {
+            return Ok(None);
+        };
+        let Some(projected_columns) = self.table_column_ids_for_ordinals(
+            context,
+            edge_table_id,
+            &[tgt_col_idx, prop_col_idx],
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut stream = self.resolve_scan_stream(
+            context,
+            edge_table_id,
+            &ScanAccessPath::SeqScan,
+            Some(projected_columns),
+        )?;
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        let mut result_bytes = 0u64;
+        while let Some(record) = stream.next()? {
+            context.check_deadline()?;
+            let target_id = record.row.values.first().unwrap_or(&Value::Null);
+            let prop_value = record.row.values.get(1).unwrap_or(&Value::Null);
+            if target_id.is_null() {
+                continue;
+            }
+            let Some(ordering) = compare_runtime_values(prop_value, &filter_value)? else {
+                continue;
+            };
+            if ordering != Ordering::Equal {
+                continue;
+            }
+            let row = Row::new(vec![target_id.clone()]);
+            result_bytes =
+                ensure_result_bytes_fit_and_track_query_row(context, &row, result_bytes)?;
+            rows.push(row);
+            if rows.len() >= limit {
+                break;
+            }
+        }
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows,
+        }))
+    }
+
     fn try_execute_fast_multi_out_limit(
         &self,
         plan: &CypherQueryPlan,
@@ -2976,46 +3252,55 @@ impl Executor {
             return Ok(None);
         }
 
-        let first_start = &first.nodes[0];
-        let first_end = &first.nodes[1];
-        let second_start = &second.nodes[0];
-        let second_end = &second.nodes[1];
         let first_rel = &first.relationships[0];
         let second_rel = &second.relationships[0];
-        let (Some(start_var), Some(first_end_var), Some(second_start_var), Some(second_end_var)) = (
-            first_start.variable.as_deref(),
-            first_end.variable.as_deref(),
-            second_start.variable.as_deref(),
-            second_end.variable.as_deref(),
+        // Normalize each pattern to the physical edge (source -> target)
+        // following the relationship direction. The binder may reverse a
+        // pattern (e.g. anchoring on a filtered/returned node), turning
+        // `(a)-[:k]->(b)` into `(b)<-[:k]-(a)`; both orientations describe the
+        // same edge so the same scan/group/cartesian plan applies.
+        let (first_src, first_tgt) = match first_rel.direction {
+            CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
+            CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        let (second_src, second_tgt) = match second_rel.direction {
+            CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
+            CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
+            first_src.variable.as_deref(),
+            first_tgt.variable.as_deref(),
+            second_src.variable.as_deref(),
+            second_tgt.variable.as_deref(),
         ) else {
             return Ok(None);
         };
-        let expected_first_return = format!("{first_end_var}.id");
-        let expected_second_return = format!("{second_end_var}.id");
-        if start_var != second_start_var
+        let expected_first_return = format!("{first_tgt_var}.id");
+        let expected_second_return = format!("{second_tgt_var}.id");
+        if src_var != second_src_var
             || column_ref_name(&plan.returns[0].expr) != Some(expected_first_return.as_str())
             || column_ref_name(&plan.returns[1].expr) != Some(expected_second_return.as_str())
         {
             return Ok(None);
         }
-        if second_start
+        if second_src
             .table_id
-            .is_some_and(|table_id| Some(table_id) != first_start.table_id)
+            .is_some_and(|table_id| Some(table_id) != first_src.table_id)
         {
             return Ok(None);
         }
-        if first_start.table_id.is_none()
-            || first_end.table_id.is_none()
-            || second_end.table_id.is_none()
-            || !first_start.properties.is_empty()
-            || !first_end.properties.is_empty()
-            || !second_start.properties.is_empty()
-            || !second_end.properties.is_empty()
+        if first_src.table_id.is_none()
+            || first_tgt.table_id.is_none()
+            || second_tgt.table_id.is_none()
+            || !first_src.properties.is_empty()
+            || !first_tgt.properties.is_empty()
+            || !second_src.properties.is_empty()
+            || !second_tgt.properties.is_empty()
             || first_rel.table_id.is_none()
             || second_rel.table_id.is_none()
             || first_rel.table_id != second_rel.table_id
-            || first_rel.direction != CypherRelDirection::Outgoing
-            || second_rel.direction != CypherRelDirection::Outgoing
             || first_rel.variable.is_some()
             || second_rel.variable.is_some()
             || first_rel.min_hops.is_some()
@@ -3031,7 +3316,7 @@ impl Executor {
         let filter_value = match match_clause.filter.as_ref() {
             Some(filter) => {
                 let Some(value) =
-                    exact_named_column_literal_gt(filter, &format!("{first_end_var}.number"))
+                    exact_named_column_literal_gt(filter, &format!("{first_tgt_var}.number"))
                 else {
                     return Ok(None);
                 };
@@ -3043,7 +3328,7 @@ impl Executor {
         let Some(edge_table_id) = first_rel.table_id else {
             return Ok(None);
         };
-        let Some(first_target_table_id) = first_end.table_id else {
+        let Some(first_target_table_id) = first_tgt.table_id else {
             return Ok(None);
         };
         let ((src_col_idx, _), _) = self.resolve_edge_endpoint_columns_for_rel(
@@ -4691,6 +4976,78 @@ impl Executor {
     // UNWIND
     // -----------------------------------------------------------------------
 
+    /// Execute a FOREACH clause: for every input binding, evaluate the list
+    /// expression, then run the body update clauses once per element with
+    /// `variable` bound to that element. FOREACH performs side effects only;
+    /// it never changes the outer binding cardinality, so the input bindings
+    /// are returned unchanged.
+    fn execute_cypher_foreach(
+        &self,
+        context: &ExecutionContext,
+        foreach: &CypherForeachPlan,
+        mut bindings: Vec<BindingRow>,
+    ) -> DbResult<Vec<BindingRow>> {
+        for binding in &mut bindings {
+            context.check_deadline()?;
+            let list_value =
+                self.evaluate_cypher_expr_with_binding(&foreach.expr, &*binding, context)?;
+            let elements = match list_value {
+                Value::Array(elements) => elements,
+                Value::Null => continue,
+                other => vec![other],
+            };
+            for elem in elements {
+                context.check_deadline()?;
+                binding.insert_binding(foreach.variable.clone(), BoundValue::Scalar(elem));
+                self.execute_cypher_foreach_body(context, &foreach.body, &mut *binding)?;
+            }
+            // FOREACH does not leak its loop variable to later clauses.
+            binding.remove(&foreach.variable);
+        }
+        Ok(bindings)
+    }
+
+    /// Run the FOREACH body update clauses against a single binding row.
+    ///
+    /// SET mutates the row in place so a later RETURN observes the change.
+    /// CREATE / MERGE only need their storage side effects here, so they run
+    /// against a throwaway copy of the row; FOREACH never changes the outer
+    /// binding cardinality.
+    fn execute_cypher_foreach_body(
+        &self,
+        context: &ExecutionContext,
+        body: &[CypherForeachOp],
+        binding: &mut BindingRow,
+    ) -> DbResult<()> {
+        for op in body {
+            context.check_deadline()?;
+            match op {
+                CypherForeachOp::Set(set_item) => {
+                    self.execute_cypher_set(context, set_item, std::slice::from_mut(binding))?;
+                }
+                CypherForeachOp::Create(create_clause) => {
+                    self.execute_cypher_create(context, create_clause, vec![binding.clone()])?;
+                }
+                CypherForeachOp::Merge(merge_clause) => {
+                    self.execute_cypher_merge(context, merge_clause, vec![binding.clone()])?;
+                }
+                CypherForeachOp::Delete(delete_clause) => {
+                    self.execute_cypher_delete(
+                        context,
+                        delete_clause,
+                        std::slice::from_ref(binding),
+                    )?;
+                }
+                CypherForeachOp::Foreach(nested) => {
+                    let taken = std::mem::replace(binding, BindingRow::new());
+                    let mut rows = self.execute_cypher_foreach(context, nested, vec![taken])?;
+                    *binding = rows.pop().unwrap_or_else(BindingRow::new);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Execute an UNWIND clause: evaluate the list expression and expand each
     /// element into its own binding row with the given variable name.
     fn execute_cypher_unwind(
@@ -4978,8 +5335,14 @@ impl Executor {
                 CypherPipelineOp::Match(m) => {
                     bindings = self.execute_cypher_match(context, m, bindings)?;
                 }
+                CypherPipelineOp::ProcedureCall(call) => {
+                    bindings = self.execute_cypher_procedure_call(context, call, bindings)?;
+                }
                 CypherPipelineOp::CallSubquery(nested) => {
                     bindings = self.execute_cypher_call_subquery(context, nested, bindings)?;
+                }
+                CypherPipelineOp::Foreach(foreach) => {
+                    bindings = self.execute_cypher_foreach(context, foreach, bindings)?;
                 }
             }
         }
@@ -5013,914 +5376,6 @@ impl Executor {
         Ok(bindings)
     }
 
-    // -----------------------------------------------------------------------
-    // MATCH
-    // -----------------------------------------------------------------------
-
-    /// Execute a single MATCH clause against the storage layer.
-    fn execute_cypher_match(
-        &self,
-        context: &ExecutionContext,
-        clause: &CypherMatchClause,
-        input_bindings: Vec<BindingRow>,
-    ) -> DbResult<Vec<BindingRow>> {
-        // Pre-compute column counts for every table referenced in the
-        // clause's patterns.  These are only needed for the OPTIONAL MATCH
-        // null-binding fallback, but computing them once here avoids
-        // repeated catalog lookups inside the per-binding loop.
-        let col_count_cache: HashMap<RelationId, usize> = if clause.optional {
-            let mut cache = HashMap::new();
-            for pattern in &clause.patterns {
-                for node in &pattern.nodes {
-                    if let Some(tid) = node.table_id {
-                        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(tid) {
-                            let count = self
-                                .catalog_reader
-                                .get_table_by_id(context.txn_id, tid)?
-                                .map_or(0, |t| t.columns.len());
-                            entry.insert(count);
-                        }
-                    }
-                }
-                for rel in &pattern.relationships {
-                    if let Some(tid) = rel.table_id {
-                        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(tid) {
-                            let count = self
-                                .catalog_reader
-                                .get_table_by_id(context.txn_id, tid)?
-                                .map_or(0, |t| t.columns.len());
-                            entry.insert(count);
-                        }
-                    }
-                }
-            }
-            cache
-        } else {
-            HashMap::new()
-        };
-
-        let filter_conjuncts = clause
-            .filter
-            .as_ref()
-            .map(|filter| build_graph_filter_conjuncts(filter))
-            .unwrap_or_default();
-        // ALWAYS apply the inline-property index-hint pass so
-        // patterns like `(a:Person {id: 50})` pick up the PK btree
-        // and avoid a full SeqScan when no top-level WHERE clause
-        // is present. The WHERE-based pass adds the same hint when
-        // it sees `WHERE a.id = 50`, but inline-property syntax
-        // never went through it before — so a pattern of the shape
-        // `MATCH (x)-->(a {id:50})-->(b)` was full-scanning the
-        // backing table for `a` instead of doing the O(log n) PK
-        // lookup. The two passes are complementary: the inline
-        // pass fills in hints from `node.properties`, the WHERE
-        // pass adds them from `WHERE` predicates.
-        let hinted_patterns;
-        let inline_first;
-        let patterns: &[CypherPattern] = if let Some(filter) = clause.filter.as_ref() {
-            inline_first = clause
-                .patterns
-                .iter()
-                .map(|pattern| self.apply_inline_property_index_hints(context, pattern))
-                .collect::<DbResult<Vec<_>>>()?;
-            hinted_patterns = inline_first
-                .iter()
-                .map(|pattern| self.apply_match_filter_index_hints(context, pattern, filter))
-                .collect::<DbResult<Vec<_>>>()?;
-            &hinted_patterns
-        } else {
-            inline_first = clause
-                .patterns
-                .iter()
-                .map(|pattern| self.apply_inline_property_index_hints(context, pattern))
-                .collect::<DbResult<Vec<_>>>()?;
-            &inline_first
-        };
-
-        let mut result_bindings = Vec::new();
-
-        for input_binding in &input_bindings {
-            context.check_deadline()?;
-            let mut current_bindings = vec![input_binding.clone()];
-
-            // Process each pattern in the clause.
-            for pattern in patterns {
-                validate_named_path_pattern(pattern)?;
-                let materialized_pattern;
-                let pattern = if pattern.path_variable.is_some() {
-                    materialized_pattern = materialize_named_path_pattern(pattern);
-                    &materialized_pattern
-                } else {
-                    pattern
-                };
-                current_bindings =
-                    self.match_pattern(context, pattern, current_bindings, &filter_conjuncts)?;
-                current_bindings = bind_named_path_variable(pattern, current_bindings);
-                if current_bindings.is_empty() && !clause.optional {
-                    break;
-                }
-            }
-
-            // Apply WHERE filter.
-            if let Some(ref filter) = clause.filter {
-                let mut filtered = Vec::new();
-                for binding in current_bindings {
-                    match self.evaluate_graph_predicate(context, filter, &binding) {
-                        Ok(true) => filtered.push(binding),
-                        Ok(false) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                current_bindings = filtered;
-            }
-
-            if current_bindings.is_empty() && clause.optional {
-                // OPTIONAL MATCH: keep input binding with NULLs for pattern
-                // variables that were not matched.  Column counts come from
-                // the pre-computed cache to avoid per-binding catalog lookups.
-                let mut null_binding = input_binding.clone();
-                for pattern in &clause.patterns {
-                    for node in &pattern.nodes {
-                        if let Some(ref var) = node.variable {
-                            let col_count = node
-                                .table_id
-                                .and_then(|tid| col_count_cache.get(&tid).copied())
-                                .unwrap_or(0);
-                            null_binding.insert_binding(
-                                var.clone(),
-                                BoundValue::Null {
-                                    column_count: col_count,
-                                },
-                            );
-                        }
-                    }
-                    for rel in &pattern.relationships {
-                        if let Some(ref var) = rel.variable {
-                            let col_count = rel
-                                .table_id
-                                .and_then(|tid| col_count_cache.get(&tid).copied())
-                                .unwrap_or(0);
-                            null_binding.insert_binding(
-                                var.clone(),
-                                BoundValue::Null {
-                                    column_count: col_count,
-                                },
-                            );
-                        }
-                    }
-                    if let Some(ref var) = pattern.path_variable {
-                        null_binding
-                            .insert_binding(var.clone(), BoundValue::Null { column_count: 1 });
-                    }
-                }
-                ensure_graph_result_row_capacity(context, result_bindings.len())?;
-                context.track_memory(estimate_binding_row_bytes(&null_binding))?;
-                result_bindings.push(null_binding);
-            } else {
-                for binding in current_bindings {
-                    ensure_graph_result_row_capacity(context, result_bindings.len())?;
-                    context.track_memory(estimate_binding_row_bytes(&binding))?;
-                    result_bindings.push(binding);
-                }
-            }
-        }
-
-        Ok(result_bindings)
-    }
-
-    /// Promote an inline node property predicate `(a:Person
-    /// {id: 50})` into an `IndexScanInfo` when the property maps
-    /// onto a btree index leading column AND the value is a
-    /// literal. Without this hint the matcher fell through to a
-    /// full SeqScan of the backing table for the constrained node
-    /// — the dominant overhead in multi-hop patterns whose only
-    /// constraint sits in the middle of the chain (e.g.
-    /// `(x)-->(a {id:50})-->(b)`: the planner correctly enumerates
-    /// `a` via the PK index after this hint, vs. scanning all
-    /// 10k `x`'s in the previous left-to-right walk).
-    fn apply_inline_property_index_hints(
-        &self,
-        context: &ExecutionContext,
-        pattern: &CypherPattern,
-    ) -> DbResult<CypherPattern> {
-        let mut hinted = pattern.clone();
-        for node in &mut hinted.nodes {
-            if node.index_scan.is_some() {
-                continue;
-            }
-            let Some(table_id) = node.table_id else {
-                continue;
-            };
-            if node.properties.is_empty() {
-                continue;
-            }
-            let Some(table) = self
-                .catalog_reader
-                .get_table_by_id(context.txn_id, table_id)?
-            else {
-                continue;
-            };
-            for prop in &node.properties {
-                let scan_value = match &prop.value {
-                    TypedExpr {
-                        kind: TypedExprKind::Literal(value),
-                        ..
-                    } if !matches!(value, Value::Null) => value.clone(),
-                    _ => continue,
-                };
-                let Some(column_index) = self.find_column_index(&table.columns, &prop.key) else {
-                    continue;
-                };
-                let Some(index_id) =
-                    self.find_btree_index_for_column_ordinal(context, table_id, column_index)?
-                else {
-                    continue;
-                };
-                node.index_scan = Some(IndexScanInfo {
-                    index_id,
-                    column_index,
-                    scan_value,
-                });
-                break;
-            }
-        }
-        Ok(hinted)
-    }
-
-    fn apply_match_filter_index_hints(
-        &self,
-        context: &ExecutionContext,
-        pattern: &CypherPattern,
-        filter: &TypedExpr,
-    ) -> DbResult<CypherPattern> {
-        let mut hinted = pattern.clone();
-        let mut conjuncts = Vec::new();
-        collect_graph_filter_conjuncts(filter, &mut conjuncts);
-
-        for node in &mut hinted.nodes {
-            if node.index_scan.is_some() {
-                continue;
-            }
-            let (Some(table_id), Some(variable)) = (node.table_id, node.variable.as_deref()) else {
-                continue;
-            };
-            let Some(table) = self
-                .catalog_reader
-                .get_table_by_id(context.txn_id, table_id)?
-            else {
-                continue;
-            };
-            // Collect every literal-equality predicate the WHERE
-            // clause exposes for this node so we can either set
-            // an `index_scan` (best — uses a btree) or inject the
-            // predicate as an inline-style property hint that
-            // `scan_node_candidates` then routes through
-            // `scan_table_eq_filter` (storage-side count map +
-            // Base-table tight loop). Without the second arm,
-            // shapes like
-            // `MATCH (a:P)-->(b) WHERE a.number = 1` paid for a
-            // full SeqScan + per-row predicate eval through the
-            // executor's generic ExpressionEvaluator even when the
-            // backing storage could push down the equality
-            // cheaply.
-            let mut chosen_index = false;
-            for conjunct in &conjuncts {
-                let Some((column_ref, scan_value)) = exact_column_literal_equality(conjunct) else {
-                    continue;
-                };
-                let Some(property) = column_ref
-                    .strip_prefix(variable)
-                    .and_then(|tail| tail.strip_prefix('.'))
-                else {
-                    continue;
-                };
-                let Some(column_index) = self.find_column_index(&table.columns, property) else {
-                    continue;
-                };
-                if !chosen_index {
-                    if let Some(index_id) =
-                        self.find_btree_index_for_column_ordinal(context, table_id, column_index)?
-                    {
-                        node.index_scan = Some(IndexScanInfo {
-                            index_id,
-                            column_index,
-                            scan_value: scan_value.clone(),
-                        });
-                        chosen_index = true;
-                        continue;
-                    }
-                }
-                // Non-indexed eq — inject as a property hint if
-                // it isn't already there. Skip duplicates so
-                // node.properties doesn't grow on repeated planning.
-                let already = node
-                    .properties
-                    .iter()
-                    .any(|p| p.key.eq_ignore_ascii_case(property));
-                if !already {
-                    let value_type = scan_value
-                        .data_type()
-                        .unwrap_or(aiondb_core::DataType::Text);
-                    node.properties
-                        .push(aiondb_plan::graph::CypherPropertyExpr {
-                            key: property.to_owned(),
-                            value: TypedExpr {
-                                kind: TypedExprKind::Literal(scan_value),
-                                data_type: value_type,
-                                nullable: true,
-                            },
-                        });
-                }
-            }
-            // Range pushdown: walk WHERE conjuncts a SECOND time
-            // to harvest comparisons (`<`, `<=`, `>`, `>=`,
-            // `BETWEEN`) we couldn't promote to either an
-            // index_scan or an inline-eq property hint. Each
-            // bound is stored on `node.range_pushdown` so the
-            // matcher can route through
-            // `scan_table_multi_range_filter` and let storage
-            // filter inline at decode time. Lifts shapes like
-            // `MATCH (a:Person)-->(b) WHERE a.number < 20` from
-            // a full SeqScan + per-row generic filter to a single
-            // pushdown call.
-            for conjunct in &conjuncts {
-                let Some((column_ref, lower, upper)) = extract_column_literal_range(conjunct)
-                else {
-                    continue;
-                };
-                let Some(property) = column_ref
-                    .strip_prefix(variable)
-                    .and_then(|tail| tail.strip_prefix('.'))
-                else {
-                    continue;
-                };
-                let Some(column_index) = self.find_column_index(&table.columns, property) else {
-                    continue;
-                };
-                let Some(column) = table.columns.get(column_index) else {
-                    continue;
-                };
-                // Skip duplicates: if we already have a range on
-                // the same column (e.g. from another conjunct),
-                // intersect by keeping the tighter bound. For
-                // simplicity, just append — `multi_range_filter`
-                // applies AND semantics anyway.
-                node.range_pushdown
-                    .push(aiondb_plan::graph::CypherRangePushdown {
-                        column_id: column.column_id,
-                        lower,
-                        upper,
-                    });
-            }
-        }
-
-        Ok(hinted)
-    }
-
-    /// Match a single `CypherPattern` (a chain of alternating nodes and
-    /// relationships).  For `(a)-[r]->(b)`, nodes = [a, b] and
-    /// relationships = [r].
-    fn match_pattern(
-        &self,
-        context: &ExecutionContext,
-        pattern: &CypherPattern,
-        mut bindings: Vec<BindingRow>,
-        filter_conjuncts: &[GraphFilterConjunct<'_>],
-    ) -> DbResult<Vec<BindingRow>> {
-        for binding in &mut bindings {
-            binding.remove("__edge_next_node_id__");
-        }
-
-        // Dispatch to shortest-path matching if a path function is present.
-        if let Some(ref func) = pattern.path_function {
-            return self.match_shortest_path(context, pattern, *func, bindings);
-        }
-
-        // Pattern pivot: pick the most-selective node as the
-        // matching start so a shape like
-        // `(x)-->(a {id: 50})-->(b)` jumps straight to the PK
-        // lookup on `a` and expands outwards, instead of
-        // full-scanning `x` and joining inward. The previous
-        // strict left-to-right walk made every chained pattern
-        // pay for an unconstrained-leftmost-node SeqScan even
-        // when a later node had a literal-equality constraint
-        // on an indexed column.
-        //
-        // Pivot rules:
-        // * `node.index_scan.is_some()` → score 0 (best)
-        // * `node.properties non-empty`  → score 1
-        // * label-only or no constraint → score 2
-        //
-        // When the chosen pivot is NOT the leftmost node we
-        // rewrite the pattern: walk the LEFT arm in reversed
-        // direction (incoming becomes outgoing and vice-versa),
-        // then the RIGHT arm in original direction. The pivot is
-        // matched once at the start, both arms reuse the bindings
-        // produced for it. This is the same transform PG's
-        // planner runs when it pulls an inner-join's
-        // most-selective relation up to the driver position.
-        if let Some(pivot) = pick_match_pivot_index(pattern) {
-            return self.match_pattern_pivoted(context, pattern, bindings, filter_conjuncts, pivot);
-        }
-
-        for (i, node) in pattern.nodes.iter().enumerate() {
-            bindings = self.match_node(context, node, bindings)?;
-            bindings =
-                self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-            if bindings.is_empty() {
-                return Ok(bindings);
-            }
-            // After each node except the last, process the relationship and
-            // then the next node will be handled by the next loop iteration.
-            if i < pattern.relationships.len() {
-                let rel = &pattern.relationships[i];
-                let next_node = pattern.nodes.get(i + 1);
-                bindings = self.match_relationship(
-                    context,
-                    node,
-                    rel,
-                    next_node,
-                    bindings,
-                    pattern.path_variable.as_deref(),
-                )?;
-                bindings =
-                    self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-                if bindings.is_empty() {
-                    return Ok(bindings);
-                }
-            }
-        }
-        Ok(bindings)
-    }
-
-    /// Pivoted match: anchor at `pivot` (the most-selective node
-    /// chosen by `pick_match_pivot_index`) and expand left-then-right.
-    ///
-    /// Left expansion walks `pivot - 1, pivot - 2, …, 0`, processing
-    /// the relationship that originally connected `node[i]` to
-    /// `node[i+1]` with its direction flipped (Outgoing↔Incoming;
-    /// Both stays Both) so the adjacency lookup goes from the
-    /// already-bound right side back to the unbound left side.
-    /// Right expansion walks `pivot + 1, pivot + 2, …` with the
-    /// original relationship direction.
-    fn match_pattern_pivoted(
-        &self,
-        context: &ExecutionContext,
-        pattern: &CypherPattern,
-        bindings: Vec<BindingRow>,
-        filter_conjuncts: &[GraphFilterConjunct<'_>],
-        pivot: usize,
-    ) -> DbResult<Vec<BindingRow>> {
-        let mut bindings = self.match_node(context, &pattern.nodes[pivot], bindings)?;
-        bindings = self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-        if bindings.is_empty() {
-            return Ok(bindings);
-        }
-
-        // Left arm: walk from pivot back to index 0. Each
-        // relationship[i] connects node[i] (left) to node[i+1]
-        // (right). When we walk right→left we treat the
-        // "current" as node[i+1] and the "next" as node[i], so
-        // the direction must be flipped.
-        for left_node_idx in (0..pivot).rev() {
-            let rel_idx = left_node_idx;
-            let original_rel = &pattern.relationships[rel_idx];
-            let flipped_rel = flip_relationship_direction(original_rel);
-            let current_node = &pattern.nodes[left_node_idx + 1];
-            let next_node = &pattern.nodes[left_node_idx];
-            for binding in &mut bindings {
-                binding.remove("__edge_next_node_id__");
-            }
-            bindings = self.match_relationship(
-                context,
-                current_node,
-                &flipped_rel,
-                Some(next_node),
-                bindings,
-                None,
-            )?;
-            bindings =
-                self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-            if bindings.is_empty() {
-                return Ok(bindings);
-            }
-            bindings = self.match_node(context, next_node, bindings)?;
-            bindings =
-                self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-            if bindings.is_empty() {
-                return Ok(bindings);
-            }
-        }
-
-        // Right arm: walk from pivot forward to the end with the
-        // original relationship direction.
-        for right_node_idx in (pivot + 1)..pattern.nodes.len() {
-            let rel_idx = right_node_idx - 1;
-            let original_rel = &pattern.relationships[rel_idx];
-            let current_node = &pattern.nodes[right_node_idx - 1];
-            let next_node = &pattern.nodes[right_node_idx];
-            for binding in &mut bindings {
-                binding.remove("__edge_next_node_id__");
-            }
-            bindings = self.match_relationship(
-                context,
-                current_node,
-                original_rel,
-                Some(next_node),
-                bindings,
-                None,
-            )?;
-            bindings =
-                self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-            if bindings.is_empty() {
-                return Ok(bindings);
-            }
-            bindings = self.match_node(context, next_node, bindings)?;
-            bindings =
-                self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
-            if bindings.is_empty() {
-                return Ok(bindings);
-            }
-        }
-        Ok(bindings)
-    }
-
-    fn apply_ready_graph_filter_conjuncts(
-        &self,
-        context: &ExecutionContext,
-        bindings: Vec<BindingRow>,
-        filter_conjuncts: &[GraphFilterConjunct<'_>],
-    ) -> DbResult<Vec<BindingRow>> {
-        if filter_conjuncts.is_empty() || bindings.is_empty() {
-            return Ok(bindings);
-        }
-
-        let mut filtered = Vec::with_capacity(bindings.len());
-        'binding: for binding in bindings {
-            for conjunct in filter_conjuncts {
-                if !conjunct.is_ready(&binding) {
-                    continue;
-                }
-                if !self.evaluate_graph_predicate(context, conjunct.expr, &binding)? {
-                    continue 'binding;
-                }
-            }
-            filtered.push(binding);
-        }
-        Ok(filtered)
-    }
-
-    /// Execute a shortest-path or all-shortest-paths match.
-    ///
-    /// The pattern must have exactly two nodes and one relationship (the
-    /// typical `(a)-[*..N]->(b)` form).  BFS is used to find the shortest
-    /// path(s) between every pair of candidate start/end nodes.  The results
-    /// are returned as binding rows containing the start node, end node, and
-    /// (if the relationship is named) the first edge on the path.
-    fn match_shortest_path(
-        &self,
-        context: &ExecutionContext,
-        pattern: &CypherPattern,
-        func: CypherPathFunction,
-        input_bindings: Vec<BindingRow>,
-    ) -> DbResult<Vec<BindingRow>> {
-        // Validate the pattern shape.
-        if pattern.nodes.len() != 2 || pattern.relationships.len() != 1 {
-            return Err(DbError::internal(
-                "shortestPath/allShortestPaths requires exactly two nodes and one relationship",
-            ));
-        }
-        let start_node_pat = &pattern.nodes[0];
-        let end_node_pat = &pattern.nodes[1];
-        let rel_pat = &pattern.relationships[0];
-
-        let max_depth = rel_pat.max_hops.unwrap_or(15);
-
-        // Resolve edge table id.
-        let Some(edge_table_id) = rel_pat.table_id else {
-            return Err(DbError::internal(
-                "shortestPath requires a typed relationship pattern (e.g. [:KNOWS*])",
-            ));
-        };
-
-        // Determine source/target column indices in the edge table.
-        let edge_table = self
-            .catalog_reader
-            .get_table_by_id(context.txn_id, edge_table_id)?
-            .ok_or_else(|| DbError::internal("edge table not found"))?;
-        let edge_col_names: SharedStrings =
-            Arc::new(edge_table.columns.iter().map(|c| c.name.clone()).collect());
-        let ((source_idx, target_idx), use_table_adjacency) = self
-            .resolve_edge_endpoint_columns_for_rel(
-                context,
-                edge_table_id,
-                rel_pat.rel_type.as_deref(),
-            )?;
-
-        // First, expand start and end node candidates using normal matching.
-        let start_bindings = self.match_node(context, start_node_pat, input_bindings)?;
-        // For each start binding, expand end-node candidates.
-        // We need all-labels support here so we use a temporary pattern.
-        let start_and_end_bindings = self.match_node(context, end_node_pat, start_bindings)?;
-
-        let start_var = start_node_pat.variable.as_deref().unwrap_or("__sp_start__");
-        let end_var = end_node_pat.variable.as_deref().unwrap_or("__sp_end__");
-        let rel_var = rel_pat.variable.as_deref();
-        let rel_type_name: SharedText = Arc::from(rel_pat.rel_type.clone().unwrap_or_default());
-
-        let mut output = Vec::new();
-
-        let mode = PathSearchMode::from_path_function(func);
-        let mut edge_endpoint_overrides = HashMap::new();
-        if !use_table_adjacency {
-            edge_endpoint_overrides.insert(edge_table_id, (source_idx, target_idx));
-        }
-        let graph_provider = ExecutorGraphRowProvider {
-            executor: self,
-            context,
-            edge_endpoint_overrides,
-        };
-        let use_storage_backed_shortest_path = matches!(mode, PathSearchMode::SingleShortest);
-
-        for binding in &start_and_end_bindings {
-            context.check_deadline()?;
-
-            // Extract start and end node ids.
-            let start_id = match binding.get(start_var) {
-                Some(BoundValue::Node { id_value, .. }) => id_value.clone(),
-                _ => continue,
-            };
-            let end_id = match binding.get(end_var) {
-                Some(BoundValue::Node { id_value, .. }) => id_value.clone(),
-                _ => continue,
-            };
-
-            // Skip self-loops unless they make sense.
-            if start_id == end_id {
-                // For shortest path from a node to itself, the path is trivial
-                // (just the node). We emit the binding as-is.
-                ensure_graph_result_row_capacity(context, output.len())?;
-                context.track_memory(estimate_binding_row_bytes(binding))?;
-                output.push(binding.clone());
-                continue;
-            }
-
-            if use_storage_backed_shortest_path {
-                let (start_table_id, start_row) = match binding.get(start_var) {
-                    Some(BoundValue::Node { table_id, row, .. }) => (*table_id, row.as_ref()),
-                    _ => continue,
-                };
-                let (end_table_id, end_row) = match binding.get(end_var) {
-                    Some(BoundValue::Node { table_id, row, .. }) => (*table_id, row.as_ref()),
-                    _ => continue,
-                };
-                let Some(path) = graph_shortest_path(
-                    start_table_id,
-                    start_row,
-                    end_table_id,
-                    end_row,
-                    edge_table_id,
-                    &graph_provider,
-                    max_depth,
-                )?
-                else {
-                    continue;
-                };
-
-                let mut new_binding = binding.clone();
-                if let Some(rv) = rel_var {
-                    let first_edge_tuple_id = path.iter().find_map(|element| match element {
-                        GraphPathElement::Edge { tuple_id, .. } => Some(*tuple_id),
-                        GraphPathElement::Node { .. } => None,
-                    });
-                    if let Some(tuple_id) = first_edge_tuple_id {
-                        let Some(raw_row) = self.storage_dml.fetch(
-                            context.txn_id,
-                            &context.snapshot,
-                            edge_table_id,
-                            tuple_id,
-                            None,
-                        )?
-                        else {
-                            continue;
-                        };
-                        let record = aiondb_storage_api::TupleRecord {
-                            tuple_id,
-                            heap_position: tuple_id.get(),
-                            row: raw_row,
-                        };
-                        let compat_row =
-                            self.compat_scan_row_for_table_id(context, edge_table_id, &record)?;
-                        new_binding.insert_binding(
-                            rv.to_owned(),
-                            BoundValue::Edge {
-                                table_id: edge_table_id,
-                                row: Arc::new(compat_row),
-                                raw_row: Arc::new(record.row),
-                                tuple_id,
-                                rel_type: Arc::clone(&rel_type_name),
-                                column_names: Arc::clone(&edge_col_names),
-                            },
-                        );
-                    }
-                }
-                ensure_graph_result_row_capacity(context, output.len())?;
-                context.track_memory(estimate_binding_row_bytes(&new_binding))?;
-                output.push(new_binding);
-            } else {
-                let paths = self.search_paths_bfs_adjacency(
-                    context,
-                    mode,
-                    &start_id,
-                    &end_id,
-                    edge_table_id,
-                    target_idx,
-                    &graph_provider,
-                    max_depth,
-                )?;
-
-                if paths.is_empty() {
-                    continue;
-                }
-
-                for path_edges in &paths {
-                    let mut new_binding = binding.clone();
-
-                    if let Some(rv) = rel_var {
-                        if let Some(tuple_id) = path_edges.first() {
-                            let Some(raw_row) = self.storage_dml.fetch(
-                                context.txn_id,
-                                &context.snapshot,
-                                edge_table_id,
-                                *tuple_id,
-                                None,
-                            )?
-                            else {
-                                continue;
-                            };
-                            let record = aiondb_storage_api::TupleRecord {
-                                tuple_id: *tuple_id,
-                                heap_position: tuple_id.get(),
-                                row: raw_row,
-                            };
-                            let compat_row =
-                                self.compat_scan_row_for_table_id(context, edge_table_id, &record)?;
-                            new_binding.insert_binding(
-                                rv.to_owned(),
-                                BoundValue::Edge {
-                                    table_id: edge_table_id,
-                                    row: Arc::new(compat_row),
-                                    raw_row: Arc::new(record.row),
-                                    tuple_id: *tuple_id,
-                                    rel_type: Arc::clone(&rel_type_name),
-                                    column_names: Arc::clone(&edge_col_names),
-                                },
-                            );
-                        }
-                    }
-
-                    ensure_graph_result_row_capacity(context, output.len())?;
-                    context.track_memory(estimate_binding_row_bytes(&new_binding))?;
-                    output.push(new_binding);
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// BFS shortest-path(s) between two node ids using adjacency expansion.
-    ///
-    /// Returns a vec of paths, where each path is a vec of edge tuple ids.
-    fn search_paths_bfs_adjacency(
-        &self,
-        context: &ExecutionContext,
-        mode: PathSearchMode,
-        start_id: &Value,
-        end_id: &Value,
-        edge_table_id: RelationId,
-        target_idx: usize,
-        provider: &dyn GraphRowProvider,
-        max_depth: u32,
-    ) -> DbResult<Vec<Vec<TupleId>>> {
-        let all = mode.allows_multiple_shortest_paths();
-        let mut queue: VecDeque<(Value, Vec<TupleId>, HashSet<TupleId>)> = VecDeque::new();
-        context.track_memory(estimate_shortest_path_queue_entry_bytes(start_id, 0, 0))?;
-        ensure_graph_workset_capacity(context, queue.len(), "shortest-path queue")?;
-        queue.push_back((start_id.clone(), Vec::new(), HashSet::new()));
-
-        // For the single-shortest variant, track visited nodes to prune.
-        // For all-shortest, we track (node, depth) to allow multiple arrivals
-        // at the same depth.
-        let mut visited: HashMap<ValueHashKey, u32> = HashMap::new();
-        if let Some(k) = value_to_bfs_key(start_id) {
-            visited.insert(k, 0);
-            context.track_memory(
-                size_of_u64::<ValueHashKey>()
-                    .saturating_add(size_of_u64::<u32>())
-                    .saturating_add(16),
-            )?;
-        }
-
-        let mut found_paths: Vec<Vec<TupleId>> = Vec::new();
-        let mut found_depth: Option<u32> = None;
-
-        for _depth in 0..max_depth {
-            let frontier_len = queue.len();
-            if frontier_len == 0 {
-                break;
-            }
-
-            // If we already found paths and we're past the shortest depth, stop.
-            if let Some(fd) = found_depth {
-                if _depth > fd {
-                    break;
-                }
-            }
-
-            for _ in 0..frontier_len {
-                let Some((current_val, path, path_set)) = queue.pop_front() else {
-                    break;
-                };
-
-                let edges = provider.adjacency_lookup_edges(
-                    edge_table_id,
-                    &current_val,
-                    aiondb_graph::traversal::TraversalDirection::Outgoing,
-                )?;
-                for edge in &edges {
-                    context.check_deadline()?;
-                    let edge_tgt = edge
-                        .row
-                        .values
-                        .get(target_idx)
-                        .cloned()
-                        .unwrap_or(Value::Null);
-
-                    // Don't re-use the same edge in a path (O(1) HashSet lookup).
-                    if path_set.contains(&edge.tuple_id) {
-                        continue;
-                    }
-
-                    let mut new_path = path.clone();
-                    new_path.push(edge.tuple_id);
-                    let mut new_path_set = path_set.clone();
-                    new_path_set.insert(edge.tuple_id);
-
-                    // Found the target?
-                    if edge_tgt == *end_id {
-                        let depth = usize_to_u32(new_path.len());
-                        match found_depth {
-                            None => {
-                                found_depth = Some(depth);
-                                ensure_graph_result_row_capacity(context, found_paths.len())?;
-                                context.track_memory(estimate_bfs_path_bytes(new_path.len()))?;
-                                found_paths.push(new_path);
-                                if !all {
-                                    return Ok(found_paths);
-                                }
-                            }
-                            Some(fd) if depth == fd => {
-                                ensure_graph_result_row_capacity(context, found_paths.len())?;
-                                context.track_memory(estimate_bfs_path_bytes(new_path.len()))?;
-                                found_paths.push(new_path);
-                            }
-                            _ => {
-                                // Longer than shortest found -- skip.
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Node-level cycle detection.
-                    if let Some(k) = value_to_bfs_key(&edge_tgt) {
-                        if let Some(&prev_depth) = visited.get(&k) {
-                            if !all || usize_to_u32(new_path.len()) > prev_depth {
-                                continue;
-                            }
-                        }
-                        if visited.insert(k, usize_to_u32(new_path.len())).is_none() {
-                            context.track_memory(
-                                size_of_u64::<u64>()
-                                    .saturating_add(size_of_u64::<u32>())
-                                    .saturating_add(16),
-                            )?;
-                        }
-                    }
-
-                    context.track_memory(estimate_shortest_path_queue_entry_bytes(
-                        &edge_tgt,
-                        new_path.len(),
-                        new_path_set.len(),
-                    ))?;
-                    ensure_graph_workset_capacity(context, queue.len(), "shortest-path queue")?;
-                    queue.push_back((edge_tgt, new_path, new_path_set));
-                }
-            }
-        }
-
-        Ok(found_paths)
-    }
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -6177,17 +5632,6 @@ impl Executor {
             }
         }
         last_id
-    }
-
-    /// Check if the current node's id matches a given value.
-    pub(super) fn current_node_id_matches(
-        &self,
-        binding: &BindingRow,
-        current_node: Option<&CypherNodePattern>,
-        value: &Value,
-    ) -> bool {
-        self.find_current_node_id_for_pattern(binding, current_node)
-            .is_some_and(|id| id == *value)
     }
 
     /// Extract the node identity value from a bound variable.
