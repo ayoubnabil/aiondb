@@ -635,6 +635,11 @@ pub(super) fn ensure_graph_result_row_capacity(
 
 const GRAPH_WORKSET_ENTRIES_PER_RESULT_ROW: u64 = 32;
 const GRAPH_MIN_WORKSET_ENTRIES: u64 = 256;
+const GRAPH_PREALLOC_CAP: usize = 1024;
+
+pub(super) fn graph_prealloc_capacity(estimated: usize) -> usize {
+    estimated.min(GRAPH_PREALLOC_CAP)
+}
 
 pub(super) fn graph_workset_entry_cap(context: &ExecutionContext) -> u64 {
     context
@@ -1756,8 +1761,11 @@ impl Executor {
             node_id,
             outgoing,
         )?;
-        let mut values = Vec::with_capacity(cursor.remaining_hint());
+        let mut values = Vec::with_capacity(graph_prealloc_capacity(cursor.remaining_hint()));
         while let Some(value) = cursor.next_neighbor() {
+            context.check_deadline()?;
+            ensure_graph_workset_capacity(context, values.len(), "adjacency neighbor cache")?;
+            context.track_memory(estimate_value_bytes(&value).saturating_add(32))?;
             values.push(value);
         }
 

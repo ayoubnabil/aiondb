@@ -1043,11 +1043,11 @@ fn cypher_named_all_shortest_paths_renders_each_full_path() {
                 "paths: {paths:?}"
             );
             assert!(
-                paths.iter().any(|path| path.contains("B")),
+                paths.iter().any(|path| path.contains('B')),
                 "paths: {paths:?}"
             );
             assert!(
-                paths.iter().any(|path| path.contains("C")),
+                paths.iter().any(|path| path.contains('C')),
                 "paths: {paths:?}"
             );
         }

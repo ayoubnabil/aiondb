@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aiondb_core::{DbError, DbResult, Value, VectorValue};
 use aiondb_graph::algorithms::procedures::AlgorithmResult;
 
-use super::{BoundValue, SharedBoundValue};
+use super::{graph_prealloc_capacity, BoundValue, SharedBoundValue};
 
 fn selected_procedure_value_indexes(
     procedure: &str,
@@ -55,13 +55,16 @@ pub(super) fn procedure_result_bindings(
     results: &[AlgorithmResult],
     node_ids: &[Value],
 ) -> DbResult<Vec<Vec<SharedBoundValue>>> {
-    let estimated_rows = results.iter().map(algorithm_result_row_count).sum();
+    let estimated_rows = results
+        .iter()
+        .map(algorithm_result_row_count)
+        .fold(0usize, usize::saturating_add);
     let shared_node_ids = node_ids
         .iter()
         .cloned()
         .map(|value| Arc::new(BoundValue::Scalar(value)))
         .collect::<Vec<_>>();
-    let mut rows = Vec::with_capacity(estimated_rows);
+    let mut rows = Vec::with_capacity(graph_prealloc_capacity(estimated_rows));
     for result in results {
         match result {
             AlgorithmResult::NodeScores { column, scores } => {

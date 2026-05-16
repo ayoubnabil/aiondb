@@ -1,7 +1,7 @@
 use aiondb_core::DbResult;
 use aiondb_plan::graph::CypherProcedureCall;
 
-use super::{push_graph_binding, BindingRow, SharedBoundValue};
+use super::{graph_prealloc_capacity, push_graph_binding, BindingRow, SharedBoundValue};
 use crate::executor::ExecutionContext;
 
 pub(super) fn merge_procedure_rows_into_bindings(
@@ -10,7 +10,8 @@ pub(super) fn merge_procedure_rows_into_bindings(
     input_bindings: Vec<BindingRow>,
     procedure_rows: &[Vec<SharedBoundValue>],
 ) -> DbResult<Vec<BindingRow>> {
-    let mut output = Vec::with_capacity(input_bindings.len().saturating_mul(procedure_rows.len()));
+    let estimated_rows = input_bindings.len().saturating_mul(procedure_rows.len());
+    let mut output = Vec::with_capacity(graph_prealloc_capacity(estimated_rows));
     for input in input_bindings {
         let yield_slots = call
             .yields
