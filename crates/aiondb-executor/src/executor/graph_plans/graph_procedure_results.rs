@@ -32,6 +32,30 @@ fn selected_procedure_values_from_indexes(
     indexes.iter().map(|&index| values[index].clone()).collect()
 }
 
+struct SharedNodeIds<'a> {
+    node_ids: &'a [Value],
+    values: Vec<Option<SharedBoundValue>>,
+}
+
+impl<'a> SharedNodeIds<'a> {
+    fn new(node_ids: &'a [Value]) -> Self {
+        Self {
+            node_ids,
+            values: vec![None; node_ids.len()],
+        }
+    }
+
+    fn get(&mut self, node_index: usize) -> Option<SharedBoundValue> {
+        let slot = self.values.get_mut(node_index)?;
+        if slot.is_none() {
+            *slot = Some(Arc::new(BoundValue::Scalar(
+                self.node_ids.get(node_index)?.clone(),
+            )));
+        }
+        slot.clone()
+    }
+}
+
 fn algorithm_result_row_count(result: &AlgorithmResult) -> usize {
     match result {
         AlgorithmResult::NodeScores { scores, .. } => scores.len(),
@@ -59,11 +83,7 @@ pub(super) fn procedure_result_bindings(
         .iter()
         .map(algorithm_result_row_count)
         .fold(0usize, usize::saturating_add);
-    let shared_node_ids = node_ids
-        .iter()
-        .cloned()
-        .map(|value| Arc::new(BoundValue::Scalar(value)))
-        .collect::<Vec<_>>();
+    let mut shared_node_ids = SharedNodeIds::new(node_ids);
     let mut rows = Vec::with_capacity(graph_prealloc_capacity(estimated_rows));
     for result in results {
         match result {
@@ -74,7 +94,7 @@ pub(super) fn procedure_result_bindings(
                     &["nodeId", column.as_str()],
                 )?;
                 for (node_index, score) in scores.iter().enumerate() {
-                    let node_id = shared_node_ids.get(node_index).cloned().ok_or_else(|| {
+                    let node_id = shared_node_ids.get(node_index).ok_or_else(|| {
                         DbError::internal(format!(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
@@ -101,7 +121,7 @@ pub(super) fn procedure_result_bindings(
                     &["nodeId", first_column.as_str(), second_column.as_str()],
                 )?;
                 for (node_index, (first, second)) in scores.iter().enumerate() {
-                    let node_id = shared_node_ids.get(node_index).cloned().ok_or_else(|| {
+                    let node_id = shared_node_ids.get(node_index).ok_or_else(|| {
                         DbError::internal(format!(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
@@ -121,7 +141,7 @@ pub(super) fn procedure_result_bindings(
                     &["nodeId", column.as_str()],
                 )?;
                 for (node_index, label) in labels.iter().enumerate() {
-                    let node_id = shared_node_ids.get(node_index).cloned().ok_or_else(|| {
+                    let node_id = shared_node_ids.get(node_index).ok_or_else(|| {
                         DbError::internal(format!(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
@@ -140,7 +160,7 @@ pub(super) fn procedure_result_bindings(
                     &["nodeId", column.as_str()],
                 )?;
                 for (node_index, count) in counts.iter().enumerate() {
-                    let node_id = shared_node_ids.get(node_index).cloned().ok_or_else(|| {
+                    let node_id = shared_node_ids.get(node_index).ok_or_else(|| {
                         DbError::internal(format!(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
@@ -162,7 +182,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure node index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced unknown node index {node_index}"
@@ -189,7 +208,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure source index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced result for unknown source node index {source_index}"
@@ -201,7 +219,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure target index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced result for unknown target node index {target_index}"
@@ -251,7 +268,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure source index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced result for unknown source node index {source_index}"
@@ -263,7 +279,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure target index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced result for unknown target node index {target_index}"
@@ -301,7 +316,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure source index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced path for unknown source node index {source_index}"
@@ -313,7 +327,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure target index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced path for unknown target node index {target_index}"
@@ -362,7 +375,6 @@ pub(super) fn procedure_result_bindings(
                                 "Cypher graph procedure walk node index exceeds usize capacity",
                             )
                         })?)
-                        .cloned()
                         .ok_or_else(|| {
                             DbError::internal(format!(
                                 "procedure {procedure} produced walk for unknown node index {node_index}"
@@ -403,7 +415,7 @@ pub(super) fn procedure_result_bindings(
                     &[node_column.as_str(), embedding_column.as_str()],
                 )?;
                 for (node_index, embedding) in embeddings.iter().enumerate() {
-                    let node_id = shared_node_ids.get(node_index).cloned().ok_or_else(|| {
+                    let node_id = shared_node_ids.get(node_index).ok_or_else(|| {
                         DbError::internal(format!(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
