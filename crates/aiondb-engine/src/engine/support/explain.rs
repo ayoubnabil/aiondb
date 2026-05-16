@@ -57,6 +57,7 @@ pub(in super::super) fn explain_result_rows_pg(
     summary: Option<&ExplainAnalyzeSummary>,
     table_names: &HashMap<u64, String>,
     session_vars: &HashMap<String, String>,
+    extra_lines: &[String],
 ) -> Vec<Row> {
     let analyze_info = summary.as_ref().map(|s| match s {
         ExplainAnalyzeSummary::Query { rows_returned, .. } => AnalyzeNodeInfo {
@@ -73,6 +74,8 @@ pub(in super::super) fn explain_result_rows_pg(
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect();
+
+    lines.extend(extra_lines.iter().cloned());
 
     // Append EXPLAIN ANALYZE summary lines when present.
     if let Some(s) = summary {

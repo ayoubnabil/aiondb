@@ -185,7 +185,17 @@ fn collect_required_cypher_privileges_from_query(
                     reqs,
                 )?;
             }
-            aiondb_plan::graph::CypherPipelineOp::Unwind(_) => {}
+            aiondb_plan::graph::CypherPipelineOp::Foreach(foreach) => {
+                collect_required_cypher_foreach_privileges(
+                    catalog_reader,
+                    foreach,
+                    rbac_active,
+                    reqs,
+                    &mut variable_tables,
+                )?;
+            }
+            aiondb_plan::graph::CypherPipelineOp::Unwind(_)
+            | aiondb_plan::graph::CypherPipelineOp::ProcedureCall(_) => {}
         }
     }
 
@@ -272,6 +282,85 @@ fn collect_required_cypher_privileges_from_query(
         )?;
     }
 
+    Ok(())
+}
+
+fn collect_required_cypher_foreach_privileges(
+    catalog_reader: &dyn CatalogReader,
+    foreach: &aiondb_plan::graph::CypherForeachPlan,
+    rbac_active: bool,
+    reqs: &mut Vec<(CatalogPrivilege, RelationId)>,
+    variable_tables: &mut BTreeMap<String, Vec<RelationId>>,
+) -> DbResult<()> {
+    for op in &foreach.body {
+        match op {
+            aiondb_plan::graph::CypherForeachOp::Set(set_item) => {
+                collect_required_cypher_set_privileges(
+                    set_item,
+                    reqs,
+                    variable_tables,
+                    rbac_active,
+                    "FOREACH SET/REMOVE",
+                )?;
+            }
+            aiondb_plan::graph::CypherForeachOp::Create(create_clause) => {
+                collect_required_cypher_create_privileges(
+                    catalog_reader,
+                    create_clause,
+                    rbac_active,
+                    reqs,
+                    variable_tables,
+                )?;
+            }
+            aiondb_plan::graph::CypherForeachOp::Merge(merge_clause) => {
+                collect_required_cypher_match_pattern_privileges(
+                    catalog_reader,
+                    &merge_clause.pattern,
+                    reqs,
+                    variable_tables,
+                )?;
+                collect_required_cypher_create_pattern_privileges(
+                    catalog_reader,
+                    &merge_clause.pattern,
+                    rbac_active,
+                    reqs,
+                    variable_tables,
+                    "FOREACH MERGE",
+                )?;
+                for set_item in merge_clause
+                    .on_create_set
+                    .iter()
+                    .chain(merge_clause.on_match_set.iter())
+                {
+                    collect_required_cypher_set_privileges(
+                        set_item,
+                        reqs,
+                        variable_tables,
+                        rbac_active,
+                        "FOREACH MERGE SET",
+                    )?;
+                }
+            }
+            aiondb_plan::graph::CypherForeachOp::Delete(delete_clause) => {
+                collect_required_cypher_delete_privileges(
+                    catalog_reader,
+                    delete_clause,
+                    reqs,
+                    variable_tables,
+                    rbac_active,
+                )?;
+            }
+            aiondb_plan::graph::CypherForeachOp::Foreach(nested) => {
+                collect_required_cypher_foreach_privileges(
+                    catalog_reader,
+                    nested,
+                    rbac_active,
+                    reqs,
+                    variable_tables,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 

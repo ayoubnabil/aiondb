@@ -351,6 +351,10 @@ fn push_functions_from_cypher_query<'a>(
             aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery) => {
                 stack.push(FunctionPlanWork::Cypher(subquery));
             }
+            aiondb_plan::graph::CypherPipelineOp::Foreach(foreach) => {
+                push_functions_from_cypher_foreach(foreach, stack);
+            }
+            aiondb_plan::graph::CypherPipelineOp::ProcedureCall(_) => {}
         }
     }
 
@@ -385,6 +389,39 @@ fn push_functions_from_cypher_query<'a>(
 
     if let Some(union) = &query.union {
         stack.push(FunctionPlanWork::Cypher(&union.right));
+    }
+}
+
+fn push_functions_from_cypher_foreach<'a>(
+    foreach: &'a aiondb_plan::graph::CypherForeachPlan,
+    stack: &mut Vec<FunctionPlanWork<'a>>,
+) {
+    stack.push(FunctionPlanWork::Expr(&foreach.expr));
+    for op in &foreach.body {
+        match op {
+            aiondb_plan::graph::CypherForeachOp::Set(set_item) => {
+                stack.push(FunctionPlanWork::Expr(&set_item.expr));
+            }
+            aiondb_plan::graph::CypherForeachOp::Create(create_clause) => {
+                for pattern in &create_clause.patterns {
+                    push_functions_from_cypher_pattern(pattern, stack);
+                }
+            }
+            aiondb_plan::graph::CypherForeachOp::Merge(merge_clause) => {
+                push_functions_from_cypher_pattern(&merge_clause.pattern, stack);
+                for set_item in merge_clause
+                    .on_create_set
+                    .iter()
+                    .chain(merge_clause.on_match_set.iter())
+                {
+                    stack.push(FunctionPlanWork::Expr(&set_item.expr));
+                }
+            }
+            aiondb_plan::graph::CypherForeachOp::Delete(_) => {}
+            aiondb_plan::graph::CypherForeachOp::Foreach(nested) => {
+                push_functions_from_cypher_foreach(nested, stack);
+            }
+        }
     }
 }
 

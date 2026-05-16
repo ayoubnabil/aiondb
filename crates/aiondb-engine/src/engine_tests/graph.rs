@@ -1,5 +1,6 @@
 use super::*;
 use aiondb_core::SqlState;
+mod cypher_regression;
 mod implicit_column_rewrite;
 // ===================================================================
 // CREATE NODE LABEL
@@ -220,6 +221,120 @@ fn create_edge_label_can_project_existing_fk_columns() {
     );
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].values[0], Value::BigInt(10));
+}
+
+#[test]
+fn explain_match_includes_graph_access_lines() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain VALUES (1, 2); \
+             CREATE NODE LABEL person_explain ON people_explain; \
+             CREATE EDGE LABEL knows_explain ON knows_explain SOURCE person_explain TARGET person_explain",
+        )
+        .expect("setup graph explain tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain)-[:knows_explain]->(b:person_explain) RETURN b.id",
+        )
+        .expect("execute explain match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Graph Access [") && line.contains("pattern 0]")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("source=Some(TraversalStore)")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("fallback=Some(RowStore)")),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_graph_procedure_includes_projection_lines() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN CALL graph.pageRank() YIELD nodeId, score RETURN nodeId, score",
+        )
+        .expect("execute explain graph procedure");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Graph Projection [ProcedureCall 0]")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("procedure=graph.pageRank")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("source=Some(ProjectionStore)")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("projection=cypher.native.graph")),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("node_count=unknown") && line.contains("edge_count=unknown")),
+        "explain lines: {lines:?}"
+    );
 }
 
 #[test]
@@ -1724,4 +1839,57 @@ fn cypher_multi_out_where_limit_filters_left_branch() {
             Row::new(vec![Value::Int(4), Value::Int(2)]),
         ],
     );
+}
+
+#[test]
+fn cypher_inline_edge_property_equality_limit_filters_edges() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_eq (id INT NOT NULL, number INT); \
+             CREATE TABLE knows_eq_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_eq ON people_eq; \
+             CREATE EDGE LABEL knows_eq ON knows_eq_edges SOURCE person_eq TARGET person_eq; \
+             INSERT INTO people_eq VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0); \
+             INSERT INTO knows_eq_edges VALUES (1, 2, 10), (1, 3, 20), (2, 4, 10), (3, 5, 10), (4, 5, 99)",
+        )
+        .expect("seed graph");
+
+    // Inline `{weight: 10}` equality filter must match only edges whose weight
+    // is exactly 10, preserving edge scan order, honoring LIMIT.
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_eq)-[:knows_eq {weight: 10}]->(b:person_eq) RETURN b.id LIMIT 10",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            Row::new(vec![Value::Int(2)]),
+            Row::new(vec![Value::Int(4)]),
+            Row::new(vec![Value::Int(5)]),
+        ],
+    );
+
+    let limited = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_eq)-[:knows_eq {weight: 10}]->(b:person_eq) RETURN b.id LIMIT 2",
+    );
+    assert_eq!(
+        limited,
+        vec![Row::new(vec![Value::Int(2)]), Row::new(vec![Value::Int(4)])],
+    );
+
+    // Reversed pattern orientation (binder may anchor on the returned node)
+    // must yield the same edges.
+    let reversed = query_rows(
+        &engine,
+        &session,
+        "MATCH (b:person_eq)<-[:knows_eq {weight: 10}]-(a:person_eq) RETURN b.id LIMIT 10",
+    );
+    assert_eq!(reversed, rows);
 }

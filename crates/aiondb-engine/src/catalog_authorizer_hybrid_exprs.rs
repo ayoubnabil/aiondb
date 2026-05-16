@@ -58,6 +58,14 @@ fn collect_required_hybrid_privileges_from_cypher_query(
                     reqs,
                 )?;
             }
+            aiondb_plan::graph::CypherPipelineOp::Foreach(foreach) => {
+                collect_required_hybrid_privileges_from_cypher_foreach(
+                    catalog_reader,
+                    foreach,
+                    reqs,
+                )?;
+            }
+            aiondb_plan::graph::CypherPipelineOp::ProcedureCall(_) => {}
         }
     }
 
@@ -110,6 +118,61 @@ fn collect_required_hybrid_privileges_from_cypher_query(
         collect_required_hybrid_privileges_from_cypher_query(catalog_reader, &union.right, reqs)?;
     }
 
+    Ok(())
+}
+
+fn collect_required_hybrid_privileges_from_cypher_foreach(
+    catalog_reader: &dyn CatalogReader,
+    foreach: &aiondb_plan::graph::CypherForeachPlan,
+    reqs: &mut Vec<(CatalogPrivilege, RelationId)>,
+) -> DbResult<()> {
+    collect_required_hybrid_privileges_from_expr(catalog_reader, &foreach.expr, reqs)?;
+    for op in &foreach.body {
+        match op {
+            aiondb_plan::graph::CypherForeachOp::Set(set_item) => {
+                collect_required_hybrid_privileges_from_expr(
+                    catalog_reader,
+                    &set_item.expr,
+                    reqs,
+                )?;
+            }
+            aiondb_plan::graph::CypherForeachOp::Create(create_clause) => {
+                for pattern in &create_clause.patterns {
+                    collect_required_hybrid_privileges_from_cypher_pattern(
+                        catalog_reader,
+                        pattern,
+                        reqs,
+                    )?;
+                }
+            }
+            aiondb_plan::graph::CypherForeachOp::Merge(merge_clause) => {
+                collect_required_hybrid_privileges_from_cypher_pattern(
+                    catalog_reader,
+                    &merge_clause.pattern,
+                    reqs,
+                )?;
+                for set_item in merge_clause
+                    .on_create_set
+                    .iter()
+                    .chain(merge_clause.on_match_set.iter())
+                {
+                    collect_required_hybrid_privileges_from_expr(
+                        catalog_reader,
+                        &set_item.expr,
+                        reqs,
+                    )?;
+                }
+            }
+            aiondb_plan::graph::CypherForeachOp::Delete(_) => {}
+            aiondb_plan::graph::CypherForeachOp::Foreach(nested) => {
+                collect_required_hybrid_privileges_from_cypher_foreach(
+                    catalog_reader,
+                    nested,
+                    reqs,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 

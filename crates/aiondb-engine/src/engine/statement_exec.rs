@@ -1536,11 +1536,16 @@ impl Engine {
             text_type_modifier: None,
             nullable: false,
         }];
+        let txn_id = self.current_txn_id(session).unwrap_or_default();
+        let graph_access_lines = self
+            .executor
+            .explain_physical_plan_graph_access_lines(txn_id, physical_plan.as_ref());
         let rows = support::explain_result_rows_pg(
             physical_plan.as_ref(),
             analyze_summary.as_ref(),
             &table_names,
             &session_vars,
+            &graph_access_lines,
         );
         Ok(StatementResult::Query { columns, rows })
     }
