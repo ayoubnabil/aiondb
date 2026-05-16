@@ -1818,7 +1818,94 @@ impl Executor {
         Ok(Value::Array(neighbors))
     }
 
-    fn collect_graph_neighbors(
+    pub(crate) fn resolve_graph_neighbors_rows(
+        &self,
+        args: &[TypedExpr],
+        outer_row: Option<&Row>,
+        context: &ExecutionContext,
+    ) -> DbResult<Vec<Row>> {
+        let arg_values = self.evaluate_special_function_args(args, outer_row, context)?;
+        if arg_values.iter().any(Value::is_null) {
+            return Ok(Vec::new());
+        }
+        if !(2..=4).contains(&arg_values.len()) {
+            return Err(DbError::internal(
+                "graph_neighbors() expects 2, 3, or 4 arguments",
+            ));
+        }
+
+        let edge_label = expect_text_arg(&arg_values[0], "graph_neighbors() edge label")?;
+        let (direction, limit) = parse_graph_neighbor_options(&arg_values)?;
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let meta = self.resolve_graph_neighbor_edge_meta(context, edge_label)?;
+        let capacity_hint = limit.map_or(16, |max_rows| max_rows.min(1024));
+        let mut rows = Vec::with_capacity(capacity_hint);
+        let mut seen_neighbors = GraphNeighborSeen::new(limit, capacity_hint);
+        match direction {
+            GraphNeighborDirection::Outgoing => self.collect_graph_neighbors(
+                context,
+                meta.table_id,
+                &arg_values[1],
+                &meta.source_type,
+                meta.source_idx,
+                meta.target_idx,
+                true,
+                meta.use_table_adjacency,
+                limit,
+                &mut rows,
+                &mut seen_neighbors,
+            )?,
+            GraphNeighborDirection::Incoming => self.collect_graph_neighbors(
+                context,
+                meta.table_id,
+                &arg_values[1],
+                &meta.target_type,
+                meta.target_idx,
+                meta.source_idx,
+                false,
+                meta.use_table_adjacency,
+                limit,
+                &mut rows,
+                &mut seen_neighbors,
+            )?,
+            GraphNeighborDirection::Both => {
+                self.collect_graph_neighbors(
+                    context,
+                    meta.table_id,
+                    &arg_values[1],
+                    &meta.source_type,
+                    meta.source_idx,
+                    meta.target_idx,
+                    true,
+                    meta.use_table_adjacency,
+                    limit,
+                    &mut rows,
+                    &mut seen_neighbors,
+                )?;
+                if limit.map_or(true, |max_rows| rows.len() < max_rows) {
+                    self.collect_graph_neighbors(
+                        context,
+                        meta.table_id,
+                        &arg_values[1],
+                        &meta.target_type,
+                        meta.target_idx,
+                        meta.source_idx,
+                        false,
+                        meta.use_table_adjacency,
+                        limit,
+                        &mut rows,
+                        &mut seen_neighbors,
+                    )?;
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn collect_graph_neighbors<O: GraphNeighborOutput>(
         &self,
         context: &ExecutionContext,
         edge_table_id: RelationId,
@@ -1829,7 +1916,7 @@ impl Executor {
         outgoing: bool,
         use_table_adjacency: bool,
         limit: Option<usize>,
-        output: &mut Vec<Value>,
+        output: &mut O,
         seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         if limit.is_some_and(|max_rows| output.len() >= max_rows) {
@@ -1957,7 +2044,7 @@ impl Executor {
         }
     }
 
-    fn collect_graph_neighbors_by_index(
+    fn collect_graph_neighbors_by_index<O: GraphNeighborOutput>(
         &self,
         context: &ExecutionContext,
         edge_table_id: RelationId,
@@ -1966,7 +2053,7 @@ impl Executor {
         endpoint_idx: usize,
         neighbor_idx: usize,
         limit: Option<usize>,
-        output: &mut Vec<Value>,
+        output: &mut O,
         seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         let projected_columns = self.table_column_ids_for_ordinals(
@@ -1991,7 +2078,7 @@ impl Executor {
         Ok(())
     }
 
-    fn collect_graph_neighbors_by_scan(
+    fn collect_graph_neighbors_by_scan<O: GraphNeighborOutput>(
         &self,
         context: &ExecutionContext,
         edge_table_id: RelationId,
@@ -1999,7 +2086,7 @@ impl Executor {
         endpoint_idx: usize,
         neighbor_idx: usize,
         limit: Option<usize>,
-        output: &mut Vec<Value>,
+        output: &mut O,
         seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         let projected_columns = self.table_column_ids_for_ordinals(

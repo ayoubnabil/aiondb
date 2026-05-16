@@ -4656,9 +4656,34 @@ impl GraphNeighborSeen {
     }
 }
 
-fn push_bigint_neighbor_with_seen(
+trait GraphNeighborOutput {
+    fn len(&self) -> usize;
+    fn push_id(&mut self, id: i64);
+}
+
+impl GraphNeighborOutput for Vec<Value> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn push_id(&mut self, id: i64) {
+        self.push(Value::BigInt(id));
+    }
+}
+
+impl GraphNeighborOutput for Vec<Row> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn push_id(&mut self, id: i64) {
+        self.push(Row::new(vec![Value::BigInt(id)]));
+    }
+}
+
+fn push_bigint_neighbor_with_seen<O: GraphNeighborOutput>(
     value: Option<&Value>,
-    output: &mut Vec<Value>,
+    output: &mut O,
     seen: &mut GraphNeighborSeen,
 ) -> DbResult<()> {
     let Some(value) = value else {
@@ -4677,7 +4702,7 @@ fn push_bigint_neighbor_with_seen(
         }
     };
     if seen.insert(id) {
-        output.push(Value::BigInt(id));
+        output.push_id(id);
     }
     Ok(())
 }

@@ -1501,15 +1501,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let value = self.resolve_graph_neighbors(args, None, context)?;
-        let rows = match value {
-            Value::Array(elements) => elements
-                .into_iter()
-                .map(|value| Row::new(vec![value]))
-                .collect(),
-            Value::Null => Vec::new(),
-            value => vec![Row::new(vec![value])],
-        };
+        let rows = self.resolve_graph_neighbors_rows(args, None, context)?;
         Ok(Some(ExecutionResult::Query {
             columns: output_fields.to_vec(),
             rows,
