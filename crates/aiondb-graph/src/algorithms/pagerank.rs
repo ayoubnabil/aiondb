@@ -43,6 +43,12 @@ pub const DEFAULT_TOLERANCE: f64 = 1e-6;
 /// this prevents over-subdivision so tiny graphs stay close to sequential
 /// cost while large graphs still fan out across cores.
 const PAR_MIN_CHUNK: usize = 64;
+const PAR_MIN_NODES: usize = 4096;
+
+#[inline]
+fn use_parallel_pagerank(n: usize) -> bool {
+    rayon::current_num_threads() > 1 && n >= PAR_MIN_NODES
+}
 
 /// Configuration for the `PageRank` algorithm.
 #[derive(Clone, Debug)]
@@ -117,6 +123,22 @@ pub fn pagerank<G: GraphViewV2 + ?Sized>(
         .map(|u| usize_to_u32(u).and_then(|u_u32| graph.in_neighbors(u_u32)))
         .collect();
     let out_degrees: Vec<usize> = adjacency.iter().map(|neighbors| neighbors.len()).collect();
+    let inv_out_degrees: Vec<f64> = out_degrees
+        .iter()
+        .map(|&degree| {
+            if degree == 0 {
+                0.0
+            } else {
+                1.0 / usize_to_f64(degree)
+            }
+        })
+        .collect();
+    let dangling_nodes: Vec<usize> = out_degrees
+        .iter()
+        .enumerate()
+        .filter_map(|(node, degree)| (*degree == 0).then_some(node))
+        .collect();
+    let use_parallel = use_parallel_pagerank(n);
 
     // Initialise uniform scores.
     let mut scores = vec![1.0 / n_f64; n];
@@ -124,31 +146,45 @@ pub fn pagerank<G: GraphViewV2 + ?Sized>(
 
     for _ in 0..iterations {
         // Accumulate dangling node mass (nodes with out-degree 0).
-        // Pure sum reduction over independent values — parallel-safe.
-        let dangling_sum: f64 = out_degrees
-            .par_iter()
-            .zip(scores.par_iter())
-            .filter_map(|(degree, s)| if *degree == 0 { Some(*s) } else { None })
-            .sum();
+        let dangling_sum: f64 = if use_parallel {
+            dangling_nodes.par_iter().map(|&node| scores[node]).sum()
+        } else {
+            dangling_nodes.iter().map(|&node| scores[node]).sum()
+        };
 
         let dangling_share = damping * (dangling_sum / n_f64);
 
         if let Some(reverse_adjacency) = reverse_adjacency.as_ref() {
-            new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
-                let incoming_sum = reverse_adjacency[v]
-                    .iter()
-                    .map(|&u| {
-                        let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                        if u_idx >= scores.len() || out_degrees[u_idx] == 0 {
-                            return 0.0;
-                        }
-                        scores[u_idx]
-                            / f64::from(usize_to_u32(out_degrees[u_idx]).unwrap_or(u32::MAX))
-                    })
-                    .sum::<f64>();
-                *ns = base + dangling_share + damping * incoming_sum;
-            });
-        } else {
+            if use_parallel {
+                new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
+                    let incoming_sum = reverse_adjacency[v]
+                        .iter()
+                        .map(|&u| {
+                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
+                            scores
+                                .get(u_idx)
+                                .zip(inv_out_degrees.get(u_idx))
+                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
+                        })
+                        .sum::<f64>();
+                    *ns = base + dangling_share + damping * incoming_sum;
+                });
+            } else {
+                for (v, ns) in new_scores.iter_mut().enumerate() {
+                    let incoming_sum = reverse_adjacency[v]
+                        .iter()
+                        .map(|&u| {
+                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
+                            scores
+                                .get(u_idx)
+                                .zip(inv_out_degrees.get(u_idx))
+                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
+                        })
+                        .sum::<f64>();
+                    *ns = base + dangling_share + damping * incoming_sum;
+                }
+            }
+        } else if use_parallel {
             // Rank-distribution scatter. Each source contributes to its
             // out-neighbours; we fold those contributions into thread-local
             // dense vectors, then element-wise reduce. No shared mutable state.
@@ -158,14 +194,14 @@ pub fn pagerank<G: GraphViewV2 + ?Sized>(
                 .par_iter()
                 .with_min_len(PAR_MIN_CHUNK)
                 .zip(scores.par_iter())
+                .zip(inv_out_degrees.par_iter())
                 .fold(
                     || vec![0.0_f64; n],
-                    |mut local, (neigh, score)| {
+                    |mut local, ((neigh, score), inv_degree)| {
                         if neigh.is_empty() {
                             return local;
                         }
-                        let contrib = damping * score
-                            / f64::from(usize_to_u32(neigh.len()).unwrap_or(u32::MAX));
+                        let contrib = damping * score * inv_degree;
                         for &v in *neigh {
                             if let Some(v_idx) = u32_to_usize(v) {
                                 if v_idx < local.len() {
@@ -193,14 +229,40 @@ pub fn pagerank<G: GraphViewV2 + ?Sized>(
                 .for_each(|(ns, c)| {
                     *ns = base + dangling_share + *c;
                 });
+        } else {
+            new_scores.fill(base + dangling_share);
+            for (neighbors, (score, inv_degree)) in adjacency
+                .iter()
+                .zip(scores.iter().zip(inv_out_degrees.iter()))
+            {
+                if neighbors.is_empty() {
+                    continue;
+                }
+                let contrib = damping * score * inv_degree;
+                for &v in *neighbors {
+                    if let Some(v_idx) = u32_to_usize(v) {
+                        if let Some(ns) = new_scores.get_mut(v_idx) {
+                            *ns += contrib;
+                        }
+                    }
+                }
+            }
         }
 
         // Convergence check via L1 norm — parallel reduction.
-        let diff: f64 = new_scores
-            .par_iter()
-            .zip(scores.par_iter())
-            .map(|(ns, s)| (ns - s).abs())
-            .sum();
+        let diff: f64 = if use_parallel {
+            new_scores
+                .par_iter()
+                .zip(scores.par_iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        } else {
+            new_scores
+                .iter()
+                .zip(scores.iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        };
 
         // Swap buffers.
         std::mem::swap(&mut scores, &mut new_scores);
@@ -295,47 +357,79 @@ pub fn personalized_pagerank<G: GraphViewV2 + ?Sized>(
         .map(|u| usize_to_u32(u).and_then(|u_u32| graph.in_neighbors(u_u32)))
         .collect();
     let out_degrees: Vec<usize> = adjacency.iter().map(|neighbors| neighbors.len()).collect();
+    let inv_out_degrees: Vec<f64> = out_degrees
+        .iter()
+        .map(|&degree| {
+            if degree == 0 {
+                0.0
+            } else {
+                1.0 / usize_to_f64(degree)
+            }
+        })
+        .collect();
+    let dangling_nodes: Vec<usize> = out_degrees
+        .iter()
+        .enumerate()
+        .filter_map(|(node, degree)| (*degree == 0).then_some(node))
+        .collect();
+    let use_parallel = use_parallel_pagerank(n);
 
     // Start the walk at the restart distribution for faster convergence.
     let mut scores = restart.clone();
     let mut new_scores = vec![0.0_f64; n];
 
     for _ in 0..iterations {
-        let dangling_sum: f64 = out_degrees
-            .par_iter()
-            .zip(scores.par_iter())
-            .filter_map(|(degree, s)| if *degree == 0 { Some(*s) } else { None })
-            .sum();
+        let dangling_sum: f64 = if use_parallel {
+            dangling_nodes.par_iter().map(|&node| scores[node]).sum()
+        } else {
+            dangling_nodes.iter().map(|&node| scores[node]).sum()
+        };
 
         if let Some(reverse_adjacency) = reverse_adjacency.as_ref() {
-            new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
-                let incoming_sum = reverse_adjacency[v]
-                    .iter()
-                    .map(|&u| {
-                        let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
-                        if u_idx >= scores.len() || out_degrees[u_idx] == 0 {
-                            return 0.0;
-                        }
-                        scores[u_idx]
-                            / f64::from(usize_to_u32(out_degrees[u_idx]).unwrap_or(u32::MAX))
-                    })
-                    .sum::<f64>();
-                *ns = (1.0 - damping) * restart[v]
-                    + damping * (dangling_sum * restart[v] + incoming_sum);
-            });
-        } else {
+            if use_parallel {
+                new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
+                    let incoming_sum = reverse_adjacency[v]
+                        .iter()
+                        .map(|&u| {
+                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
+                            scores
+                                .get(u_idx)
+                                .zip(inv_out_degrees.get(u_idx))
+                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
+                        })
+                        .sum::<f64>();
+                    *ns = (1.0 - damping) * restart[v]
+                        + damping * (dangling_sum * restart[v] + incoming_sum);
+                });
+            } else {
+                for (v, ns) in new_scores.iter_mut().enumerate() {
+                    let incoming_sum = reverse_adjacency[v]
+                        .iter()
+                        .map(|&u| {
+                            let u_idx = u32_to_usize(u).unwrap_or(usize::MAX);
+                            scores
+                                .get(u_idx)
+                                .zip(inv_out_degrees.get(u_idx))
+                                .map_or(0.0, |(score, inv_degree)| score * inv_degree)
+                        })
+                        .sum::<f64>();
+                    *ns = (1.0 - damping) * restart[v]
+                        + damping * (dangling_sum * restart[v] + incoming_sum);
+                }
+            }
+        } else if use_parallel {
             let contribs: Vec<f64> = adjacency
                 .par_iter()
                 .with_min_len(PAR_MIN_CHUNK)
                 .zip(scores.par_iter())
+                .zip(inv_out_degrees.par_iter())
                 .fold(
                     || vec![0.0_f64; n],
-                    |mut local, (neigh, score)| {
+                    |mut local, ((neigh, score), inv_degree)| {
                         if neigh.is_empty() {
                             return local;
                         }
-                        let contrib = damping * score
-                            / f64::from(usize_to_u32(neigh.len()).unwrap_or(u32::MAX));
+                        let contrib = damping * score * inv_degree;
                         for &v in *neigh {
                             if let Some(v_idx) = u32_to_usize(v) {
                                 if v_idx < local.len() {
@@ -363,13 +457,41 @@ pub fn personalized_pagerank<G: GraphViewV2 + ?Sized>(
                 .for_each(|(v, (ns, c))| {
                     *ns = (1.0 - damping) * restart[v] + damping * dangling_sum * restart[v] + *c;
                 });
+        } else {
+            for (ns, restart_value) in new_scores.iter_mut().zip(restart.iter()) {
+                *ns = (1.0 - damping) * restart_value + damping * dangling_sum * restart_value;
+            }
+            for (neighbors, (score, inv_degree)) in adjacency
+                .iter()
+                .zip(scores.iter().zip(inv_out_degrees.iter()))
+            {
+                if neighbors.is_empty() {
+                    continue;
+                }
+                let contrib = damping * score * inv_degree;
+                for &v in *neighbors {
+                    if let Some(v_idx) = u32_to_usize(v) {
+                        if let Some(ns) = new_scores.get_mut(v_idx) {
+                            *ns += contrib;
+                        }
+                    }
+                }
+            }
         }
 
-        let diff: f64 = new_scores
-            .par_iter()
-            .zip(scores.par_iter())
-            .map(|(ns, s)| (ns - s).abs())
-            .sum();
+        let diff: f64 = if use_parallel {
+            new_scores
+                .par_iter()
+                .zip(scores.par_iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        } else {
+            new_scores
+                .iter()
+                .zip(scores.iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        };
 
         std::mem::swap(&mut scores, &mut new_scores);
 
@@ -442,38 +564,81 @@ pub fn weighted_pagerank(
             })
         })
         .collect();
-    let dangling: Vec<bool> = out_strength.iter().map(|s| *s <= 0.0).collect();
+    let inv_out_strength: Vec<f64> = out_strength
+        .iter()
+        .map(|strength| {
+            if *strength <= 0.0 {
+                0.0
+            } else {
+                1.0 / strength
+            }
+        })
+        .collect();
+    let dangling_nodes: Vec<usize> = out_strength
+        .iter()
+        .enumerate()
+        .filter_map(|(node, strength)| (*strength <= 0.0).then_some(node))
+        .collect();
+    let use_parallel = use_parallel_pagerank(n);
 
     let mut scores = vec![1.0 / n_f64; n];
     let mut new_scores = vec![0.0_f64; n];
 
     for _ in 0..iterations {
-        let dangling_sum: f64 = dangling
-            .par_iter()
-            .zip(scores.par_iter())
-            .filter_map(|(is_dangling, s)| if *is_dangling { Some(*s) } else { None })
-            .sum();
+        let dangling_sum: f64 = if use_parallel {
+            dangling_nodes.par_iter().map(|&node| scores[node]).sum()
+        } else {
+            dangling_nodes.iter().map(|&node| scores[node]).sum()
+        };
         let dangling_share = damping * (dangling_sum / n_f64);
 
-        new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
-            let incoming: f64 = reverse[v]
-                .iter()
-                .map(|edge| {
-                    let u = u32_to_usize(edge.target).unwrap_or(usize::MAX);
-                    if u >= scores.len() || dangling[u] {
-                        return 0.0;
-                    }
-                    scores[u] * edge.weight.max(0.0) / out_strength[u]
-                })
-                .sum();
-            *ns = base + dangling_share + damping * incoming;
-        });
+        if use_parallel {
+            new_scores.par_iter_mut().enumerate().for_each(|(v, ns)| {
+                let incoming: f64 = reverse[v]
+                    .iter()
+                    .map(|edge| {
+                        let u = u32_to_usize(edge.target).unwrap_or(usize::MAX);
+                        scores
+                            .get(u)
+                            .zip(inv_out_strength.get(u))
+                            .map_or(0.0, |(score, inv_strength)| {
+                                score * edge.weight.max(0.0) * inv_strength
+                            })
+                    })
+                    .sum();
+                *ns = base + dangling_share + damping * incoming;
+            });
+        } else {
+            for (v, ns) in new_scores.iter_mut().enumerate() {
+                let incoming: f64 = reverse[v]
+                    .iter()
+                    .map(|edge| {
+                        let u = u32_to_usize(edge.target).unwrap_or(usize::MAX);
+                        scores
+                            .get(u)
+                            .zip(inv_out_strength.get(u))
+                            .map_or(0.0, |(score, inv_strength)| {
+                                score * edge.weight.max(0.0) * inv_strength
+                            })
+                    })
+                    .sum();
+                *ns = base + dangling_share + damping * incoming;
+            }
+        }
 
-        let diff: f64 = new_scores
-            .par_iter()
-            .zip(scores.par_iter())
-            .map(|(ns, s)| (ns - s).abs())
-            .sum();
+        let diff: f64 = if use_parallel {
+            new_scores
+                .par_iter()
+                .zip(scores.par_iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        } else {
+            new_scores
+                .iter()
+                .zip(scores.iter())
+                .map(|(ns, s)| (ns - s).abs())
+                .sum()
+        };
         std::mem::swap(&mut scores, &mut new_scores);
         if diff < tolerance {
             break;
