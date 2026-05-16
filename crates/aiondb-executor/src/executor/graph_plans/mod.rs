@@ -3227,7 +3227,6 @@ impl Executor {
             CypherRelDirection::Both => return Ok(None),
         };
         if rel.table_id.is_none()
-            || rel.variable.is_some()
             || rel.min_hops.is_some()
             || rel.max_hops.is_some()
             || phys_src.table_id.is_none()
