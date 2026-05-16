@@ -1499,6 +1499,17 @@ fn exact_named_column_literal_equality(expr: &TypedExpr, expected_name: &str) ->
     name.eq_ignore_ascii_case(expected_name).then_some(value)
 }
 
+fn exact_variable_column_literal_equality(
+    expr: &TypedExpr,
+    expected_variable: &str,
+) -> Option<(String, Value)> {
+    let (name, value) = exact_column_literal_equality(expr)?;
+    let (variable, column) = name.split_once('.')?;
+    variable
+        .eq_ignore_ascii_case(expected_variable)
+        .then_some((column.to_owned(), value))
+}
+
 fn exact_named_column_literal_gt(expr: &TypedExpr, expected_name: &str) -> Option<Value> {
     let TypedExprKind::BinaryGt { left, right } = &expr.kind else {
         return None;
@@ -1715,6 +1726,10 @@ fn column_ref_name(expr: &TypedExpr) -> Option<&str> {
         TypedExprKind::ColumnRef { name, .. } => Some(name.as_str()),
         _ => None,
     }
+}
+
+fn node_has_filter_constraints(node: &CypherNodePattern) -> bool {
+    !node.properties.is_empty() || node.index_scan.is_some() || !node.range_pushdown.is_empty()
 }
 
 fn ascending_order_by_matches_column(order_by: &[SortExpr], expected: &str) -> bool {
@@ -2081,6 +2096,54 @@ impl Executor {
         Ok(usize_to_u64(frontier.len()))
     }
 
+    fn fast_graph_count_fixed_outgoing_paths_to_allowed_end_ids(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        start_id: &Value,
+        hops: usize,
+        allowed_end_ids: &HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>,
+    ) -> DbResult<u64> {
+        if hops == 0 {
+            return Ok(0);
+        }
+
+        let mut frontier = HashMap::new();
+        Self::fast_graph_add_count_frontier_node(context, &mut frontier, start_id.clone(), 1)?;
+        for _ in 0..hops {
+            let mut next = HashMap::new();
+            for (node_id, multiplicity) in frontier.into_values() {
+                context.check_deadline()?;
+                let neighbors = self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &node_id,
+                    true,
+                )?;
+                for neighbor_id in neighbors {
+                    Self::fast_graph_add_count_frontier_node(
+                        context,
+                        &mut next,
+                        neighbor_id,
+                        multiplicity,
+                    )?;
+                }
+            }
+            if next.is_empty() {
+                return Ok(0);
+            }
+            frontier = next;
+        }
+
+        let mut count = 0u64;
+        for (node_key, (_, multiplicity)) in frontier {
+            if allowed_end_ids.contains(&node_key) {
+                count = count.saturating_add(multiplicity);
+            }
+        }
+        Ok(count)
+    }
+
     fn fast_graph_collect_fixed_outgoing_endpoint_ids(
         &self,
         context: &ExecutionContext,
@@ -2205,11 +2268,12 @@ impl Executor {
         Ok(())
     }
 
-    fn fast_graph_collect_target_ids_gt_filter(
+    fn fast_graph_collect_target_ids_filter_by_ordinal(
         &self,
         context: &ExecutionContext,
         target_table_id: RelationId,
-        filter_column_name: &str,
+        filter_ordinal: usize,
+        comparison: GraphTargetFilterComparison,
         filter_value: &Value,
     ) -> DbResult<Option<Arc<HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>>>> {
         let Some(target_table) = self
@@ -2221,11 +2285,9 @@ impl Executor {
         let id_ordinal = self
             .find_column_index(&target_table.columns, "id")
             .unwrap_or(0);
-        let Some(filter_ordinal) =
-            self.find_column_index(&target_table.columns, filter_column_name)
-        else {
+        if filter_ordinal >= target_table.columns.len() {
             return Ok(None);
-        };
+        }
         let mut required_ordinals = vec![id_ordinal];
         if filter_ordinal != id_ordinal {
             required_ordinals.push(filter_ordinal);
@@ -2247,6 +2309,7 @@ impl Executor {
                 target_table_id,
                 id_ordinal,
                 filter_ordinal,
+                comparison,
                 filter_value,
             });
         if let (Some(cache_key), Some(generation)) =
@@ -2285,7 +2348,11 @@ impl Executor {
             let Some(ordering) = compare_runtime_values(number, filter_value)? else {
                 continue;
             };
-            if ordering != Ordering::Greater {
+            let matched = match comparison {
+                GraphTargetFilterComparison::Eq => ordering == Ordering::Equal,
+                GraphTargetFilterComparison::Gt => ordering == Ordering::Greater,
+            };
+            if !matched {
                 continue;
             }
             let Some(id_value) = record.row.values.first() else {
@@ -2317,6 +2384,34 @@ impl Executor {
             cache.insert(cache_key, (generation, Arc::clone(&allowed)));
         }
         Ok(Some(allowed))
+    }
+
+    fn fast_graph_collect_target_ids_filter(
+        &self,
+        context: &ExecutionContext,
+        target_table_id: RelationId,
+        filter_column_name: &str,
+        comparison: GraphTargetFilterComparison,
+        filter_value: &Value,
+    ) -> DbResult<Option<Arc<HashSet<ValueHashKey, join_plans::JoinFxBuildHasher>>>> {
+        let Some(target_table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, target_table_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(filter_ordinal) =
+            self.find_column_index(&target_table.columns, filter_column_name)
+        else {
+            return Ok(None);
+        };
+        self.fast_graph_collect_target_ids_filter_by_ordinal(
+            context,
+            target_table_id,
+            filter_ordinal,
+            comparison,
+            filter_value,
+        )
     }
 
     fn hybrid_deep_graph_vector_meta_cached(
@@ -2501,6 +2596,11 @@ impl Executor {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_one_hop_endpoint_id_lookup(plan, context)? {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_fast_anchored_path_end_property_count(plan, context)?
+        {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_anchored_path_count(plan, context)? {
@@ -2721,7 +2821,7 @@ impl Executor {
         let expected_return = format!("{end_variable}.id");
         if start.table_id.is_none()
             || end.table_id.is_none()
-            || !end.properties.is_empty()
+            || node_has_filter_constraints(end)
             || rel.table_id.is_none()
             || rel.direction != CypherRelDirection::Outgoing
             || rel.variable.is_some()
@@ -2868,7 +2968,7 @@ impl Executor {
             extract_start_id_literal(right, match_clause.filter.as_ref(), right_variable);
         let (mut anchor_id, lookup_outgoing): (Value, Vec<bool>) =
             match (left_id, right_id, returns_left, returns_right) {
-                (Some(anchor_id), None, false, true) if right.properties.is_empty() => {
+                (Some(anchor_id), None, false, true) if !node_has_filter_constraints(right) => {
                     let directions = match rel.direction {
                         CypherRelDirection::Outgoing => vec![true],
                         CypherRelDirection::Incoming => vec![false],
@@ -2876,7 +2976,7 @@ impl Executor {
                     };
                     (anchor_id, directions)
                 }
-                (None, Some(anchor_id), true, false) if left.properties.is_empty() => {
+                (None, Some(anchor_id), true, false) if !node_has_filter_constraints(left) => {
                     let directions = match rel.direction {
                         CypherRelDirection::Outgoing => vec![false],
                         CypherRelDirection::Incoming => vec![true],
@@ -3002,11 +3102,13 @@ impl Executor {
             return Ok(None);
         }
         if start.table_id.is_none()
-            || pattern
-                .nodes
-                .iter()
-                .skip(1)
-                .any(|node| node.table_id.is_none() || !node.properties.is_empty())
+            || end.table_id.is_none()
+            || pattern.nodes[1..].iter().any(|node| {
+                node.table_id.is_none()
+                    || !node.properties.is_empty()
+                    || node.index_scan.is_some()
+                    || !node.range_pushdown.is_empty()
+            })
         {
             return Ok(None);
         }
@@ -3047,6 +3149,208 @@ impl Executor {
             Err(_) => return Ok(None),
         };
 
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
+    }
+
+    fn try_execute_fast_anchored_path_end_property_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        let hops = pattern.relationships.len();
+        if pattern.path_function.is_some() || hops == 0 || pattern.nodes.len() != hops + 1 {
+            return Ok(None);
+        }
+
+        let Some(start) = pattern.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(end) = pattern.nodes.last() else {
+            return Ok(None);
+        };
+        let Some(start_variable) = start.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        if !count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable))
+        {
+            return Ok(None);
+        }
+        if start.table_id.is_none()
+            || end.table_id.is_none()
+            || pattern.nodes[1..hops].iter().any(|node| {
+                node.table_id.is_none()
+                    || !node.properties.is_empty()
+                    || node.index_scan.is_some()
+                    || !node.range_pushdown.is_empty()
+            })
+            || !end.range_pushdown.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(edge_table_id) = pattern.relationships.first().and_then(|rel| rel.table_id) else {
+            return Ok(None);
+        };
+        if pattern.relationships.iter().any(|rel| {
+            rel.table_id != Some(edge_table_id)
+                || rel.direction != CypherRelDirection::Outgoing
+                || rel.variable.is_some()
+                || rel.min_hops.is_some()
+                || rel.max_hops.is_some()
+                || !rel.properties.is_empty()
+        }) {
+            return Ok(None);
+        }
+
+        let mut start_id = extract_start_id_literal(start, None, start_variable);
+        let mut end_filter_name = None;
+        let mut end_filter_ordinal = None;
+        let mut end_filter_value = None;
+        if let Some(index_scan) = &end.index_scan {
+            end_filter_ordinal = Some(index_scan.column_index);
+            end_filter_value = Some(index_scan.scan_value.clone());
+        }
+        match end.properties.as_slice() {
+            [] => {}
+            [property] => {
+                let Some(value) = literal_value(&property.value) else {
+                    return Ok(None);
+                };
+                end_filter_name = Some(property.key.clone());
+                if let Some(existing) = &end_filter_value {
+                    let Some(ordering) = compare_runtime_values(existing, &value)? else {
+                        return Ok(None);
+                    };
+                    if ordering != Ordering::Equal {
+                        return Ok(None);
+                    }
+                } else {
+                    end_filter_value = Some(value);
+                }
+            }
+            _ => return Ok(None),
+        }
+        if let Some(filter) = match_clause.filter.as_ref() {
+            let mut conjuncts = Vec::new();
+            collect_graph_filter_conjuncts(filter, &mut conjuncts);
+            for conjunct in conjuncts {
+                if let Some(value) =
+                    exact_named_column_literal_equality(conjunct, &format!("{start_variable}.id"))
+                {
+                    match start_id.as_mut() {
+                        Some(existing) => {
+                            let mut normalized_value = value;
+                            normalize_int_key(existing);
+                            normalize_int_key(&mut normalized_value);
+                            if *existing != normalized_value {
+                                return Ok(None);
+                            }
+                        }
+                        None => start_id = Some(value),
+                    }
+                    continue;
+                }
+
+                if let Some((column, value)) =
+                    exact_variable_column_literal_equality(conjunct, end_variable)
+                {
+                    if let Some(existing) = &end_filter_value {
+                        let Some(ordering) = compare_runtime_values(existing, &value)? else {
+                            return Ok(None);
+                        };
+                        if ordering != Ordering::Equal {
+                            return Ok(None);
+                        }
+                    } else {
+                        end_filter_value = Some(value);
+                    }
+                    end_filter_name = Some(column);
+                    continue;
+                }
+
+                return Ok(None);
+            }
+        }
+
+        let Some(mut start_id) = start_id else {
+            return Ok(None);
+        };
+        normalize_int_key(&mut start_id);
+        let Some(filter_value) = end_filter_value else {
+            return Ok(None);
+        };
+        let Some(end_table_id) = end.table_id else {
+            return Ok(None);
+        };
+        let allowed_end_ids = if let Some(filter_ordinal) = end_filter_ordinal {
+            self.fast_graph_collect_target_ids_filter_by_ordinal(
+                context,
+                end_table_id,
+                filter_ordinal,
+                GraphTargetFilterComparison::Eq,
+                &filter_value,
+            )?
+        } else {
+            let Some(filter_column) = end_filter_name else {
+                return Ok(None);
+            };
+            self.fast_graph_collect_target_ids_filter(
+                context,
+                end_table_id,
+                &filter_column,
+                GraphTargetFilterComparison::Eq,
+                &filter_value,
+            )?
+        };
+        let Some(allowed_end_ids) = allowed_end_ids else {
+            return Ok(None);
+        };
+
+        let count = match self.fast_graph_count_fixed_outgoing_paths_to_allowed_end_ids(
+            context,
+            edge_table_id,
+            &start_id,
+            hops,
+            &allowed_end_ids,
+        ) {
+            Ok(count) => count,
+            Err(_) => return Ok(None),
+        };
         let row = Row::new(vec![Value::BigInt(
             i64::try_from(count).unwrap_or(i64::MAX),
         )]);
@@ -3106,8 +3410,8 @@ impl Executor {
         if start.table_id.is_none()
             || middle.table_id.is_none()
             || end.table_id.is_none()
-            || !middle.properties.is_empty()
-            || !end.properties.is_empty()
+            || node_has_filter_constraints(middle)
+            || node_has_filter_constraints(end)
             || first_rel.table_id.is_none()
             || second_rel.table_id.is_none()
             || first_rel.table_id != second_rel.table_id
@@ -3261,9 +3565,9 @@ impl Executor {
             || first_mid.table_id.is_none()
             || second_mid.table_id.is_none()
             || end.table_id.is_none()
-            || !first_mid.properties.is_empty()
-            || !second_mid.properties.is_empty()
-            || !end.properties.is_empty()
+            || node_has_filter_constraints(first_mid)
+            || node_has_filter_constraints(second_mid)
+            || node_has_filter_constraints(end)
         {
             return Ok(None);
         }
@@ -3438,7 +3742,7 @@ impl Executor {
                 .nodes
                 .iter()
                 .skip(1)
-                .any(|node| node.table_id.is_none() || !node.properties.is_empty())
+                .any(|node| node.table_id.is_none() || node_has_filter_constraints(node))
         {
             return Ok(None);
         }
@@ -4007,10 +4311,11 @@ impl Executor {
         };
 
         let allowed_left_target_ids = match filter_value.as_ref() {
-            Some(filter_value) => Some(self.fast_graph_collect_target_ids_gt_filter(
+            Some(filter_value) => Some(self.fast_graph_collect_target_ids_filter(
                 context,
                 first_target_table_id,
                 "number",
+                GraphTargetFilterComparison::Gt,
                 filter_value,
             )?),
             None => None,
@@ -4633,10 +4938,11 @@ impl Executor {
             edge_table_id,
             rel.rel_type.as_deref(),
         )?;
-        let Some(allowed_target_ids) = self.fast_graph_collect_target_ids_gt_filter(
+        let Some(allowed_target_ids) = self.fast_graph_collect_target_ids_filter(
             context,
             target_table_id,
             "number",
+            GraphTargetFilterComparison::Gt,
             &filter_value,
         )?
         else {

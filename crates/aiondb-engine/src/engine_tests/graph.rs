@@ -1719,11 +1719,13 @@ fn cypher_deep_id_lookup_uses_adjacency_chain() {
     engine
         .execute_sql(
             &session,
-            "CREATE TABLE people_depth5_fast (id INT NOT NULL); \
+            "CREATE TABLE people_depth5_fast (id INT NOT NULL, payload INT NOT NULL); \
              CREATE TABLE knows_depth5_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
              CREATE NODE LABEL person_depth5_fast ON people_depth5_fast; \
              CREATE EDGE LABEL knows_depth5_fast ON knows_depth5_fast_edges SOURCE person_depth5_fast TARGET person_depth5_fast; \
-             INSERT INTO people_depth5_fast VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10); \
+             INSERT INTO people_depth5_fast VALUES \
+                (1, 0), (2, 0), (3, 0), (4, 0), (5, 1), \
+                (6, 0), (7, 0), (8, 3), (9, 2), (10, 4); \
              INSERT INTO knows_depth5_fast_edges VALUES \
                 (1, 2), (2, 3), (3, 4), (4, 5), \
                 (2, 6), (6, 7), (7, 8), \
@@ -1765,6 +1767,28 @@ fn cypher_deep_id_lookup_uses_adjacency_chain() {
             Row::new(vec![Value::Int(9)]),
             Row::new(vec![Value::Int(10)])
         ],
+    );
+
+    let four_hop_payload_count = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_depth5_fast {id: 1})-[:knows_depth5_fast]->(b:person_depth5_fast)-[:knows_depth5_fast]->(c:person_depth5_fast)-[:knows_depth5_fast]->(d:person_depth5_fast)-[:knows_depth5_fast]->(e:person_depth5_fast) \
+         WHERE e.payload = 1 RETURN count(e)",
+    );
+    assert_eq!(
+        four_hop_payload_count,
+        vec![Row::new(vec![Value::BigInt(1)])]
+    );
+
+    let five_hop_payload_count = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_depth5_fast {id: 1})-[:knows_depth5_fast]->(b:person_depth5_fast)-[:knows_depth5_fast]->(c:person_depth5_fast)-[:knows_depth5_fast]->(d:person_depth5_fast)-[:knows_depth5_fast]->(e:person_depth5_fast)-[:knows_depth5_fast]->(f:person_depth5_fast) \
+         WHERE f.payload = 2 RETURN count(f)",
+    );
+    assert_eq!(
+        five_hop_payload_count,
+        vec![Row::new(vec![Value::BigInt(1)])]
     );
 }
 

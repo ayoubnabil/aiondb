@@ -575,11 +575,18 @@ pub(super) struct GraphEdgeFilterLimitRowsCacheKey {
     pub limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum GraphTargetFilterComparison {
+    Eq,
+    Gt,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct GraphTargetFilterIdsCacheKey {
     pub target_table_id: RelationId,
     pub id_ordinal: usize,
     pub filter_ordinal: usize,
+    pub comparison: GraphTargetFilterComparison,
     pub filter_value: ValueHashKey,
 }
 
