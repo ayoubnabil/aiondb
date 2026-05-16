@@ -2035,6 +2035,9 @@ impl InMemoryStorage {
             adjacency_neighbors_cache: std::sync::Arc::new(super::PlRwLock::new(
                 std::collections::HashMap::new(),
             )),
+            adjacency_compact_cache: std::sync::Arc::new(super::PlRwLock::new(
+                std::collections::HashMap::new(),
+            )),
             index_group_counts_cache: std::sync::Arc::new(super::PlRwLock::new(
                 std::collections::BTreeMap::new(),
             )),

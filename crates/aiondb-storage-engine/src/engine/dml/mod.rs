@@ -1,9 +1,15 @@
 mod scan;
 pub(crate) mod split_phase;
 
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use aiondb_core::{ColumnId, DbError, DbResult, IndexId, RelationId, Row, TupleId, TxnId, Value};
+use aiondb_graph_api::{GraphDirection, NeighborCursor, OwnedCursor};
 use aiondb_storage_api::{Bound, KeyRange, StorageDML, TupleRecord, TupleStream, VecTupleStream};
 use aiondb_tx::Snapshot;
 use aiondb_wal::WalRecord;
@@ -13,11 +19,148 @@ use self::scan::{
     scan_index_view, scan_index_view_limited, scan_index_view_ordered_limited, scan_table_view,
     scan_table_view_eq_filter, scan_table_view_limited,
 };
-use super::{InMemoryStorage, PendingRowState, StorageState, TableView};
+use super::{
+    adjacency::CompactAdjacencyIndex, InMemoryStorage, PendingRowState, PlRwLockReadGuard,
+    StorageState, TableView,
+};
+
+impl InMemoryStorage {
+    fn graph_projection_cache_file_name_prefix(&self, namespace: &str, cache_key: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        namespace.hash(&mut hasher);
+        cache_key.hash(&mut hasher);
+        let digest = hasher.finish();
+        format!("{namespace}-{digest:016x}-")
+    }
+
+    fn graph_projection_cache_path(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+    ) -> Option<PathBuf> {
+        let root = self.graph_projection_cache_root_dir()?;
+        Some(root.join("graph_projection_cache").join(format!(
+            "{}{generation}.bin",
+            self.graph_projection_cache_file_name_prefix(namespace, cache_key)
+        )))
+    }
+
+    fn committed_compact_adjacency_index(
+        &self,
+        state: &PlRwLockReadGuard<'_, StorageState>,
+        edge_table_id: RelationId,
+    ) -> DbResult<Arc<CompactAdjacencyIndex>> {
+        if let Some(compact) = self
+            .adjacency_compact_cache
+            .read()
+            .get(&edge_table_id)
+            .cloned()
+        {
+            return Ok(compact);
+        }
+        let index = state.adjacency_indexes.get(&edge_table_id).ok_or_else(|| {
+            DbError::feature_not_supported("no adjacency index for this edge table")
+        })?;
+        let compact = Arc::new(index.compact());
+        self.adjacency_compact_cache
+            .write()
+            .insert(edge_table_id, Arc::clone(&compact));
+        Ok(compact)
+    }
+}
 
 impl StorageDML for InMemoryStorage {
     fn cache_generation(&self) -> Option<u64> {
         Some(self.cache_generation.load(Ordering::Acquire))
+    }
+
+    fn graph_projection_cache_get(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        let Some(path) = self.graph_projection_cache_path(namespace, cache_key, generation) else {
+            return Ok(None);
+        };
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DbError::internal(format!(
+                "graph projection cache read failed at {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn graph_projection_cache_put(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+        payload: &[u8],
+    ) -> DbResult<()> {
+        let Some(path) = self.graph_projection_cache_path(namespace, cache_key, generation) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                DbError::internal(format!(
+                    "graph projection cache directory create failed at {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, payload).map_err(|error| {
+            DbError::internal(format!(
+                "graph projection cache temp write failed at {}: {error}",
+                tmp_path.display()
+            ))
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|error| {
+            DbError::internal(format!(
+                "graph projection cache rename failed from {} to {}: {error}",
+                tmp_path.display(),
+                path.display()
+            ))
+        })?;
+        let current_file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        let file_name_prefix = self.graph_projection_cache_file_name_prefix(namespace, cache_key);
+        if let (Some(parent), Some(current_file_name)) = (path.parent(), current_file_name) {
+            match fs::read_dir(parent) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str())
+                        else {
+                            continue;
+                        };
+                        if file_name == current_file_name
+                            || !file_name.starts_with(&file_name_prefix)
+                            || entry_path.extension().and_then(|e| e.to_str()) != Some("bin")
+                        {
+                            continue;
+                        }
+                        if let Err(error) = fs::remove_file(&entry_path) {
+                            warn!(
+                                path = %entry_path.display(),
+                                "failed to prune stale graph projection cache artifact: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => warn!(
+                    path = %parent.display(),
+                    "failed to enumerate graph projection cache directory for pruning: {error}"
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn apply_replicated_wal_entry(&self, record_bytes: &[u8]) -> DbResult<()> {
@@ -906,6 +1049,41 @@ impl StorageDML for InMemoryStorage {
             super::project_row(table_view.descriptor(), &row, projected_columns.as_deref())
         })
         .transpose()
+    }
+
+    fn fetch_ref(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        table_id: RelationId,
+        tuple_id: TupleId,
+        projected_columns: Option<&[ColumnId]>,
+    ) -> DbResult<Option<Row>> {
+        let state = self.read_state()?;
+        let Some(table_view) = Self::table_view(&state, txn, table_id) else {
+            return Err(DbError::internal("table storage does not exist"));
+        };
+
+        let row = match table_view {
+            TableView::Created(table) => table.load_latest_row(&state.overflow, tuple_id)?,
+            TableView::Base {
+                table,
+                overlay,
+                descriptor,
+            } => match overlay.and_then(|overlay| overlay.rows.get(&tuple_id)) {
+                Some(PendingRowState::Present(row)) => Some(row.clone()),
+                Some(PendingRowState::Deleted) => None,
+                None => self.load_base_visible_row(
+                    &state,
+                    table,
+                    descriptor.table_id,
+                    tuple_id,
+                    snapshot,
+                )?,
+            },
+        };
+        row.map(|row| super::project_row(table_view.descriptor(), &row, projected_columns))
+            .transpose()
     }
 
     fn insert(&self, txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId> {
@@ -2756,7 +2934,62 @@ impl StorageDML for InMemoryStorage {
                 "no adjacency index for this edge table",
             ));
         }
+        let has_pending_overlay = !Self::is_autocommit_txn(txn)
+            && state.active_txns.get(&txn).is_some_and(|pending| {
+                pending
+                    .pending_adjacency
+                    .iter()
+                    .any(|change| change.table_id == edge_table_id)
+            });
+        if !has_pending_overlay {
+            let compact = self.committed_compact_adjacency_index(&state, edge_table_id)?;
+            let direction = if outgoing {
+                GraphDirection::Outgoing
+            } else {
+                GraphDirection::Incoming
+            };
+            return Ok(compact.edge_ids(node_id, direction).to_vec());
+        }
         self.adjacency_lookup_with_pending(&state, txn, edge_table_id, node_id, outgoing)
+    }
+
+    fn adjacency_edge_cursor(
+        &self,
+        txn: TxnId,
+        _snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<TupleId> + '_>> {
+        let state = self.read_state()?;
+        if !state.adjacency_indexes.contains_key(&edge_table_id) {
+            return Err(DbError::feature_not_supported(
+                "no adjacency index for this edge table",
+            ));
+        }
+        let has_pending_overlay = !Self::is_autocommit_txn(txn)
+            && state.active_txns.get(&txn).is_some_and(|pending| {
+                pending
+                    .pending_adjacency
+                    .iter()
+                    .any(|change| change.table_id == edge_table_id)
+            });
+        if has_pending_overlay {
+            let edge_ids =
+                self.adjacency_lookup_with_pending(&state, txn, edge_table_id, node_id, outgoing)?;
+            drop(state);
+            return Ok(Box::new(OwnedCursor::new(edge_ids)));
+        }
+        let compact = self.committed_compact_adjacency_index(&state, edge_table_id)?;
+        drop(state);
+        Ok(Box::new(compact.edge_id_cursor(
+            node_id,
+            if outgoing {
+                GraphDirection::Outgoing
+            } else {
+                GraphDirection::Incoming
+            },
+        )))
     }
 
     fn adjacency_neighbors(
@@ -2797,6 +3030,211 @@ impl StorageDML for InMemoryStorage {
                 .insert(cache_key, neighbors.clone());
         }
         Ok(neighbors)
+    }
+
+    fn adjacency_neighbor_cursor(
+        &self,
+        txn: TxnId,
+        _snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<Value> + '_>> {
+        let state = self.read_state()?;
+        if !state.adjacency_indexes.contains_key(&edge_table_id) {
+            return Err(DbError::feature_not_supported(
+                "no adjacency index for this edge table",
+            ));
+        }
+        let has_pending_overlay = !Self::is_autocommit_txn(txn)
+            && state.active_txns.get(&txn).is_some_and(|pending| {
+                pending
+                    .pending_adjacency
+                    .iter()
+                    .any(|change| change.table_id == edge_table_id)
+            });
+        if has_pending_overlay {
+            let neighbors = self.adjacency_neighbors_with_pending(
+                &state,
+                txn,
+                edge_table_id,
+                node_id,
+                outgoing,
+            )?;
+            drop(state);
+            return Ok(Box::new(OwnedCursor::new(neighbors)));
+        }
+        let compact = self.committed_compact_adjacency_index(&state, edge_table_id)?;
+        drop(state);
+        Ok(Box::new(compact.neighbor_cursor(
+            node_id,
+            if outgoing {
+                GraphDirection::Outgoing
+            } else {
+                GraphDirection::Incoming
+            },
+        )))
+    }
+
+    fn adjacency_edges(
+        &self,
+        txn: TxnId,
+        _snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+    ) -> DbResult<Vec<(TupleId, Value, Value)>> {
+        let state = self.read_state()?;
+        if !state.adjacency_indexes.contains_key(&edge_table_id) {
+            return Err(DbError::feature_not_supported(
+                "no adjacency index for this edge table",
+            ));
+        }
+        let mut edges: Vec<(TupleId, Value, Value)> = state
+            .adjacency_indexes
+            .get(&edge_table_id)
+            .map(|index| {
+                index
+                    .edges()
+                    .map(|(source, target, tuple_id)| (tuple_id, source, target))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !Self::is_autocommit_txn(txn) {
+            if let Some(pending) = state.active_txns.get(&txn) {
+                for change in &pending.pending_adjacency {
+                    if change.table_id != edge_table_id {
+                        continue;
+                    }
+                    match change.operation {
+                        super::AdjacencyOp::Insert => {
+                            if !edges
+                                .iter()
+                                .any(|(tuple_id, _, _)| *tuple_id == change.edge_tuple_id)
+                            {
+                                edges.push((
+                                    change.edge_tuple_id,
+                                    change.source_id.clone(),
+                                    change.target_id.clone(),
+                                ));
+                            }
+                        }
+                        super::AdjacencyOp::Remove => {
+                            edges.retain(|(tuple_id, _, _)| *tuple_id != change.edge_tuple_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(edges)
+    }
+
+    fn adjacency_weighted_edges(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        weight_column: ColumnId,
+    ) -> DbResult<Vec<(TupleId, Value, Value, Value)>> {
+        let edges = self.adjacency_edges(txn, snapshot, edge_table_id)?;
+        let projection = vec![weight_column];
+        let mut weighted = Vec::with_capacity(edges.len());
+        for (tuple_id, source_id, target_id) in edges {
+            let Some(row) = self.fetch(
+                txn,
+                snapshot,
+                edge_table_id,
+                tuple_id,
+                Some(projection.clone()),
+            )?
+            else {
+                continue;
+            };
+            let Some(weight) = row.values.into_iter().next() else {
+                continue;
+            };
+            weighted.push((tuple_id, source_id, target_id, weight));
+        }
+        Ok(weighted)
+    }
+
+    fn adjacency_edge_endpoints(
+        &self,
+        txn: TxnId,
+        _snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        edge_tuple_id: TupleId,
+    ) -> DbResult<Option<(Value, Value)>> {
+        let state = self.read_state()?;
+        if !state.adjacency_indexes.contains_key(&edge_table_id) {
+            return Err(DbError::feature_not_supported(
+                "no adjacency index for this edge table",
+            ));
+        }
+        if !Self::is_autocommit_txn(txn) {
+            if let Some(pending) = state.active_txns.get(&txn) {
+                for change in pending.pending_adjacency.iter().rev() {
+                    if change.table_id != edge_table_id || change.edge_tuple_id != edge_tuple_id {
+                        continue;
+                    }
+                    return Ok(match change.operation {
+                        super::AdjacencyOp::Insert => {
+                            Some((change.source_id.clone(), change.target_id.clone()))
+                        }
+                        super::AdjacencyOp::Remove => None,
+                    });
+                }
+            }
+        }
+        let compact = self.committed_compact_adjacency_index(&state, edge_table_id)?;
+        Ok(compact.edge_endpoints(edge_tuple_id))
+    }
+
+    fn adjacency_index_available(&self, txn: TxnId, edge_table_id: RelationId) -> bool {
+        let Ok(state) = self.read_state() else {
+            return false;
+        };
+        if state.adjacency_indexes.contains_key(&edge_table_id) {
+            return true;
+        }
+        if Self::is_autocommit_txn(txn) {
+            return false;
+        }
+        state.active_txns.get(&txn).is_some_and(|pending| {
+            pending
+                .pending_adjacency
+                .iter()
+                .any(|change| change.table_id == edge_table_id)
+        })
+    }
+
+    fn adjacency_index_stats(
+        &self,
+        txn: TxnId,
+        edge_table_id: RelationId,
+    ) -> Option<aiondb_graph_api::GraphStats> {
+        let Ok(state) = self.read_state() else {
+            return None;
+        };
+        if let Some(index) = state.adjacency_indexes.get(&edge_table_id) {
+            return Some(aiondb_graph_api::GraphStorage::stats(index));
+        }
+        if Self::is_autocommit_txn(txn) {
+            return None;
+        }
+        state.active_txns.get(&txn).and_then(|pending| {
+            pending
+                .pending_adjacency
+                .iter()
+                .any(|change| change.table_id == edge_table_id)
+                .then_some(aiondb_graph_api::GraphStats {
+                    node_count: None,
+                    edge_count: 0,
+                    source_node_count: None,
+                    target_node_count: None,
+                    has_reverse_adjacency: true,
+                    has_weighted_adjacency: false,
+                    directed: true,
+                })
+        })
     }
 
     fn adjacency_index_has_edges(&self, txn: TxnId, edge_table_id: RelationId) -> bool {

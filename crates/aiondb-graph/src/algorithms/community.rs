@@ -12,11 +12,10 @@
 //!
 //! O(V + E) for the community assignments and intermediate data structures.
 
-use std::collections::HashMap;
-
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
-use super::{u32_to_usize, usize_to_u32, GraphView};
+use super::{u32_to_usize, usize_to_u32, GraphViewV2Ext};
+use aiondb_graph_api::GraphViewV2;
 
 #[inline]
 fn u64_to_f64(value: u64) -> f64 {
@@ -52,12 +51,12 @@ impl Default for LouvainConfig {
 ///
 /// Returns a `Vec<u32>` of length `graph.node_count()` where entry `i` is the
 /// community id of node `i`. Community ids are contiguous starting from 0.
-pub fn louvain(graph: &impl GraphView) -> Vec<u32> {
+pub fn louvain<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<u32> {
     louvain_with_config(graph, &LouvainConfig::default())
 }
 
 /// Run Louvain with custom configuration.
-pub fn louvain_with_config(graph: &impl GraphView, config: &LouvainConfig) -> Vec<u32> {
+pub fn louvain_with_config<G: GraphViewV2 + ?Sized>(graph: &G, config: &LouvainConfig) -> Vec<u32> {
     let n_u32 = graph.node_count();
     let n = u32_to_usize(n_u32);
     if n == 0 {
@@ -83,35 +82,28 @@ pub fn louvain_with_config(graph: &impl GraphView, config: &LouvainConfig) -> Ve
     // Sum of degrees inside each community.
     let mut sigma_tot: Vec<f64> = degrees.clone();
 
-    // Sum of internal edges for each community (initially 0 except self-loops).
-    let mut sigma_in: Vec<f64> = vec![0.0; n];
-    for u in 0..n_u32 {
-        for &v in graph.neighbors(u) {
-            if v == u {
-                sigma_in[u32_to_usize(u)] += 1.0;
-            }
-        }
-    }
-
     for _pass in 0..config.max_passes {
         let mut improved = false;
+        let mut neighbor_communities = vec![0.0_f64; n];
+        let mut touched_communities = Vec::new();
 
         for u in 0..n_u32 {
             let u_community = community[u32_to_usize(u)];
             let k_u = degrees[u32_to_usize(u)];
 
             // Count edges from u to each neighboring community.
-            let mut neighbor_communities: HashMap<u32, f64> = HashMap::new();
-            for &v in graph.neighbors(u) {
+            touched_communities.clear();
+            for &v in graph.out_neighbors(u) {
                 let v_comm = community[u32_to_usize(v)];
-                *neighbor_communities.entry(v_comm).or_insert(0.0) += 1.0;
+                let slot = &mut neighbor_communities[u32_to_usize(v_comm)];
+                if *slot == 0.0 {
+                    touched_communities.push(v_comm);
+                }
+                *slot += 1.0;
             }
 
             // Edges from u to its own community.
-            let k_u_in = neighbor_communities
-                .get(&u_community)
-                .copied()
-                .unwrap_or(0.0);
+            let k_u_in = neighbor_communities[u32_to_usize(u_community)];
 
             // Try removing u from its community.
             // Modularity change for removing u from its current community:
@@ -121,10 +113,11 @@ pub fn louvain_with_config(graph: &impl GraphView, config: &LouvainConfig) -> Ve
             let mut best_community = u_community;
             let mut best_gain = 0.0;
 
-            for (&target_comm, &k_u_target) in &neighbor_communities {
+            for &target_comm in &touched_communities {
                 if target_comm == u_community {
                     continue;
                 }
+                let k_u_target = neighbor_communities[u32_to_usize(target_comm)];
 
                 // Modularity gain of moving u from u_community to target_comm.
                 // Using the standard Louvain formula:
@@ -142,17 +135,14 @@ pub fn louvain_with_config(graph: &impl GraphView, config: &LouvainConfig) -> Ve
                 }
             }
 
+            for &comm in &touched_communities {
+                neighbor_communities[u32_to_usize(comm)] = 0.0;
+            }
+
             if best_community != u_community && best_gain > config.min_modularity_gain {
                 // Move u from u_community to best_community.
                 sigma_tot[u32_to_usize(u_community)] -= k_u;
                 sigma_tot[u32_to_usize(best_community)] += k_u;
-
-                sigma_in[u32_to_usize(u_community)] -= k_u_in;
-                let k_u_best = neighbor_communities
-                    .get(&best_community)
-                    .copied()
-                    .unwrap_or(0.0);
-                sigma_in[u32_to_usize(best_community)] += k_u_best;
 
                 community[u32_to_usize(u)] = best_community;
                 improved = true;
@@ -175,7 +165,7 @@ pub fn louvain_with_config(graph: &impl GraphView, config: &LouvainConfig) -> Ve
 ///
 /// where m is the number of edges, A is the adjacency, `k_u` is the degree of u,
 /// and delta is 1 iff u and v are in the same community.
-pub fn modularity(graph: &impl GraphView, communities: &[u32]) -> f64 {
+pub fn modularity<G: GraphViewV2 + ?Sized>(graph: &G, communities: &[u32]) -> f64 {
     let n_u32 = graph.node_count();
     let n = u32_to_usize(n_u32);
     if n == 0 {
@@ -188,9 +178,9 @@ pub fn modularity(graph: &impl GraphView, communities: &[u32]) -> f64 {
     }
 
     let degrees: Vec<f64> = (0..n_u32).map(|u| f64::from(graph.degree(u))).collect();
-    // Materialise adjacency so the parallel sum below does not require the
-    // underlying `GraphView` reference to be `Sync`.
-    let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.neighbors(u)).collect();
+    // Snapshot adjacency so the parallel reduction indexes a slice table
+    // directly rather than dispatching through the view per node.
+    let adjacency: Vec<&[u32]> = (0..n_u32).map(|u| graph.out_neighbors(u)).collect();
 
     // Per-source partial sums are independent. f64 addition is not
     // bit-associative, but for production modularity reporting any reduction
@@ -218,14 +208,18 @@ pub fn modularity(graph: &impl GraphView, communities: &[u32]) -> f64 {
 
 /// Renumber community ids to be contiguous `[0, num_communities)`.
 fn renumber_communities(community: &mut [u32]) {
-    let mut mapping: HashMap<u32, u32> = HashMap::new();
+    let mut mapping = vec![u32::MAX; community.len()];
     let mut next_id: u32 = 0;
     for c in community.iter_mut() {
-        let new_id = *mapping.entry(*c).or_insert_with(|| {
+        let entry = &mut mapping[u32_to_usize(*c)];
+        let new_id = if *entry == u32::MAX {
             let id = next_id;
             next_id += 1;
+            *entry = id;
             id
-        });
+        } else {
+            *entry
+        };
         *c = new_id;
     }
 }

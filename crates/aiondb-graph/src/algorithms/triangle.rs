@@ -19,15 +19,15 @@
 //! # Complexity
 //!
 //! Time: O(V * d^2) where d is the maximum degree.
-//! Space: O(V + E) for sorted neighbor lists and hash sets.
-
-use std::collections::HashSet;
+//! Space: O(V + E) for sorted neighbor lists.
 
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-use super::{u32_to_usize, usize_to_u32, GraphView};
+use aiondb_graph_api::GraphViewV2;
+
+use super::{u32_to_usize, usize_to_u32, GraphViewV2Ext};
 
 #[inline]
 fn u64_to_f64(value: u64) -> f64 {
@@ -53,7 +53,7 @@ fn u64_to_f64(value: u64) -> f64 {
 /// # Returns
 ///
 /// The total number of triangles in the graph.
-pub fn triangle_count(graph: &impl GraphView) -> u64 {
+pub fn triangle_count<G: GraphViewV2 + ?Sized>(graph: &G) -> u64 {
     let n = graph.node_count();
     if n < 3 {
         return 0;
@@ -69,21 +69,14 @@ pub fn triangle_count(graph: &impl GraphView) -> u64 {
         .with_min_len(16)
         .map(|u| {
             let neighbors_u = &sorted[u32_to_usize(u)];
-            let set_u: HashSet<u32> = neighbors_u.iter().copied().collect();
             let mut local: u64 = 0;
             for &v in neighbors_u {
                 if v <= u {
                     continue;
                 }
                 let neighbors_v = &sorted[u32_to_usize(v)];
-                for &w in neighbors_v {
-                    if w <= v {
-                        continue;
-                    }
-                    if set_u.contains(&w) {
-                        local = local.saturating_add(1);
-                    }
-                }
+                local =
+                    local.saturating_add(count_common_neighbors_after(neighbors_u, neighbors_v, v));
             }
             local
         })
@@ -100,7 +93,7 @@ pub fn triangle_count(graph: &impl GraphView) -> u64 {
 /// # Time complexity
 ///
 /// O(V * d^2) where d is the maximum degree.
-pub fn node_triangle_count(graph: &impl GraphView) -> Vec<u32> {
+pub fn node_triangle_count<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<u32> {
     let n = graph.node_count();
     let n_usize = u32_to_usize(n);
 
@@ -122,25 +115,12 @@ pub fn node_triangle_count(graph: &impl GraphView) -> Vec<u32> {
             || vec![0u32; n_usize],
             |mut local, u| {
                 let neighbors_u = &sorted[u32_to_usize(u)];
-                let set_u: HashSet<u32> = neighbors_u.iter().copied().collect();
                 for &v in neighbors_u {
                     if v <= u {
                         continue;
                     }
                     let neighbors_v = &sorted[u32_to_usize(v)];
-                    for &w in neighbors_v {
-                        if w <= v {
-                            continue;
-                        }
-                        if set_u.contains(&w) {
-                            let ui = u32_to_usize(u);
-                            let vi = u32_to_usize(v);
-                            let wi = u32_to_usize(w);
-                            local[ui] = local[ui].saturating_add(1);
-                            local[vi] = local[vi].saturating_add(1);
-                            local[wi] = local[wi].saturating_add(1);
-                        }
-                    }
+                    add_triangle_credits_after(&mut local, u, v, neighbors_u, neighbors_v);
                 }
                 local
             },
@@ -172,11 +152,11 @@ pub fn node_triangle_count(graph: &impl GraphView) -> Vec<u32> {
 /// # Returns
 ///
 /// A `Vec<f64>` of length `graph.node_count()` indexed by node ID.
-pub fn local_clustering_coefficient(graph: &impl GraphView) -> Vec<f64> {
+pub fn local_clustering_coefficient<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     let n = u32_to_usize(graph.node_count());
     let tri = node_triangle_count(graph);
-    // Pre-extract degrees so the parallel pass below does not need to touch
-    // the `GraphView` reference (which is not bounded `Sync`).
+    // Pre-extract degrees so the parallel pass indexes a flat `Vec`
+    // instead of dispatching `degree` through the view per element.
     let degrees: Vec<u64> = (0..n)
         .map(|v| u64::from(graph.degree(usize_to_u32(v))))
         .collect();
@@ -207,7 +187,7 @@ pub fn local_clustering_coefficient(graph: &impl GraphView) -> Vec<f64> {
 /// Returns 0.0 if there are no triplets (e.g., all nodes have degree < 2).
 ///
 /// The graph must be undirected for correct results.
-pub fn global_clustering_coefficient(graph: &impl GraphView) -> f64 {
+pub fn global_clustering_coefficient<G: GraphViewV2 + ?Sized>(graph: &G) -> f64 {
     let n = graph.node_count();
     let triangles = triangle_count(graph);
 
@@ -231,12 +211,14 @@ pub fn global_clustering_coefficient(graph: &impl GraphView) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Build sorted neighbor lists for every node.
-fn sorted_neighbor_lists(graph: &impl GraphView) -> Vec<Vec<u32>> {
+fn sorted_neighbor_lists<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<Vec<u32>> {
     let n = u32_to_usize(graph.node_count());
-    // Materialise the borrowed slices first so the parallel sort phase below
-    // does not require `GraphView: Sync`. Slice references (`&[u32]`) are
-    // `Sync` because `u32: Sync`.
-    let raw: Vec<&[u32]> = (0..usize_to_u32(n)).map(|v| graph.neighbors(v)).collect();
+    // Snapshot the borrowed slices first, then sort/dedup in parallel. The
+    // owned sorted lists are required by the algorithm regardless; the
+    // snapshot just lets the parallel phase work on plain slices.
+    let raw: Vec<&[u32]> = (0..usize_to_u32(n))
+        .map(|v| graph.out_neighbors(v))
+        .collect();
     raw.par_iter()
         .map(|nbrs| {
             let mut owned = nbrs.to_vec();
@@ -245,6 +227,61 @@ fn sorted_neighbor_lists(graph: &impl GraphView) -> Vec<Vec<u32>> {
             owned
         })
         .collect()
+}
+
+fn first_strictly_greater(sorted: &[u32], threshold: u32) -> usize {
+    sorted.partition_point(|&node| node <= threshold)
+}
+
+fn count_common_neighbors_after(a: &[u32], b: &[u32], threshold: u32) -> u64 {
+    let (mut i, mut j) = (
+        first_strictly_greater(a, threshold),
+        first_strictly_greater(b, threshold),
+    );
+    let mut count = 0u64;
+
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                count = count.saturating_add(1);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+
+    count
+}
+
+fn add_triangle_credits_after(
+    local: &mut [u32],
+    u_node: u32,
+    v_node: u32,
+    u_adj: &[u32],
+    v_adj: &[u32],
+) {
+    let (mut ai, mut bj) = (
+        first_strictly_greater(u_adj, v_node),
+        first_strictly_greater(v_adj, v_node),
+    );
+    let (ui, vi) = (u32_to_usize(u_node), u32_to_usize(v_node));
+
+    while ai < u_adj.len() && bj < v_adj.len() {
+        match u_adj[ai].cmp(&v_adj[bj]) {
+            std::cmp::Ordering::Less => ai += 1,
+            std::cmp::Ordering::Greater => bj += 1,
+            std::cmp::Ordering::Equal => {
+                let wi = u32_to_usize(u_adj[ai]);
+                local[ui] = local[ui].saturating_add(1);
+                local[vi] = local[vi].saturating_add(1);
+                local[wi] = local[wi].saturating_add(1);
+                ai += 1;
+                bj += 1;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

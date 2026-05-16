@@ -16,15 +16,45 @@
 //! - Jaccard, P. (1912). "The distribution of the flora in the alpine zone."
 //! - Adamic, L. A. & Adar, E. (2003). "Friends and neighbors on the Web."
 
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
-use super::{u32_to_usize, GraphView};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
+
+use super::{u32_to_usize, GraphViewV2Ext};
+use aiondb_graph_api::GraphViewV2;
 
 #[inline]
 fn usize_to_f64(value: usize) -> f64 {
     // Standard narrowing convert; neighbor-set cardinalities are bounded by
     // node count and well below the 2^53 exact-representation range.
     value as f64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TopKEntry {
+    node: u32,
+    score: f64,
+}
+
+impl Eq for TopKEntry {}
+
+impl Ord for TopKEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for TopKEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -47,15 +77,15 @@ pub enum SimilarityMetric {
 // ---------------------------------------------------------------------------
 
 /// Returns the sorted, deduplicated neighbor list of `node`.
-fn sorted_neighbors(graph: &impl GraphView, node: u32) -> Vec<u32> {
-    let mut nbrs: Vec<u32> = graph.neighbors(node).to_vec();
+fn sorted_neighbors<G: GraphViewV2 + ?Sized>(graph: &G, node: u32) -> Vec<u32> {
+    let mut nbrs: Vec<u32> = graph.out_neighbors(node).to_vec();
     nbrs.sort_unstable();
     nbrs.dedup();
     nbrs
 }
 
 /// Computes the intersection of two *sorted* slices.
-fn sorted_intersection(a: &[u32], b: &[u32]) -> Vec<u32> {
+fn sorted_intersection_collect(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut result = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -70,6 +100,24 @@ fn sorted_intersection(a: &[u32], b: &[u32]) -> Vec<u32> {
         }
     }
     result
+}
+
+/// Returns the size of the intersection of two *sorted* slices.
+fn sorted_intersection_len(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j) = (0, 0);
+    let mut count = 0usize;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Returns the size of the union of two *sorted* slices (without materialising it).
@@ -95,6 +143,199 @@ fn sorted_union_len(a: &[u32], b: &[u32]) -> usize {
     count
 }
 
+fn sorted_intersection_adamic_adar_with_graph<G: GraphViewV2 + ?Sized>(
+    a: &[u32],
+    b: &[u32],
+    graph: &G,
+) -> f64 {
+    let (mut i, mut j) = (0, 0);
+    let mut score = 0.0_f64;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let deg = graph.degree(a[i]);
+                if deg > 1 {
+                    score += 1.0 / f64::from(deg).ln();
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    score
+}
+
+fn sorted_intersection_adamic_adar_with_degrees(a: &[u32], b: &[u32], degrees: &[u32]) -> f64 {
+    let (mut i, mut j) = (0, 0);
+    let mut score = 0.0_f64;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let deg = degrees[u32_to_usize(a[i])];
+                if deg > 1 {
+                    score += 1.0 / f64::from(deg).ln();
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    score
+}
+
+fn similarity_score_from_sorted(
+    left: &[u32],
+    right: &[u32],
+    metric: SimilarityMetric,
+    degrees: &[u32],
+) -> f64 {
+    match metric {
+        SimilarityMetric::Jaccard => {
+            let inter = sorted_intersection_len(left, right);
+            let union = sorted_union_len(left, right);
+            if union == 0 {
+                0.0
+            } else {
+                usize_to_f64(inter) / usize_to_f64(union)
+            }
+        }
+        SimilarityMetric::Overlap => {
+            let min_size = left.len().min(right.len());
+            if min_size == 0 {
+                0.0
+            } else {
+                let inter = sorted_intersection_len(left, right);
+                usize_to_f64(inter) / usize_to_f64(min_size)
+            }
+        }
+        SimilarityMetric::AdamicAdar => {
+            sorted_intersection_adamic_adar_with_degrees(left, right, degrees)
+        }
+    }
+}
+
+fn sort_scores_desc(scores: &mut [(u32, f64)]) {
+    scores.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+}
+
+fn maybe_push_top_k(heap: &mut BinaryHeap<TopKEntry>, node: u32, score: f64, k: usize) {
+    if k == 0 {
+        return;
+    }
+
+    let candidate = TopKEntry { node, score };
+    if heap.len() < k {
+        heap.push(candidate);
+        return;
+    }
+
+    if let Some(worst) = heap.peek() {
+        let better = score > worst.score || (score == worst.score && node < worst.node);
+        if better {
+            heap.pop();
+            heap.push(candidate);
+        }
+    }
+}
+
+fn sort_node_pair_scores(scores: &mut [(u32, u32, f64)]) {
+    scores.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.2.partial_cmp(&left.2).unwrap_or(Ordering::Equal))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+}
+
+fn owner_lists_from_sorted_neighbors(sorted_neighbors: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let mut owners = vec![Vec::new(); sorted_neighbors.len()];
+    for (owner, neighbors) in sorted_neighbors.iter().enumerate() {
+        let owner = u32::try_from(owner).unwrap_or(u32::MAX);
+        for &neighbor in neighbors {
+            owners[u32_to_usize(neighbor)].push(owner);
+        }
+    }
+    owners
+}
+
+struct CandidateWorkspace {
+    marks: Vec<u32>,
+    touched: Vec<u32>,
+    generation: u32,
+}
+
+impl CandidateWorkspace {
+    fn new(node_count: usize) -> Self {
+        Self {
+            marks: vec![0; node_count],
+            touched: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    fn begin_source(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.marks.fill(0);
+            self.generation = 1;
+        }
+        self.touched.clear();
+    }
+
+    fn mark(&mut self, node: u32) {
+        let idx = u32_to_usize(node);
+        if self.marks[idx] == self.generation {
+            return;
+        }
+        self.marks[idx] = self.generation;
+        self.touched.push(node);
+    }
+}
+
+pub(crate) fn sorted_neighbor_lists<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<Vec<u32>> {
+    let n = graph.node_count();
+    let raw: Vec<&[u32]> = (0..n).map(|node| graph.out_neighbors(node)).collect();
+    raw.par_iter()
+        .map(|neighbors| {
+            let mut owned = neighbors.to_vec();
+            owned.sort_unstable();
+            owned.dedup();
+            owned
+        })
+        .collect()
+}
+
+pub(crate) fn degree_list<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<u32> {
+    (0..graph.node_count())
+        .map(|node| graph.degree(node))
+        .collect()
+}
+
+pub(crate) fn pair_similarity_from_precomputed(
+    sorted_neighbors: &[Vec<u32>],
+    degrees: &[u32],
+    node_a: u32,
+    node_b: u32,
+    metric: SimilarityMetric,
+) -> f64 {
+    similarity_score_from_sorted(
+        &sorted_neighbors[u32_to_usize(node_a)],
+        &sorted_neighbors[u32_to_usize(node_b)],
+        metric,
+        degrees,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -109,13 +350,13 @@ fn sorted_union_len(a: &[u32], b: &[u32]) -> usize {
 ///
 /// # Panics
 ///
-/// Panics (via `GraphView::neighbors`) if `node_a` or `node_b` is out of
+/// Panics (via `GraphViewV2::neighbors`) if `node_a` or `node_b` is out of
 /// bounds.
-pub fn jaccard_similarity(graph: &impl GraphView, node_a: u32, node_b: u32) -> f64 {
+pub fn jaccard_similarity<G: GraphViewV2 + ?Sized>(graph: &G, node_a: u32, node_b: u32) -> f64 {
     let na = sorted_neighbors(graph, node_a);
     let nb = sorted_neighbors(graph, node_b);
 
-    let inter = sorted_intersection(&na, &nb).len();
+    let inter = sorted_intersection_len(&na, &nb);
     let union = sorted_union_len(&na, &nb);
 
     if union == 0 {
@@ -134,9 +375,9 @@ pub fn jaccard_similarity(graph: &impl GraphView, node_a: u32, node_b: u32) -> f
 ///
 /// # Panics
 ///
-/// Panics (via `GraphView::neighbors`) if `node_a` or `node_b` is out of
+/// Panics (via `GraphViewV2::neighbors`) if `node_a` or `node_b` is out of
 /// bounds.
-pub fn overlap_coefficient(graph: &impl GraphView, node_a: u32, node_b: u32) -> f64 {
+pub fn overlap_coefficient<G: GraphViewV2 + ?Sized>(graph: &G, node_a: u32, node_b: u32) -> f64 {
     let na = sorted_neighbors(graph, node_a);
     let nb = sorted_neighbors(graph, node_b);
 
@@ -145,7 +386,7 @@ pub fn overlap_coefficient(graph: &impl GraphView, node_a: u32, node_b: u32) -> 
         return 0.0;
     }
 
-    let inter = sorted_intersection(&na, &nb).len();
+    let inter = sorted_intersection_len(&na, &nb);
     usize_to_f64(inter) / usize_to_f64(min_size)
 }
 
@@ -161,33 +402,24 @@ pub fn overlap_coefficient(graph: &impl GraphView, node_a: u32, node_b: u32) -> 
 ///
 /// # Panics
 ///
-/// Panics (via `GraphView::neighbors`) if `node_a` or `node_b` is out of
+/// Panics (via `GraphViewV2::neighbors`) if `node_a` or `node_b` is out of
 /// bounds.
-pub fn adamic_adar(graph: &impl GraphView, node_a: u32, node_b: u32) -> f64 {
+pub fn adamic_adar<G: GraphViewV2 + ?Sized>(graph: &G, node_a: u32, node_b: u32) -> f64 {
     let na = sorted_neighbors(graph, node_a);
     let nb = sorted_neighbors(graph, node_b);
-    let common = sorted_intersection(&na, &nb);
-
-    let mut score = 0.0_f64;
-    for &w in &common {
-        let deg = graph.degree(w);
-        if deg > 1 {
-            score += 1.0 / f64::from(deg).ln();
-        }
-    }
-    score
+    sorted_intersection_adamic_adar_with_graph(&na, &nb, graph)
 }
 
 /// Returns the common neighbors of `node_a` and `node_b` as a sorted vector.
 ///
 /// # Panics
 ///
-/// Panics (via `GraphView::neighbors`) if `node_a` or `node_b` is out of
+/// Panics (via `GraphViewV2::neighbors`) if `node_a` or `node_b` is out of
 /// bounds.
-pub fn common_neighbors(graph: &impl GraphView, node_a: u32, node_b: u32) -> Vec<u32> {
+pub fn common_neighbors<G: GraphViewV2 + ?Sized>(graph: &G, node_a: u32, node_b: u32) -> Vec<u32> {
     let na = sorted_neighbors(graph, node_a);
     let nb = sorted_neighbors(graph, node_b);
-    sorted_intersection(&na, &nb)
+    sorted_intersection_collect(&na, &nb)
 }
 
 /// Find the `k` most similar nodes to `node` according to `metric`.
@@ -199,76 +431,128 @@ pub fn common_neighbors(graph: &impl GraphView, node_a: u32, node_b: u32) -> Vec
 ///
 /// # Panics
 ///
-/// Panics (via `GraphView::neighbors`) if `node` is out of bounds.
-pub fn top_k_similar(
-    graph: &impl GraphView,
+/// Panics (via `GraphViewV2::neighbors`) if `node` is out of bounds.
+pub(crate) fn top_k_similar_from_precomputed(
+    sorted: &[Vec<u32>],
+    degrees: &[u32],
     node: u32,
     k: usize,
     metric: SimilarityMetric,
 ) -> Vec<(u32, f64)> {
-    let n = graph.node_count();
-
-    // Materialise sorted-deduplicated neighbour sets once; the per-candidate
-    // pass below then has to do nothing but the intersection / union scan.
-    // This both removes the per-call allocation that the public
-    // `jaccard_similarity` / `overlap_coefficient` / `adamic_adar` helpers do
-    // and avoids needing `GraphView: Sync` for the parallel pass.
-    let sorted: Vec<Vec<u32>> = (0..n).map(|v| sorted_neighbors(graph, v)).collect();
-    let degrees: Vec<u32> = (0..n).map(|v| graph.degree(v)).collect();
+    let n = u32::try_from(sorted.len()).unwrap_or(u32::MAX);
     let target_idx = u32_to_usize(node);
     let target_neighbors = &sorted[target_idx];
-    let target_len = target_neighbors.len();
-
-    let mut scores: Vec<(u32, f64)> = (0..n)
+    let heap: BinaryHeap<TopKEntry> = (0..n)
         .into_par_iter()
         .with_min_len(64)
         .filter(|&v| v != node)
-        .map(|v| {
+        .fold(BinaryHeap::new, |mut local_heap, v| {
             let other_neighbors = &sorted[u32_to_usize(v)];
-            let score = match metric {
-                SimilarityMetric::Jaccard => {
-                    let inter = sorted_intersection(target_neighbors, other_neighbors).len();
-                    let union = sorted_union_len(target_neighbors, other_neighbors);
-                    if union == 0 {
-                        0.0
-                    } else {
-                        usize_to_f64(inter) / usize_to_f64(union)
-                    }
-                }
-                SimilarityMetric::Overlap => {
-                    let min_size = target_len.min(other_neighbors.len());
-                    if min_size == 0 {
-                        0.0
-                    } else {
-                        let inter = sorted_intersection(target_neighbors, other_neighbors).len();
-                        usize_to_f64(inter) / usize_to_f64(min_size)
-                    }
-                }
-                SimilarityMetric::AdamicAdar => {
-                    let common = sorted_intersection(target_neighbors, other_neighbors);
-                    let mut s = 0.0_f64;
-                    for &w in &common {
-                        let deg = degrees[u32_to_usize(w)];
-                        if deg > 1 {
-                            s += 1.0 / f64::from(deg).ln();
-                        }
-                    }
-                    s
-                }
-            };
-            (v, score)
+            let score =
+                similarity_score_from_sorted(target_neighbors, other_neighbors, metric, &degrees);
+            maybe_push_top_k(&mut local_heap, v, score, k);
+            local_heap
         })
+        .reduce(BinaryHeap::new, |mut left, right| {
+            for entry in right {
+                maybe_push_top_k(&mut left, entry.node, entry.score, k);
+            }
+            left
+        });
+
+    let mut scores: Vec<(u32, f64)> = heap
+        .into_iter()
+        .map(|entry| (entry.node, entry.score))
         .collect();
-
-    // Sort descending by score, then ascending by node id for determinism.
-    scores.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    scores.truncate(k);
+    sort_scores_desc(&mut scores);
     scores
+}
+
+pub(crate) fn positive_top_k_pairs_from_precomputed(
+    sorted_neighbors: &[Vec<u32>],
+    degrees: &[u32],
+    k: usize,
+    metric: SimilarityMetric,
+    exclude_existing_neighbors: bool,
+) -> Vec<(u32, u32, f64)> {
+    if k == 0 || sorted_neighbors.is_empty() {
+        return Vec::new();
+    }
+
+    let owner_lists = owner_lists_from_sorted_neighbors(sorted_neighbors);
+    let node_count = u32::try_from(sorted_neighbors.len()).unwrap_or(u32::MAX);
+    let mut scores = (0..node_count)
+        .into_par_iter()
+        .fold(
+            || (CandidateWorkspace::new(sorted_neighbors.len()), Vec::new()),
+            |(mut workspace, mut local_scores), source| {
+                workspace.begin_source();
+                let existing = &sorted_neighbors[u32_to_usize(source)];
+                for &shared_neighbor in existing {
+                    for &candidate in &owner_lists[u32_to_usize(shared_neighbor)] {
+                        if candidate == source {
+                            continue;
+                        }
+                        if exclude_existing_neighbors && existing.binary_search(&candidate).is_ok()
+                        {
+                            continue;
+                        }
+                        workspace.mark(candidate);
+                    }
+                }
+
+                let mut heap = BinaryHeap::new();
+                for &candidate in &workspace.touched {
+                    let score = pair_similarity_from_precomputed(
+                        sorted_neighbors,
+                        degrees,
+                        source,
+                        candidate,
+                        metric,
+                    );
+                    if score > 0.0 {
+                        maybe_push_top_k(&mut heap, candidate, score, k);
+                    }
+                }
+
+                let mut candidates: Vec<(u32, u32, f64)> = heap
+                    .into_iter()
+                    .map(|entry| (source, entry.node, entry.score))
+                    .collect();
+                candidates.sort_by(|left, right| {
+                    right
+                        .2
+                        .partial_cmp(&left.2)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| left.1.cmp(&right.1))
+                });
+                local_scores.extend(candidates);
+                (workspace, local_scores)
+            },
+        )
+        .map(|(_, local_scores)| local_scores)
+        .reduce(Vec::new, |mut left, mut right| {
+            left.append(&mut right);
+            left
+        });
+    sort_node_pair_scores(&mut scores);
+    scores
+}
+
+pub fn top_k_similar<G: GraphViewV2 + ?Sized>(
+    graph: &G,
+    node: u32,
+    k: usize,
+    metric: SimilarityMetric,
+) -> Vec<(u32, f64)> {
+    // Materialise sorted-deduplicated neighbour sets once; the per-candidate
+    // pass below then has to do nothing but the intersection / union scan.
+    // This removes the per-call allocation that the public
+    // `jaccard_similarity` / `overlap_coefficient` / `adamic_adar` helpers do
+    // and lets the parallel pass reuse the precomputed sets.
+    let sorted = sorted_neighbor_lists(graph);
+    let degrees = degree_list(graph);
+    top_k_similar_from_precomputed(&sorted, &degrees, node, k, metric)
 }
 
 // ---------------------------------------------------------------------------

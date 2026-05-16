@@ -1544,8 +1544,7 @@ mod tests {
             experimental: vec![],
         };
         let payload = serde_json::to_vec_pretty(&legacy).unwrap();
-        let mut bytes =
-            Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
+        let mut bytes = Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
         bytes.extend_from_slice(MANIFEST_MAGIC);
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
@@ -1591,8 +1590,7 @@ mod tests {
             experimental: vec![],
         };
         let payload = serde_json::to_vec_pretty(&future).unwrap();
-        let mut bytes =
-            Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
+        let mut bytes = Vec::with_capacity(MANIFEST_MAGIC.len() + 8 + payload.len() + 4);
         bytes.extend_from_slice(MANIFEST_MAGIC);
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);

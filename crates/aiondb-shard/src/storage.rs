@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aiondb_core::{ColumnId, DbError, DbResult, IndexId, RelationId, Row, TupleId, TxnId, Value};
+use aiondb_graph_api::NeighborCursor;
 use aiondb_storage_api::{
     KeyRange, StorageCapabilities, StorageDDL, StorageDML, StorageShardConfig,
     TableStorageDescriptor, TupleStream, MAX_STORAGE_HASH_RING_VIRTUAL_NODES,
@@ -28,6 +29,70 @@ use crate::stream::{MergedTupleStream, ShardRewriteTupleStream};
 
 fn shard_registry_poisoned() -> DbError {
     DbError::internal("shard registry lock poisoned")
+}
+
+struct ChainedCursor<'a, T: Clone> {
+    cursors: Vec<Box<dyn NeighborCursor<T> + 'a>>,
+    current: usize,
+}
+
+impl<'a, T: Clone> ChainedCursor<'a, T> {
+    fn new(cursors: Vec<Box<dyn NeighborCursor<T> + 'a>>) -> Self {
+        Self {
+            cursors,
+            current: 0,
+        }
+    }
+}
+
+impl<T: Clone> NeighborCursor<T> for ChainedCursor<'_, T> {
+    fn next_neighbor(&mut self) -> Option<T> {
+        while let Some(cursor) = self.cursors.get_mut(self.current) {
+            if let Some(value) = cursor.next_neighbor() {
+                return Some(value);
+            }
+            self.current = self.current.saturating_add(1);
+        }
+        None
+    }
+
+    fn remaining_hint(&self) -> usize {
+        self.cursors
+            .iter()
+            .skip(self.current)
+            .map(|cursor| cursor.remaining_hint())
+            .sum()
+    }
+}
+
+struct EncodedShardTupleCursor<'a> {
+    shard_idx: u32,
+    inner: Box<dyn NeighborCursor<TupleId> + 'a>,
+}
+
+impl<'a> EncodedShardTupleCursor<'a> {
+    fn new(shard_idx: u32, inner: Box<dyn NeighborCursor<TupleId> + 'a>) -> DbResult<Self> {
+        if shard_idx >= MAX_STORAGE_SHARD_COUNT {
+            return Err(DbError::internal(format!(
+                "shard index {shard_idx} exceeds 16-bit shard id range"
+            )));
+        }
+        Ok(Self { shard_idx, inner })
+    }
+}
+
+impl NeighborCursor<TupleId> for EncodedShardTupleCursor<'_> {
+    fn next_neighbor(&mut self) -> Option<TupleId> {
+        let local_tid = self.inner.next_neighbor()?;
+        Some(
+            try_encode_shard_tuple_id(self.shard_idx, local_tid)
+                .expect("storage backend produced shard-local TupleId outside 48-bit range"),
+        )
+    }
+
+    fn remaining_hint(&self) -> usize {
+        self.inner.remaining_hint()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +441,31 @@ impl<S: StorageDDL + StorageDML + Send + Sync> StorageDDL for ShardedStorage<S> 
 // ---------------------------------------------------------------------------
 
 impl<S: StorageDML + Send + Sync> StorageDML for ShardedStorage<S> {
+    fn cache_generation(&self) -> Option<u64> {
+        self.inner.cache_generation()
+    }
+
+    fn graph_projection_cache_get(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        self.inner
+            .graph_projection_cache_get(namespace, cache_key, generation)
+    }
+
+    fn graph_projection_cache_put(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+        payload: &[u8],
+    ) -> DbResult<()> {
+        self.inner
+            .graph_projection_cache_put(namespace, cache_key, generation, payload)
+    }
+
     fn scan_table(
         &self,
         txn: TxnId,
@@ -487,6 +577,26 @@ impl<S: StorageDML + Send + Sync> StorageDML for ShardedStorage<S> {
         let phys_id = physical_shard_id(&info, shard_idx, table_id)?;
         self.inner
             .fetch(txn, snapshot, phys_id, local_tid, projected_columns)
+    }
+
+    fn fetch_ref(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        table_id: RelationId,
+        tuple_id: TupleId,
+        projected_columns: Option<&[ColumnId]>,
+    ) -> DbResult<Option<Row>> {
+        let Some(info) = self.shard_info(table_id)? else {
+            return self
+                .inner
+                .fetch_ref(txn, snapshot, table_id, tuple_id, projected_columns);
+        };
+
+        let (shard_idx, local_tid) = decode_shard_tuple_id(tuple_id);
+        let phys_id = physical_shard_id(&info, shard_idx, table_id)?;
+        self.inner
+            .fetch_ref(txn, snapshot, phys_id, local_tid, projected_columns)
     }
 
     fn insert(&self, txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId> {
@@ -787,6 +897,149 @@ impl<S: StorageDML + Send + Sync> StorageDML for ShardedStorage<S> {
                 .adjacency_neighbors(txn, snapshot, edge_table_id, node_id, outgoing)
         }
     }
+
+    fn adjacency_neighbor_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<Value> + '_>> {
+        if let Some(info) = self.shard_info(edge_table_id)? {
+            if let GraphShardRoute::Single(shard_id) =
+                graph_adjacency_route(&info, node_id, outgoing)?
+            {
+                let phys_id = physical_shard_id(&info, shard_id, edge_table_id)?;
+                return self
+                    .inner
+                    .adjacency_neighbor_cursor(txn, snapshot, phys_id, node_id, outgoing);
+            }
+
+            let mut cursors = Vec::with_capacity(info.physical_ids.len());
+            for &phys_id in &info.physical_ids {
+                let cursor = self
+                    .inner
+                    .adjacency_neighbor_cursor(txn, snapshot, phys_id, node_id, outgoing)?;
+                cursors.push(cursor);
+            }
+            Ok(Box::new(ChainedCursor::new(cursors)))
+        } else {
+            self.inner
+                .adjacency_neighbor_cursor(txn, snapshot, edge_table_id, node_id, outgoing)
+        }
+    }
+
+    fn adjacency_edge_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<TupleId> + '_>> {
+        if let Some(info) = self.shard_info(edge_table_id)? {
+            if let GraphShardRoute::Single(shard_id) =
+                graph_adjacency_route(&info, node_id, outgoing)?
+            {
+                let phys_id = physical_shard_id(&info, shard_id, edge_table_id)?;
+                let cursor = self
+                    .inner
+                    .adjacency_edge_cursor(txn, snapshot, phys_id, node_id, outgoing)?;
+                return Ok(Box::new(EncodedShardTupleCursor::new(shard_id, cursor)?));
+            }
+
+            let mut cursors: Vec<Box<dyn NeighborCursor<TupleId> + '_>> =
+                Vec::with_capacity(info.physical_ids.len());
+            for (shard_idx, &phys_id) in info.physical_ids.iter().enumerate() {
+                let shard_idx = u32::try_from(shard_idx)
+                    .map_err(|_| DbError::internal("shard index exceeds u32"))?;
+                let cursor = self
+                    .inner
+                    .adjacency_edge_cursor(txn, snapshot, phys_id, node_id, outgoing)?;
+                cursors.push(Box::new(EncodedShardTupleCursor::new(shard_idx, cursor)?));
+            }
+            Ok(Box::new(ChainedCursor::new(cursors)))
+        } else {
+            self.inner
+                .adjacency_edge_cursor(txn, snapshot, edge_table_id, node_id, outgoing)
+        }
+    }
+
+    fn adjacency_edges(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+    ) -> DbResult<Vec<(TupleId, Value, Value)>> {
+        if let Some(info) = self.shard_info(edge_table_id)? {
+            let mut results = Vec::new();
+            for (shard_idx, &phys_id) in info.physical_ids.iter().enumerate() {
+                let shard_idx = u32::try_from(shard_idx)
+                    .map_err(|_| DbError::internal("shard index exceeds u32"))?;
+                let shard_edges = self.inner.adjacency_edges(txn, snapshot, phys_id)?;
+                for (local_tid, source_id, target_id) in shard_edges {
+                    results.push((
+                        try_encode_shard_tuple_id(shard_idx, local_tid)?,
+                        source_id,
+                        target_id,
+                    ));
+                }
+            }
+            Ok(results)
+        } else {
+            self.inner.adjacency_edges(txn, snapshot, edge_table_id)
+        }
+    }
+
+    fn adjacency_weighted_edges(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        weight_column: ColumnId,
+    ) -> DbResult<Vec<(TupleId, Value, Value, Value)>> {
+        if let Some(info) = self.shard_info(edge_table_id)? {
+            let mut results = Vec::new();
+            for (shard_idx, &phys_id) in info.physical_ids.iter().enumerate() {
+                let shard_idx = u32::try_from(shard_idx)
+                    .map_err(|_| DbError::internal("shard index exceeds u32"))?;
+                let shard_edges =
+                    self.inner
+                        .adjacency_weighted_edges(txn, snapshot, phys_id, weight_column)?;
+                for (local_tid, source_id, target_id, weight) in shard_edges {
+                    results.push((
+                        try_encode_shard_tuple_id(shard_idx, local_tid)?,
+                        source_id,
+                        target_id,
+                        weight,
+                    ));
+                }
+            }
+            Ok(results)
+        } else {
+            self.inner
+                .adjacency_weighted_edges(txn, snapshot, edge_table_id, weight_column)
+        }
+    }
+
+    fn adjacency_edge_endpoints(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        edge_tuple_id: TupleId,
+    ) -> DbResult<Option<(Value, Value)>> {
+        if let Some(info) = self.shard_info(edge_table_id)? {
+            let (shard_idx, local_tid) = decode_shard_tuple_id(edge_tuple_id);
+            let phys_id = physical_shard_id(&info, shard_idx, edge_table_id)?;
+            self.inner
+                .adjacency_edge_endpoints(txn, snapshot, phys_id, local_tid)
+        } else {
+            self.inner
+                .adjacency_edge_endpoints(txn, snapshot, edge_table_id, edge_tuple_id)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -961,8 +1214,261 @@ fn physical_shard_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aiondb_core::{ColumnId, DataType, RelationId, Value};
-    use aiondb_storage_api::{ShardHashFunction, StorageColumn, StorageShardConfig};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use aiondb_core::{ColumnId, DataType, RelationId, Row, TupleId, TxnId, Value};
+    use aiondb_graph_api::{NeighborCursor, OwnedCursor};
+    use aiondb_storage_api::{
+        CheckpointInfo, ShardHashFunction, StorageColumn, StorageDDL, StorageDML,
+        StorageShardConfig, StorageTxnParticipant, TableStorageDescriptor, TupleStream,
+    };
+    use aiondb_tx::{IsolationLevel, Snapshot};
+
+    struct MockStorage {
+        tables: Mutex<HashMap<RelationId, Vec<(TupleId, Row)>>>,
+        edge_endpoints: Mutex<HashMap<RelationId, (usize, usize)>>,
+        next_tuple_id: Mutex<u64>,
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                tables: Mutex::new(HashMap::new()),
+                edge_endpoints: Mutex::new(HashMap::new()),
+                next_tuple_id: Mutex::new(1),
+            }
+        }
+    }
+
+    impl StorageDDL for MockStorage {
+        fn create_table_storage(
+            &self,
+            _txn: TxnId,
+            table: &TableStorageDescriptor,
+        ) -> DbResult<()> {
+            self.tables
+                .lock()
+                .unwrap()
+                .insert(table.table_id, Vec::new());
+            Ok(())
+        }
+
+        fn create_index_storage(
+            &self,
+            _txn: TxnId,
+            _index: &aiondb_storage_api::IndexStorageDescriptor,
+        ) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn alter_table_storage(
+            &self,
+            _txn: TxnId,
+            _table: &TableStorageDescriptor,
+        ) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn drop_table_storage(&self, _txn: TxnId, table_id: RelationId) -> DbResult<()> {
+            self.tables.lock().unwrap().remove(&table_id);
+            Ok(())
+        }
+
+        fn drop_index_storage(&self, _txn: TxnId, _index_id: IndexId) -> DbResult<()> {
+            Ok(())
+        }
+    }
+
+    impl StorageDML for MockStorage {
+        fn scan_table(
+            &self,
+            _txn: TxnId,
+            _snapshot: &Snapshot,
+            _table_id: RelationId,
+            _projected_columns: Option<Vec<ColumnId>>,
+        ) -> DbResult<Box<dyn TupleStream>> {
+            Ok(Box::new(
+                aiondb_storage_api::VecTupleStream::new(Vec::new()),
+            ))
+        }
+
+        fn scan_index(
+            &self,
+            _txn: TxnId,
+            _snapshot: &Snapshot,
+            _index_id: IndexId,
+            _key_range: KeyRange,
+            _projected_columns: Option<Vec<ColumnId>>,
+        ) -> DbResult<Box<dyn TupleStream>> {
+            Ok(Box::new(
+                aiondb_storage_api::VecTupleStream::new(Vec::new()),
+            ))
+        }
+
+        fn fetch(
+            &self,
+            _txn: TxnId,
+            _snapshot: &Snapshot,
+            table_id: RelationId,
+            tuple_id: TupleId,
+            _projected_columns: Option<Vec<ColumnId>>,
+        ) -> DbResult<Option<Row>> {
+            Ok(self
+                .tables
+                .lock()
+                .unwrap()
+                .get(&table_id)
+                .and_then(|rows| rows.iter().find(|(tid, _)| *tid == tuple_id))
+                .map(|(_, row)| row.clone()))
+        }
+
+        fn insert(&self, _txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId> {
+            let mut next_tuple_id = self.next_tuple_id.lock().unwrap();
+            let tuple_id = TupleId::new(*next_tuple_id);
+            *next_tuple_id += 1;
+            self.tables
+                .lock()
+                .unwrap()
+                .entry(table_id)
+                .or_default()
+                .push((tuple_id, row));
+            Ok(tuple_id)
+        }
+
+        fn update(
+            &self,
+            _txn: TxnId,
+            _table_id: RelationId,
+            tuple_id: TupleId,
+            _row: Row,
+        ) -> DbResult<TupleId> {
+            Ok(tuple_id)
+        }
+
+        fn delete(&self, _txn: TxnId, _table_id: RelationId, _tuple_id: TupleId) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn vacuum_table(&self, _table_id: RelationId) -> DbResult<u64> {
+            Ok(0)
+        }
+
+        fn register_edge_table(
+            &self,
+            table_id: RelationId,
+            source_col_idx: usize,
+            target_col_idx: usize,
+        ) {
+            self.edge_endpoints
+                .lock()
+                .unwrap()
+                .insert(table_id, (source_col_idx, target_col_idx));
+        }
+
+        fn adjacency_neighbor_cursor(
+            &self,
+            _txn: TxnId,
+            _snapshot: &Snapshot,
+            edge_table_id: RelationId,
+            node_id: &Value,
+            outgoing: bool,
+        ) -> DbResult<Box<dyn NeighborCursor<Value> + '_>> {
+            let endpoints = self.edge_endpoints.lock().unwrap();
+            let Some(&(source_col_idx, target_col_idx)) = endpoints.get(&edge_table_id) else {
+                return Err(DbError::feature_not_supported(
+                    "adjacency cursor unavailable for unregistered edge table",
+                ));
+            };
+            drop(endpoints);
+            let rows = self.tables.lock().unwrap();
+            let neighbors = rows
+                .get(&edge_table_id)
+                .into_iter()
+                .flat_map(|rows| rows.iter())
+                .filter_map(|(_, row)| {
+                    let source = row.values.get(source_col_idx)?;
+                    let target = row.values.get(target_col_idx)?;
+                    if outgoing {
+                        (source == node_id).then(|| target.clone())
+                    } else {
+                        (target == node_id).then(|| source.clone())
+                    }
+                })
+                .collect();
+            Ok(Box::new(OwnedCursor::new(neighbors)))
+        }
+
+        fn adjacency_edge_cursor(
+            &self,
+            _txn: TxnId,
+            _snapshot: &Snapshot,
+            edge_table_id: RelationId,
+            node_id: &Value,
+            outgoing: bool,
+        ) -> DbResult<Box<dyn NeighborCursor<TupleId> + '_>> {
+            let endpoints = self.edge_endpoints.lock().unwrap();
+            let Some(&(source_col_idx, target_col_idx)) = endpoints.get(&edge_table_id) else {
+                return Err(DbError::feature_not_supported(
+                    "adjacency cursor unavailable for unregistered edge table",
+                ));
+            };
+            drop(endpoints);
+            let rows = self.tables.lock().unwrap();
+            let edge_ids = rows
+                .get(&edge_table_id)
+                .into_iter()
+                .flat_map(|rows| rows.iter())
+                .filter_map(|(tuple_id, row)| {
+                    let source = row.values.get(source_col_idx)?;
+                    let target = row.values.get(target_col_idx)?;
+                    if outgoing {
+                        (source == node_id).then_some(*tuple_id)
+                    } else {
+                        (target == node_id).then_some(*tuple_id)
+                    }
+                })
+                .collect();
+            Ok(Box::new(OwnedCursor::new(edge_ids)))
+        }
+    }
+
+    impl StorageTxnParticipant for MockStorage {
+        fn begin_txn(&self, _txn: TxnId, _isolation: IsolationLevel) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn validate_commit_txn(&self, _txn: TxnId) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn commit_txn(&self, _txn: TxnId, _commit_ts: u64) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn rollback_txn(&self, _txn: TxnId) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> DbResult<CheckpointInfo> {
+            Ok(CheckpointInfo {
+                checkpoint_lsn: 0,
+                dirty_pages_flushed: 0,
+            })
+        }
+
+        fn create_savepoint(&self, _txn: TxnId) -> DbResult<u64> {
+            Ok(1)
+        }
+
+        fn rollback_to_savepoint(&self, _txn: TxnId, _savepoint_id: u64) -> DbResult<()> {
+            Ok(())
+        }
+
+        fn release_savepoint(&self, _txn: TxnId, _savepoint_id: u64) -> DbResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn shard_index_deterministic() {
@@ -1230,5 +1736,301 @@ mod tests {
             graph_adjacency_route(&info, &Value::Text("alice".to_owned()), false).unwrap(),
             GraphShardRoute::FanOut
         );
+    }
+
+    #[test]
+    fn adjacency_neighbor_cursor_routes_outgoing_single_shard() {
+        let inner = Arc::new(MockStorage::new());
+        let storage = ShardedStorage::new(inner, 10_000);
+        let logical_table_id = RelationId::new(500);
+        let descriptor = TableStorageDescriptor {
+            table_id: logical_table_id,
+            columns: vec![
+                StorageColumn {
+                    column_id: ColumnId::new(1),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                StorageColumn {
+                    column_id: ColumnId::new(2),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+            ],
+            primary_key: None,
+            shard_config: Some(StorageShardConfig {
+                shard_key_columns: vec![ColumnId::new(1)],
+                shard_count: 4,
+                hash_function: ShardHashFunction::Sha256,
+                virtual_nodes_per_shard: 64,
+            }),
+        };
+
+        StorageDDL::create_table_storage(&storage, TxnId::default(), &descriptor)
+            .expect("create sharded edge table");
+        StorageDML::register_edge_table(&storage, logical_table_id, 0, 1);
+        StorageDML::insert(
+            &storage,
+            TxnId::default(),
+            logical_table_id,
+            Row::new(vec![Value::Int(7), Value::Int(9)]),
+        )
+        .expect("insert routed edge row");
+
+        let mut cursor = StorageDML::adjacency_neighbor_cursor(
+            &storage,
+            TxnId::default(),
+            &Snapshot::new(TxnId::default(), TxnId::default(), Vec::new()),
+            logical_table_id,
+            &Value::Int(7),
+            true,
+        )
+        .expect("adjacency cursor");
+
+        assert_eq!(cursor.remaining_hint(), 1);
+        assert_eq!(cursor.next_neighbor(), Some(Value::Int(9)));
+        assert_eq!(cursor.next_neighbor(), None);
+    }
+
+    #[test]
+    fn adjacency_edge_cursor_routes_outgoing_single_shard() {
+        let inner = Arc::new(MockStorage::new());
+        let storage = ShardedStorage::new(inner, 10_000);
+        let logical_table_id = RelationId::new(550);
+        let descriptor = TableStorageDescriptor {
+            table_id: logical_table_id,
+            columns: vec![
+                StorageColumn {
+                    column_id: ColumnId::new(1),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                StorageColumn {
+                    column_id: ColumnId::new(2),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+            ],
+            primary_key: None,
+            shard_config: Some(StorageShardConfig {
+                shard_key_columns: vec![ColumnId::new(1)],
+                shard_count: 4,
+                hash_function: ShardHashFunction::Sha256,
+                virtual_nodes_per_shard: 64,
+            }),
+        };
+
+        StorageDDL::create_table_storage(&storage, TxnId::default(), &descriptor)
+            .expect("create sharded edge table");
+        StorageDML::register_edge_table(&storage, logical_table_id, 0, 1);
+        let edge_row = Row::new(vec![Value::Int(7), Value::Int(9)]);
+        let expected_shard = compute_shard_index(&edge_row, &[0], 4).expect("expected shard");
+        StorageDML::insert(&storage, TxnId::default(), logical_table_id, edge_row)
+            .expect("insert routed edge row");
+
+        let mut cursor = StorageDML::adjacency_edge_cursor(
+            &storage,
+            TxnId::default(),
+            &Snapshot::new(TxnId::default(), TxnId::default(), Vec::new()),
+            logical_table_id,
+            &Value::Int(7),
+            true,
+        )
+        .expect("adjacency edge cursor");
+
+        assert_eq!(cursor.remaining_hint(), 1);
+        let encoded_tid = cursor.next_neighbor().expect("encoded shard tuple id");
+        let (shard_idx, local_tid) = decode_shard_tuple_id(encoded_tid);
+        assert_eq!(shard_idx, expected_shard);
+        assert!(local_tid.get() > 0);
+        assert_eq!(cursor.next_neighbor(), None);
+    }
+
+    #[test]
+    fn adjacency_neighbor_cursor_fanout_chains_shard_cursors() {
+        let inner = Arc::new(MockStorage::new());
+        let storage = ShardedStorage::new(inner, 20_000);
+        let logical_table_id = RelationId::new(600);
+        let descriptor = TableStorageDescriptor {
+            table_id: logical_table_id,
+            columns: vec![
+                StorageColumn {
+                    column_id: ColumnId::new(1),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                StorageColumn {
+                    column_id: ColumnId::new(2),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+            ],
+            primary_key: None,
+            shard_config: Some(StorageShardConfig {
+                shard_key_columns: vec![ColumnId::new(1)],
+                shard_count: 4,
+                hash_function: ShardHashFunction::Sha256,
+                virtual_nodes_per_shard: 64,
+            }),
+        };
+
+        StorageDDL::create_table_storage(&storage, TxnId::default(), &descriptor)
+            .expect("create sharded edge table");
+        StorageDML::register_edge_table(&storage, logical_table_id, 0, 1);
+
+        let mut source_a = 1i32;
+        let mut source_b = 2i32;
+        let mut shard_a = 0u32;
+        let mut shard_b = 0u32;
+        'search: for left in 1..128 {
+            for right in (left + 1)..128 {
+                let left_row = Row::new(vec![Value::Int(left), Value::Int(9)]);
+                let right_row = Row::new(vec![Value::Int(right), Value::Int(9)]);
+                let left_shard = compute_shard_index(&left_row, &[0], 4).expect("left shard");
+                let right_shard = compute_shard_index(&right_row, &[0], 4).expect("right shard");
+                if left_shard != right_shard {
+                    source_a = left;
+                    source_b = right;
+                    shard_a = left_shard;
+                    shard_b = right_shard;
+                    break 'search;
+                }
+            }
+        }
+        assert_ne!(
+            shard_a, shard_b,
+            "expected distinct shards for fan-out test"
+        );
+
+        StorageDML::insert(
+            &storage,
+            TxnId::default(),
+            logical_table_id,
+            Row::new(vec![Value::Int(source_a), Value::Int(9)]),
+        )
+        .expect("insert first routed edge row");
+        StorageDML::insert(
+            &storage,
+            TxnId::default(),
+            logical_table_id,
+            Row::new(vec![Value::Int(source_b), Value::Int(9)]),
+        )
+        .expect("insert second routed edge row");
+
+        let mut cursor = StorageDML::adjacency_neighbor_cursor(
+            &storage,
+            TxnId::default(),
+            &Snapshot::new(TxnId::default(), TxnId::default(), Vec::new()),
+            logical_table_id,
+            &Value::Int(9),
+            false,
+        )
+        .expect("fan-out adjacency cursor");
+
+        let mut neighbors = Vec::new();
+        assert_eq!(cursor.remaining_hint(), 2);
+        while let Some(value) = cursor.next_neighbor() {
+            neighbors.push(value);
+        }
+        neighbors.sort_by_key(|value| match value {
+            Value::Int(value) => *value,
+            other => panic!("expected int neighbor, got {other:?}"),
+        });
+        assert_eq!(neighbors, vec![Value::Int(source_a), Value::Int(source_b)]);
+    }
+
+    #[test]
+    fn adjacency_edge_cursor_fanout_chains_shard_cursors() {
+        let inner = Arc::new(MockStorage::new());
+        let storage = ShardedStorage::new(inner, 20_000);
+        let logical_table_id = RelationId::new(650);
+        let descriptor = TableStorageDescriptor {
+            table_id: logical_table_id,
+            columns: vec![
+                StorageColumn {
+                    column_id: ColumnId::new(1),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+                StorageColumn {
+                    column_id: ColumnId::new(2),
+                    data_type: DataType::Int,
+                    nullable: false,
+                },
+            ],
+            primary_key: None,
+            shard_config: Some(StorageShardConfig {
+                shard_key_columns: vec![ColumnId::new(1)],
+                shard_count: 4,
+                hash_function: ShardHashFunction::Sha256,
+                virtual_nodes_per_shard: 64,
+            }),
+        };
+
+        StorageDDL::create_table_storage(&storage, TxnId::default(), &descriptor)
+            .expect("create sharded edge table");
+        StorageDML::register_edge_table(&storage, logical_table_id, 0, 1);
+
+        let mut source_a = 1i32;
+        let mut source_b = 2i32;
+        let mut shard_a = 0u32;
+        let mut shard_b = 0u32;
+        'search: for left in 1..128 {
+            for right in (left + 1)..128 {
+                let left_row = Row::new(vec![Value::Int(left), Value::Int(9)]);
+                let right_row = Row::new(vec![Value::Int(right), Value::Int(9)]);
+                let left_shard = compute_shard_index(&left_row, &[0], 4).expect("left shard");
+                let right_shard = compute_shard_index(&right_row, &[0], 4).expect("right shard");
+                if left_shard != right_shard {
+                    source_a = left;
+                    source_b = right;
+                    shard_a = left_shard;
+                    shard_b = right_shard;
+                    break 'search;
+                }
+            }
+        }
+        assert_ne!(
+            shard_a, shard_b,
+            "expected distinct shards for fan-out test"
+        );
+
+        StorageDML::insert(
+            &storage,
+            TxnId::default(),
+            logical_table_id,
+            Row::new(vec![Value::Int(source_a), Value::Int(9)]),
+        )
+        .expect("insert first routed edge row");
+        StorageDML::insert(
+            &storage,
+            TxnId::default(),
+            logical_table_id,
+            Row::new(vec![Value::Int(source_b), Value::Int(9)]),
+        )
+        .expect("insert second routed edge row");
+
+        let mut cursor = StorageDML::adjacency_edge_cursor(
+            &storage,
+            TxnId::default(),
+            &Snapshot::new(TxnId::default(), TxnId::default(), Vec::new()),
+            logical_table_id,
+            &Value::Int(9),
+            false,
+        )
+        .expect("fan-out adjacency edge cursor");
+
+        assert_eq!(cursor.remaining_hint(), 2);
+        let mut shard_ids = Vec::new();
+        let mut local_tids = Vec::new();
+        while let Some(encoded_tid) = cursor.next_neighbor() {
+            let (shard_idx, local_tid) = decode_shard_tuple_id(encoded_tid);
+            shard_ids.push(shard_idx);
+            local_tids.push(local_tid.get());
+        }
+        shard_ids.sort_unstable();
+        local_tids.sort_unstable();
+        assert_eq!(shard_ids, vec![shard_a, shard_b]);
+        assert!(local_tids.into_iter().all(|tid| tid > 0));
     }
 }

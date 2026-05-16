@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 aiondb-core = { path = "../aiondb-core" }
+aiondb-graph-api = { path = "../aiondb-graph-api" }
 aiondb-tx = { path = "../aiondb-tx" }
 serde_json = { workspace = true }
 

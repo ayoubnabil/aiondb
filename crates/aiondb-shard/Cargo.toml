@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 aiondb-core = { path = "../aiondb-core" }
+aiondb-graph-api = { path = "../aiondb-graph-api" }
 aiondb-storage-api = { path = "../aiondb-storage-api" }
 aiondb-tx = { path = "../aiondb-tx" }
 async-trait = "0.1"

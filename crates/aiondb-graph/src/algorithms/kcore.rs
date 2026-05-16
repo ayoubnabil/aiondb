@@ -6,7 +6,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::{u32_to_usize, GraphView};
+use super::{u32_to_usize, GraphViewV2Ext};
+use aiondb_graph_api::GraphViewV2;
 
 /// Compute the core number of every node.
 ///
@@ -15,12 +16,12 @@ use super::{u32_to_usize, GraphView};
 ///
 /// The implementation uses lazy heap updates and runs in `O((V + E) log V)`.
 #[must_use]
-pub fn core_numbers(graph: &impl GraphView) -> Vec<u32> {
+pub fn core_numbers<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<u32> {
     let n = u32_to_usize(graph.node_count());
     let mut degrees = vec![0u32; n];
     let mut heap = BinaryHeap::new();
 
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         let degree = graph.degree(node);
         degrees[u32_to_usize(node)] = degree;
         heap.push(Reverse((degree, node)));
@@ -40,7 +41,7 @@ pub fn core_numbers(graph: &impl GraphView) -> Vec<u32> {
         current_core = current_core.max(degree);
         cores[node_idx] = current_core;
 
-        for &neighbor in graph.neighbors(node) {
+        for &neighbor in graph.out_neighbors(node) {
             let neighbor_idx = u32_to_usize(neighbor);
             if removed.get(neighbor_idx).copied().unwrap_or(true) {
                 continue;
@@ -57,7 +58,7 @@ pub fn core_numbers(graph: &impl GraphView) -> Vec<u32> {
 
 /// Return the graph degeneracy, which is the maximum core number.
 #[must_use]
-pub fn degeneracy(graph: &impl GraphView) -> u32 {
+pub fn degeneracy<G: GraphViewV2 + ?Sized>(graph: &G) -> u32 {
     core_numbers(graph).into_iter().max().unwrap_or(0)
 }
 

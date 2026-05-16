@@ -37,6 +37,11 @@ pub mod planner;
 pub mod traversal;
 
 // Re-export primary public types.
+pub use aiondb_graph_api::{
+    GraphDirection, GraphProjection, GraphProjectionAdapter, GraphStats, GraphStorage, GraphViewV2,
+    HybridGraphPlan, HybridGraphSource, NeighborCursor, OwnedCursor, ProjectionSnapshot,
+    RefreshPolicy, SliceCursor, WeightedNeighbor,
+};
 pub use edge::EdgeDescriptor;
 pub use model::GraphLabelDescriptor;
 pub use node::NodeDescriptor;

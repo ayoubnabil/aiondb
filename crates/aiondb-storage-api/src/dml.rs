@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use aiondb_core::{ColumnId, DbError, DbResult, IndexId, RelationId, Row, TupleId, TxnId, Value};
+use aiondb_graph_api::{GraphStats, NeighborCursor, OwnedCursor};
 use aiondb_tx::Snapshot;
 
 use crate::{KeyRange, TupleStream};
@@ -34,6 +35,35 @@ pub trait StorageDML: Send + Sync {
     /// caches without observing stale rows after writes.
     fn cache_generation(&self) -> Option<u64> {
         None
+    }
+
+    /// Load a backend-persisted graph projection cache blob for the given
+    /// namespace/key/generation triple.
+    ///
+    /// The default implementation returns `Ok(None)`, meaning the backend
+    /// does not provide durable projection cache storage.
+    fn graph_projection_cache_get(
+        &self,
+        _namespace: &str,
+        _cache_key: &str,
+        _generation: u64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Persist a graph projection cache blob for the given
+    /// namespace/key/generation triple.
+    ///
+    /// The default implementation is a no-op so non-durable backends can
+    /// ignore projection persistence without affecting semantics.
+    fn graph_projection_cache_put(
+        &self,
+        _namespace: &str,
+        _cache_key: &str,
+        _generation: u64,
+        _payload: &[u8],
+    ) -> DbResult<()> {
+        Ok(())
     }
 
     /// Apply one WAL entry shipped from a replication primary to this
@@ -489,6 +519,29 @@ pub trait StorageDML: Send + Sync {
         projected_columns: Option<Vec<ColumnId>>,
     ) -> DbResult<Option<Row>>;
 
+    /// Fetch a single row by tuple id using a borrowed projection slice.
+    ///
+    /// Default implementation preserves semantics by cloning the slice into
+    /// the owned [`Self::fetch`] shape. Backends should override this when
+    /// they can consume borrowed projections directly to avoid per-call
+    /// allocation on hot paths.
+    fn fetch_ref(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        table_id: RelationId,
+        tuple_id: TupleId,
+        projected_columns: Option<&[ColumnId]>,
+    ) -> DbResult<Option<Row>> {
+        self.fetch(
+            txn,
+            snapshot,
+            table_id,
+            tuple_id,
+            projected_columns.map(<[ColumnId]>::to_vec),
+        )
+    }
+
     /// Insert a row into a table. **Required.**
     fn insert(&self, txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId>;
 
@@ -665,6 +718,22 @@ pub trait StorageDML: Send + Sync {
         ))
     }
 
+    /// Look up adjacent edge tuple ids through a streaming cursor.
+    ///
+    /// The default implementation preserves semantics by materializing the
+    /// full tuple id vector through [`StorageDML::adjacency_lookup`].
+    fn adjacency_edge_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<TupleId> + '_>> {
+        let edge_ids = self.adjacency_lookup(txn, snapshot, edge_table_id, node_id, outgoing)?;
+        Ok(Box::new(OwnedCursor::new(edge_ids)))
+    }
+
     /// Look up adjacent node IDs directly from the adjacency index.
     ///
     /// This is the value-level companion to [`StorageDML::adjacency_lookup`].
@@ -681,6 +750,81 @@ pub trait StorageDML: Send + Sync {
         Err(DbError::feature_not_supported(
             "adjacency neighbor lookup is not supported by this storage backend",
         ))
+    }
+
+    /// Look up adjacent node IDs through a streaming cursor.
+    ///
+    /// The default implementation preserves semantics by materializing the
+    /// full neighbor vector through [`StorageDML::adjacency_neighbors`].
+    fn adjacency_neighbor_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn NeighborCursor<Value> + '_>> {
+        let neighbors =
+            self.adjacency_neighbors(txn, snapshot, edge_table_id, node_id, outgoing)?;
+        Ok(Box::new(OwnedCursor::new(neighbors)))
+    }
+
+    /// Enumerate edge endpoints directly from the adjacency store.
+    ///
+    /// Returns `(edge_tuple_id, source_id, target_id)` triples for the edge
+    /// table when the backend maintains a native adjacency index.
+    fn adjacency_edges(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        _edge_table_id: RelationId,
+    ) -> DbResult<Vec<(TupleId, Value, Value)>> {
+        Err(DbError::feature_not_supported(
+            "adjacency edge enumeration is not supported by this storage backend",
+        ))
+    }
+
+    /// Enumerate weighted edge endpoints directly from the adjacency store.
+    ///
+    /// Returns `(edge_tuple_id, source_id, target_id, weight)` tuples for the
+    /// edge table when the backend can combine native adjacency enumeration
+    /// with direct access to the requested weight column.
+    fn adjacency_weighted_edges(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        _edge_table_id: RelationId,
+        _weight_column: ColumnId,
+    ) -> DbResult<Vec<(TupleId, Value, Value, Value)>> {
+        Err(DbError::feature_not_supported(
+            "adjacency weighted edge enumeration is not supported by this storage backend",
+        ))
+    }
+
+    /// Look up the `(source_id, target_id)` endpoints for one edge tuple
+    /// directly from the native adjacency store.
+    fn adjacency_edge_endpoints(
+        &self,
+        _txn: TxnId,
+        _snapshot: &Snapshot,
+        _edge_table_id: RelationId,
+        _edge_tuple_id: TupleId,
+    ) -> DbResult<Option<(Value, Value)>> {
+        Err(DbError::feature_not_supported(
+            "adjacency edge endpoint lookup is not supported by this storage backend",
+        ))
+    }
+
+    /// Return whether the storage backend maintains a native adjacency index
+    /// for the table, even if that index is currently empty.
+    fn adjacency_index_available(&self, _txn: TxnId, _edge_table_id: RelationId) -> bool {
+        false
+    }
+
+    /// Return planner/runtime stats for a native adjacency index when
+    /// available. Backends without adjacency indexes return `None`.
+    fn adjacency_index_stats(&self, _txn: TxnId, _edge_table_id: RelationId) -> Option<GraphStats> {
+        None
     }
 
     /// Return whether the adjacency index currently contains any edges for

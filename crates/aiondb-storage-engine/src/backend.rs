@@ -907,6 +907,27 @@ impl StorageDML for StorageBackendHandle {
         self.inner().cache_generation()
     }
 
+    fn graph_projection_cache_get(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+    ) -> DbResult<Option<Vec<u8>>> {
+        self.inner()
+            .graph_projection_cache_get(namespace, cache_key, generation)
+    }
+
+    fn graph_projection_cache_put(
+        &self,
+        namespace: &str,
+        cache_key: &str,
+        generation: u64,
+        payload: &[u8],
+    ) -> DbResult<()> {
+        self.inner()
+            .graph_projection_cache_put(namespace, cache_key, generation, payload)
+    }
+
     fn apply_replicated_wal_entry(&self, record_bytes: &[u8]) -> DbResult<()> {
         let (entry, _consumed) = aiondb_wal::codec::decode_entry(record_bytes)?;
         self.inner().apply_replicated_wal_entry(&entry)
@@ -1218,6 +1239,18 @@ impl StorageDML for StorageBackendHandle {
             .fetch(txn, snapshot, table_id, tuple_id, projected_columns)
     }
 
+    fn fetch_ref(
+        &self,
+        txn: TxnId,
+        snapshot: &Snapshot,
+        table_id: RelationId,
+        tuple_id: TupleId,
+        projected_columns: Option<&[ColumnId]>,
+    ) -> DbResult<Option<Row>> {
+        self.inner()
+            .fetch_ref(txn, snapshot, table_id, tuple_id, projected_columns)
+    }
+
     fn insert(&self, txn: TxnId, table_id: RelationId, row: Row) -> DbResult<TupleId> {
         self.inner().insert(txn, table_id, row)
     }
@@ -1327,6 +1360,22 @@ impl StorageDML for StorageBackendHandle {
         StorageDML::unregister_edge_table(self.inner(), table_id);
     }
 
+    fn adjacency_index_available(&self, txn: TxnId, edge_table_id: RelationId) -> bool {
+        StorageDML::adjacency_index_available(self.inner(), txn, edge_table_id)
+    }
+
+    fn adjacency_index_stats(
+        &self,
+        txn: TxnId,
+        edge_table_id: RelationId,
+    ) -> Option<aiondb_graph_api::GraphStats> {
+        StorageDML::adjacency_index_stats(self.inner(), txn, edge_table_id)
+    }
+
+    fn adjacency_index_has_edges(&self, txn: TxnId, edge_table_id: RelationId) -> bool {
+        StorageDML::adjacency_index_has_edges(self.inner(), txn, edge_table_id)
+    }
+
     fn adjacency_lookup(
         &self,
         txn: TxnId,
@@ -1336,6 +1385,24 @@ impl StorageDML for StorageBackendHandle {
         outgoing: bool,
     ) -> DbResult<Vec<TupleId>> {
         StorageDML::adjacency_lookup(
+            self.inner(),
+            txn,
+            snapshot,
+            edge_table_id,
+            node_id,
+            outgoing,
+        )
+    }
+
+    fn adjacency_edge_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn aiondb_graph_api::NeighborCursor<TupleId> + '_>> {
+        StorageDML::adjacency_edge_cursor(
             self.inner(),
             txn,
             snapshot,
@@ -1360,6 +1427,65 @@ impl StorageDML for StorageBackendHandle {
             edge_table_id,
             node_id,
             outgoing,
+        )
+    }
+
+    fn adjacency_neighbor_cursor(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        node_id: &Value,
+        outgoing: bool,
+    ) -> DbResult<Box<dyn aiondb_graph_api::NeighborCursor<Value> + '_>> {
+        StorageDML::adjacency_neighbor_cursor(
+            self.inner(),
+            txn,
+            snapshot,
+            edge_table_id,
+            node_id,
+            outgoing,
+        )
+    }
+
+    fn adjacency_edges(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+    ) -> DbResult<Vec<(TupleId, Value, Value)>> {
+        StorageDML::adjacency_edges(self.inner(), txn, snapshot, edge_table_id)
+    }
+
+    fn adjacency_weighted_edges(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        weight_column: ColumnId,
+    ) -> DbResult<Vec<(TupleId, Value, Value, Value)>> {
+        StorageDML::adjacency_weighted_edges(
+            self.inner(),
+            txn,
+            snapshot,
+            edge_table_id,
+            weight_column,
+        )
+    }
+
+    fn adjacency_edge_endpoints(
+        &self,
+        txn: TxnId,
+        snapshot: &aiondb_tx::Snapshot,
+        edge_table_id: RelationId,
+        edge_tuple_id: TupleId,
+    ) -> DbResult<Option<(Value, Value)>> {
+        StorageDML::adjacency_edge_endpoints(
+            self.inner(),
+            txn,
+            snapshot,
+            edge_table_id,
+            edge_tuple_id,
         )
     }
 }

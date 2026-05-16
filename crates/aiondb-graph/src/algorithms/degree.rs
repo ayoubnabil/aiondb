@@ -18,7 +18,9 @@
 //! lookups). `degree_distribution` runs in `O(V + D_max)` where `D_max` is the
 //! maximum degree.
 
-use super::{u32_to_usize, usize_to_u32, GraphView};
+use super::{u32_to_usize, usize_to_u32};
+use crate::algorithms::WeightedCsrGraph;
+use aiondb_graph_api::GraphViewV2;
 
 #[inline]
 fn usize_to_f64(value: usize) -> f64 {
@@ -45,7 +47,7 @@ fn usize_to_f64(value: usize) -> f64 {
 ///
 /// A `Vec<f64>` of length `graph.node_count()` with values in [0, 1].
 /// For graphs with fewer than 2 nodes the result is all zeros.
-pub fn degree_centrality(graph: &impl GraphView) -> Vec<f64> {
+pub fn degree_centrality<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     let n = u32_to_usize(graph.node_count());
     if n <= 1 {
         return vec![0.0; n];
@@ -53,7 +55,7 @@ pub fn degree_centrality(graph: &impl GraphView) -> Vec<f64> {
 
     let denom = usize_to_f64(n.saturating_sub(1));
     let mut result = vec![0.0_f64; n];
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         result[u32_to_usize(node)] = f64::from(graph.degree(node)) / denom;
     }
     result
@@ -80,8 +82,8 @@ pub fn degree_centrality(graph: &impl GraphView) -> Vec<f64> {
 ///
 /// A `Vec<f64>` of length `graph.node_count()` with values in [0, 1].
 /// For graphs with fewer than 2 nodes the result is all zeros.
-pub fn in_degree_centrality<'a>(
-    graph: &impl GraphView,
+pub fn in_degree_centrality<'a, G: GraphViewV2 + ?Sized>(
+    graph: &G,
     in_neighbors_fn: impl Fn(u32) -> &'a [u32],
 ) -> Vec<f64> {
     let n = u32_to_usize(graph.node_count());
@@ -91,7 +93,7 @@ pub fn in_degree_centrality<'a>(
 
     let denom = usize_to_f64(n.saturating_sub(1));
     let mut result = vec![0.0_f64; n];
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         let in_deg = in_neighbors_fn(node).len();
         result[u32_to_usize(node)] = usize_to_f64(in_deg) / denom;
     }
@@ -112,7 +114,7 @@ pub fn in_degree_centrality<'a>(
 ///
 /// A `Vec<f64>` of length `graph.node_count()` with values in [0, 1].
 /// For graphs with fewer than 2 nodes the result is all zeros.
-pub fn out_degree_centrality(graph: &impl GraphView) -> Vec<f64> {
+pub fn out_degree_centrality<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<f64> {
     let n = u32_to_usize(graph.node_count());
     if n <= 1 {
         return vec![0.0; n];
@@ -120,7 +122,7 @@ pub fn out_degree_centrality(graph: &impl GraphView) -> Vec<f64> {
 
     let denom = usize_to_f64(n.saturating_sub(1));
     let mut result = vec![0.0_f64; n];
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         result[u32_to_usize(node)] = f64::from(graph.degree(node)) / denom;
     }
     result
@@ -141,7 +143,7 @@ pub fn out_degree_centrality(graph: &impl GraphView) -> Vec<f64> {
 /// For a star graph with center connected to 3 leaves (undirected), the
 /// distribution would be `[(1, 3), (3, 1)]` -- three leaves with degree 1 and
 /// one center with degree 3.
-pub fn degree_distribution(graph: &impl GraphView) -> Vec<(u32, u32)> {
+pub fn degree_distribution<G: GraphViewV2 + ?Sized>(graph: &G) -> Vec<(u32, u32)> {
     let n = u32_to_usize(graph.node_count());
     if n == 0 {
         return Vec::new();
@@ -149,7 +151,7 @@ pub fn degree_distribution(graph: &impl GraphView) -> Vec<(u32, u32)> {
 
     // Find max degree so we can allocate a count array.
     let mut max_deg: u32 = 0;
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         let d = graph.degree(node);
         if d > max_deg {
             max_deg = d;
@@ -157,7 +159,7 @@ pub fn degree_distribution(graph: &impl GraphView) -> Vec<(u32, u32)> {
     }
 
     let mut counts = vec![0u32; u32_to_usize(max_deg).saturating_add(1)];
-    for node in graph.iter_nodes() {
+    for node in 0..graph.node_count() {
         counts[u32_to_usize(graph.degree(node))] += 1;
     }
 
@@ -166,6 +168,26 @@ pub fn degree_distribution(graph: &impl GraphView) -> Vec<(u32, u32)> {
         .enumerate()
         .filter(|&(_, count)| count > 0)
         .map(|(deg, count)| (usize_to_u32(deg), count))
+        .collect()
+}
+
+/// Weighted (out-)degree centrality: each node's score is the sum of its
+/// out-edge weights -- Neo4j's `gds.degree` with a
+/// `relationshipWeightProperty`. Negative weights are clamped to `0` (kept
+/// consistent with [`super::pagerank::weighted_pagerank`]).
+///
+/// Returns a `Vec<f64>` of length `graph.node_count()`.
+#[must_use]
+pub fn weighted_degree_centrality(graph: &WeightedCsrGraph) -> Vec<f64> {
+    let n = u32_to_usize(graph.node_count());
+    (0..n)
+        .map(|u| {
+            graph
+                .neighbors(usize_to_u32(u))
+                .iter()
+                .map(|edge| edge.weight.max(0.0))
+                .sum()
+        })
         .collect()
 }
 
@@ -565,5 +587,32 @@ mod tests {
         for &value in dc.iter().take(4) {
             assert!(approx_eq(value, 2.0 / 3.0));
         }
+    }
+    #[test]
+    fn weighted_degree_empty() {
+        assert!(
+            weighted_degree_centrality(&crate::algorithms::WeightedCsrGraph::from_edges(0, &[]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn weighted_degree_sums_out_edge_weights() {
+        let g = crate::algorithms::WeightedCsrGraph::from_edges(
+            3,
+            &[(0, 1, 2.0), (0, 2, 3.0), (1, 2, 5.0)],
+        );
+        let w = weighted_degree_centrality(&g);
+        assert!(approx_eq(w[0], 5.0));
+        assert!(approx_eq(w[1], 5.0));
+        assert!(approx_eq(w[2], 0.0));
+    }
+
+    #[test]
+    fn weighted_degree_clamps_negative_weights() {
+        let g = crate::algorithms::WeightedCsrGraph::from_edges(2, &[(0, 1, -4.0), (0, 1, 6.0)]);
+        let w = weighted_degree_centrality(&g);
+        assert!(approx_eq(w[0], 6.0));
+        assert!(approx_eq(w[1], 0.0));
     }
 }

@@ -5,10 +5,24 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# Skip the no-op libtest bench harness so `cargo bench` runs only the
+# Criterion suite below.
+bench = false
+
 [dependencies]
+aiondb-graph-api = { path = "../aiondb-graph-api" }
 aiondb-core = { path = "../aiondb-core" }
 aiondb-catalog = { path = "../aiondb-catalog" }
 rayon = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "algorithms"
+harness = false
 
 [lints]
 workspace = true

@@ -75,6 +75,31 @@ fn test_edge_table_descriptor(table_id: RelationId) -> TableStorageDescriptor {
     }
 }
 
+fn test_weighted_edge_table_descriptor(table_id: RelationId) -> TableStorageDescriptor {
+    TableStorageDescriptor {
+        table_id,
+        columns: vec![
+            StorageColumn {
+                column_id: ColumnId::new(1),
+                data_type: DataType::Int,
+                nullable: false,
+            },
+            StorageColumn {
+                column_id: ColumnId::new(2),
+                data_type: DataType::Int,
+                nullable: false,
+            },
+            StorageColumn {
+                column_id: ColumnId::new(3),
+                data_type: DataType::Int,
+                nullable: false,
+            },
+        ],
+        primary_key: None,
+        shard_config: None,
+    }
+}
+
 fn visible_snapshot() -> Snapshot {
     Snapshot::new(TxnId::default(), TxnId::default(), Vec::new())
 }
@@ -228,18 +253,297 @@ fn durable_backend_handle_delegates_edge_table_registration() {
         )
         .expect("insert edge row");
 
-    let neighbors = backend
-        .adjacency_neighbors(
-            TxnId::default(),
-            &visible_snapshot(),
-            table_id,
-            &Value::Int(1),
-            true,
-        )
-        .expect("adjacency neighbors should be delegated to durable inner storage");
-    assert_eq!(neighbors, vec![Value::Int(2)]);
+    let mut neighbors = aiondb_storage_api::StorageDML::adjacency_neighbor_cursor(
+        &backend,
+        TxnId::default(),
+        &visible_snapshot(),
+        table_id,
+        &Value::Int(1),
+        true,
+    )
+    .expect("adjacency neighbor cursor should be delegated to durable inner storage");
+    assert_eq!(neighbors.remaining_hint(), 1);
+    assert_eq!(neighbors.next_neighbor(), Some(Value::Int(2)));
+    assert_eq!(neighbors.next_neighbor(), None);
 
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn durable_backend_handle_delegates_weighted_adjacency_edge_enumeration() {
+    let data_dir = unique_temp_path("durable-weighted-adjacency");
+    let wal_dir = data_dir.join("wal");
+    let backend = StorageBackendHandle::open(StorageBackendSpec::durable(StorageOptions::durable(
+        aiondb_wal::WalConfig {
+            dir: wal_dir,
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        },
+    )))
+    .expect("durable backend should open");
+
+    let table_id = RelationId::new(43);
+    backend
+        .create_table_storage(
+            TxnId::default(),
+            &test_weighted_edge_table_descriptor(table_id),
+        )
+        .expect("create weighted edge table storage");
+    backend.register_edge_table(table_id, 0, 1);
+    backend
+        .insert(
+            TxnId::default(),
+            table_id,
+            Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(7)]),
+        )
+        .expect("insert weighted edge row");
+
+    let weighted_edges = aiondb_storage_api::StorageDML::adjacency_weighted_edges(
+        &backend,
+        TxnId::default(),
+        &visible_snapshot(),
+        table_id,
+        ColumnId::new(3),
+    )
+    .expect("weighted adjacency edge enumeration should be delegated");
+    assert_eq!(weighted_edges.len(), 1);
+    assert_eq!(weighted_edges[0].1, Value::Int(1));
+    assert_eq!(weighted_edges[0].2, Value::Int(2));
+    assert_eq!(weighted_edges[0].3, Value::Int(7));
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn durable_backend_handle_delegates_adjacency_edge_endpoints() {
+    let data_dir = unique_temp_path("durable-adjacency-endpoints");
+    let wal_dir = data_dir.join("wal");
+    let backend = StorageBackendHandle::open(StorageBackendSpec::durable(StorageOptions::durable(
+        aiondb_wal::WalConfig {
+            dir: wal_dir,
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        },
+    )))
+    .expect("durable backend should open");
+
+    let table_id = RelationId::new(44);
+    backend
+        .create_table_storage(TxnId::default(), &test_edge_table_descriptor(table_id))
+        .expect("create edge table storage");
+    backend.register_edge_table(table_id, 0, 1);
+    let tuple_id = backend
+        .insert(
+            TxnId::default(),
+            table_id,
+            Row::new(vec![Value::Int(3), Value::Int(9)]),
+        )
+        .expect("insert edge row");
+
+    let endpoints = aiondb_storage_api::StorageDML::adjacency_edge_endpoints(
+        &backend,
+        TxnId::default(),
+        &visible_snapshot(),
+        table_id,
+        tuple_id,
+    )
+    .expect("adjacency edge endpoints should be delegated")
+    .expect("edge endpoints should exist");
+    assert_eq!(endpoints, (Value::Int(3), Value::Int(9)));
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn durable_backend_handle_persists_graph_projection_cache_bytes() {
+    let data_dir = unique_temp_path("durable-graph-projection-cache");
+    let wal_dir = data_dir.join("wal");
+    let backend = StorageBackendHandle::open(StorageBackendSpec::durable(StorageOptions::durable(
+        aiondb_wal::WalConfig {
+            dir: wal_dir.clone(),
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        },
+    )))
+    .expect("durable backend should open");
+
+    aiondb_storage_api::StorageDML::graph_projection_cache_put(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        7,
+        b"hello projection",
+    )
+    .expect("graph projection cache write should succeed");
+
+    let payload = aiondb_storage_api::StorageDML::graph_projection_cache_get(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        7,
+    )
+    .expect("graph projection cache read should succeed");
+    assert_eq!(payload.as_deref(), Some(&b"hello projection"[..]));
+    assert!(wal_dir
+        .join("graph_projection_cache")
+        .read_dir()
+        .expect("graph projection cache directory should exist")
+        .next()
+        .is_some());
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn durable_backend_handle_reopens_graph_projection_cache_bytes() {
+    let data_dir = unique_temp_path("durable-graph-projection-cache-reopen");
+    let wal_dir = data_dir.join("wal");
+    let backend = StorageBackendHandle::open(StorageBackendSpec::durable(StorageOptions::durable(
+        aiondb_wal::WalConfig {
+            dir: wal_dir.clone(),
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        },
+    )))
+    .expect("durable backend should open");
+
+    aiondb_storage_api::StorageDML::graph_projection_cache_put(
+        &backend,
+        "graph_algorithm_weighted",
+        "weighted-cache-key",
+        11,
+        b"weighted projection",
+    )
+    .expect("graph projection cache write should succeed");
+    drop(backend);
+
+    let reopened = StorageBackendHandle::open(StorageBackendSpec::durable(
+        StorageOptions::durable(aiondb_wal::WalConfig {
+            dir: wal_dir.clone(),
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        }),
+    ))
+    .expect("durable backend should reopen");
+
+    let payload = aiondb_storage_api::StorageDML::graph_projection_cache_get(
+        &reopened,
+        "graph_algorithm_weighted",
+        "weighted-cache-key",
+        11,
+    )
+    .expect("graph projection cache read after reopen should succeed");
+    assert_eq!(payload.as_deref(), Some(&b"weighted projection"[..]));
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn durable_backend_handle_prunes_stale_graph_projection_cache_generations() {
+    let data_dir = unique_temp_path("durable-graph-projection-cache-prune");
+    let wal_dir = data_dir.join("wal");
+    let backend = StorageBackendHandle::open(StorageBackendSpec::durable(StorageOptions::durable(
+        aiondb_wal::WalConfig {
+            dir: wal_dir.clone(),
+            wal_lsn_mode: aiondb_wal::WalLsnMode::Logical,
+            ..aiondb_wal::WalConfig::default()
+        },
+    )))
+    .expect("durable backend should open");
+
+    aiondb_storage_api::StorageDML::graph_projection_cache_put(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        7,
+        b"projection-v7",
+    )
+    .expect("first graph projection cache write should succeed");
+    aiondb_storage_api::StorageDML::graph_projection_cache_put(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        8,
+        b"projection-v8",
+    )
+    .expect("second graph projection cache write should succeed");
+
+    let stale_payload = aiondb_storage_api::StorageDML::graph_projection_cache_get(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        7,
+    )
+    .expect("stale graph projection cache read should succeed");
+    assert!(stale_payload.is_none());
+
+    let fresh_payload = aiondb_storage_api::StorageDML::graph_projection_cache_get(
+        &backend,
+        "graph_algorithm_input",
+        "cache-key",
+        8,
+    )
+    .expect("fresh graph projection cache read should succeed");
+    assert_eq!(fresh_payload.as_deref(), Some(&b"projection-v8"[..]));
+
+    let cache_files: Vec<_> = wal_dir
+        .join("graph_projection_cache")
+        .read_dir()
+        .expect("graph projection cache directory should exist")
+        .map(|entry| entry.expect("graph projection cache entry should be readable"))
+        .collect();
+    assert_eq!(cache_files.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn in_memory_backend_adjacency_availability_and_stats_track_empty_live_store() {
+    let backend = StorageBackendHandle::open_in_memory(None);
+    let table_id = RelationId::new(77);
+    backend
+        .create_table_storage(TxnId::default(), &test_edge_table_descriptor(table_id))
+        .expect("create edge table storage");
+    backend.register_edge_table(table_id, 0, 1);
+
+    assert!(backend.adjacency_index_available(TxnId::default(), table_id));
+    assert!(!backend.adjacency_index_has_edges(TxnId::default(), table_id));
+    let empty_stats = backend
+        .adjacency_index_stats(TxnId::default(), table_id)
+        .expect("registered edge table should expose adjacency stats");
+    assert_eq!(empty_stats.edge_count, 0);
+    assert_eq!(empty_stats.source_node_count, Some(0));
+    assert_eq!(empty_stats.target_node_count, Some(0));
+    assert!(empty_stats.has_reverse_adjacency);
+
+    let tuple_id = backend
+        .insert(
+            TxnId::default(),
+            table_id,
+            Row::new(vec![Value::Int(1), Value::Int(2)]),
+        )
+        .expect("insert edge row");
+
+    assert!(backend.adjacency_index_has_edges(TxnId::default(), table_id));
+    let live_stats = backend
+        .adjacency_index_stats(TxnId::default(), table_id)
+        .expect("live edge table should expose adjacency stats");
+    assert_eq!(live_stats.edge_count, 1);
+    assert_eq!(live_stats.source_node_count, Some(1));
+    assert_eq!(live_stats.target_node_count, Some(1));
+
+    backend
+        .delete(TxnId::default(), table_id, tuple_id)
+        .expect("delete edge row");
+
+    assert!(backend.adjacency_index_available(TxnId::default(), table_id));
+    assert!(!backend.adjacency_index_has_edges(TxnId::default(), table_id));
+    let emptied_stats = backend
+        .adjacency_index_stats(TxnId::default(), table_id)
+        .expect("empty adjacency index should still expose stats");
+    assert_eq!(emptied_stats.edge_count, 0);
+    assert_eq!(emptied_stats.source_node_count, Some(0));
+    assert_eq!(emptied_stats.target_node_count, Some(0));
 }
 
 #[test]

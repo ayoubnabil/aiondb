@@ -46,7 +46,7 @@ use parking_lot::{
     RwLockWriteGuard as PlRwLockWriteGuard,
 };
 
-use self::adjacency::AdjacencyIndex;
+use self::adjacency::{AdjacencyIndex, CompactAdjacencyIndex};
 use self::disk_ordered_index::{DiskOrderedIntIndex, DiskVarExactIndex};
 use self::helpers::{
     project_row, project_row_owned_with_ordinals, project_row_with_ordinals, remap_wal_txn_id,
@@ -428,6 +428,7 @@ pub struct InMemoryStorage {
         Arc<PlRwLock<HashMap<(RelationId, ColumnId, EqCountValueCacheKey), u64>>>,
     adjacency_neighbors_cache:
         Arc<PlRwLock<HashMap<(RelationId, EqCountValueCacheKey, bool), Vec<Value>>>>,
+    adjacency_compact_cache: Arc<PlRwLock<HashMap<RelationId, Arc<CompactAdjacencyIndex>>>>,
     index_group_counts_cache: Arc<PlRwLock<BTreeMap<IndexId, Vec<(Value, u64)>>>>,
     index_group_count_rows_cache: Arc<PlRwLock<BTreeMap<IndexId, Vec<Row>>>>,
     hnsw_search_cache: Arc<PlRwLock<HashMap<HnswSearchCacheKey, Vec<TupleRecord>>>>,
@@ -500,6 +501,7 @@ impl Clone for InMemoryStorage {
             committed_btree_index_ids_cache: self.committed_btree_index_ids_cache.clone(),
             index_eq_row_counts_cache: self.index_eq_row_counts_cache.clone(),
             adjacency_neighbors_cache: self.adjacency_neighbors_cache.clone(),
+            adjacency_compact_cache: self.adjacency_compact_cache.clone(),
             index_group_counts_cache: self.index_group_counts_cache.clone(),
             index_group_count_rows_cache: self.index_group_count_rows_cache.clone(),
             hnsw_search_cache: self.hnsw_search_cache.clone(),
@@ -837,6 +839,7 @@ impl InMemoryStorage {
     pub(super) fn clear_index_count_caches(&self) {
         self.index_eq_row_counts_cache.write().clear();
         self.adjacency_neighbors_cache.write().clear();
+        self.adjacency_compact_cache.write().clear();
         self.index_group_counts_cache.write().clear();
         self.index_group_count_rows_cache.write().clear();
         self.hnsw_search_cache.write().clear();
@@ -2991,6 +2994,7 @@ impl InMemoryStorage {
             committed_btree_index_ids_cache: Arc::new(PlRwLock::new(TableIndexIdCache::default())),
             index_eq_row_counts_cache: Arc::new(PlRwLock::new(HashMap::new())),
             adjacency_neighbors_cache: Arc::new(PlRwLock::new(HashMap::new())),
+            adjacency_compact_cache: Arc::new(PlRwLock::new(HashMap::new())),
             index_group_counts_cache: Arc::new(PlRwLock::new(BTreeMap::new())),
             index_group_count_rows_cache: Arc::new(PlRwLock::new(BTreeMap::new())),
             hnsw_search_cache: Arc::new(PlRwLock::new(HashMap::new())),
@@ -3028,6 +3032,13 @@ impl InMemoryStorage {
         })?;
         wal.flush_durable()?;
         Ok(wal.wal_dir().to_path_buf())
+    }
+
+    pub(super) fn graph_projection_cache_root_dir(&self) -> Option<PathBuf> {
+        self.file_snapshot_mirror_dir
+            .clone()
+            .or_else(|| self.checkpoint_manifest_dir.clone())
+            .or_else(|| self.wal.as_ref().map(|wal| wal.wal_dir().to_path_buf()))
     }
 
     /// Access the storage-internal row lock table for split-phase DML
