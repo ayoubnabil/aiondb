@@ -87,7 +87,7 @@ fn dump_restore_cli_roundtrip_uses_canonical_backup_path() {
         output_text(&doctor)
     );
     let doctor_text = output_text(&doctor);
-    assert!(doctor_text.contains("storage_format=v1.0"), "{doctor_text}");
+    assert!(doctor_text.contains("storage_format=v1.1"), "{doctor_text}");
     assert!(doctor_text.contains("status=ok"), "{doctor_text}");
 
     fs::remove_dir_all(&root).expect("remove test root");
