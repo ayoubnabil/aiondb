@@ -2649,13 +2649,13 @@ impl Executor {
             Err(_) => return Ok(None),
         };
 
-        let mut ids = Vec::new();
+        let mut ids = Vec::with_capacity(limit.unwrap_or(0).min(1024));
         for mut middle_id in middle_ids {
             if middle_id.is_null() {
                 continue;
             }
             normalize_int_key(&mut middle_id);
-            let mut next_ids = match self.fast_graph_adjacency_neighbors_cached(
+            let next_ids = match self.fast_graph_adjacency_neighbors_cached(
                 context,
                 edge_table_id,
                 &middle_id,
@@ -2664,9 +2664,19 @@ impl Executor {
                 Ok(ids) => ids,
                 Err(_) => return Ok(None),
             };
-            ids.append(&mut next_ids);
+            for next_id in next_ids {
+                if next_id.is_null() {
+                    continue;
+                }
+                ids.push(next_id);
+                if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
+                    break;
+                }
+            }
+            if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
+                break;
+            }
         }
-        ids.retain(|id| !id.is_null());
 
         if !plan.order_by.is_empty() {
             ids.sort_by(|left, right| {
@@ -2797,7 +2807,7 @@ impl Executor {
             Err(_) => return Ok(None),
         };
 
-        let mut ids = Vec::new();
+        let mut ids = Vec::with_capacity(limit.unwrap_or(0).min(1024));
         'outer: for mut first_id in first_ids {
             if first_id.is_null() {
                 continue;
@@ -2826,10 +2836,14 @@ impl Executor {
                     Ok(ids) => ids,
                     Err(_) => return Ok(None),
                 };
-                third_ids.retain(|id| !id.is_null());
-                ids.append(&mut third_ids);
-                if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
-                    break 'outer;
+                for third_id in third_ids.drain(..) {
+                    if third_id.is_null() {
+                        continue;
+                    }
+                    ids.push(third_id);
+                    if !ordered && limit.is_some_and(|limit| ids.len() >= limit) {
+                        break 'outer;
+                    }
                 }
             }
         }

@@ -1755,7 +1755,7 @@ impl Executor {
         // when a malicious caller passes a huge limit.
         let capacity_hint = limit.map_or(16, |max_rows| max_rows.min(1024));
         let mut neighbors = Vec::with_capacity(capacity_hint);
-        let mut seen_neighbors = std::collections::HashSet::<i64>::with_capacity(capacity_hint);
+        let mut seen_neighbors = GraphNeighborSeen::new(limit, capacity_hint);
         match direction {
             GraphNeighborDirection::Outgoing => self.collect_graph_neighbors(
                 context,
@@ -1830,7 +1830,7 @@ impl Executor {
         use_table_adjacency: bool,
         limit: Option<usize>,
         output: &mut Vec<Value>,
-        seen: &mut std::collections::HashSet<i64>,
+        seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         if limit.is_some_and(|max_rows| output.len() >= max_rows) {
             return Ok(());
@@ -1967,7 +1967,7 @@ impl Executor {
         neighbor_idx: usize,
         limit: Option<usize>,
         output: &mut Vec<Value>,
-        seen: &mut std::collections::HashSet<i64>,
+        seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         let projected_columns = self.table_column_ids_for_ordinals(
             context,
@@ -2000,7 +2000,7 @@ impl Executor {
         neighbor_idx: usize,
         limit: Option<usize>,
         output: &mut Vec<Value>,
-        seen: &mut std::collections::HashSet<i64>,
+        seen: &mut GraphNeighborSeen,
     ) -> DbResult<()> {
         let projected_columns = self.table_column_ids_for_ordinals(
             context,

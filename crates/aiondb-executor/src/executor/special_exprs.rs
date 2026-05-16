@@ -4627,20 +4627,54 @@ fn hybrid_vector_metric_to_distance_metric(metric: HybridVectorMetric) -> Vector
     }
 }
 
+enum GraphNeighborSeen {
+    Tiny(Vec<i64>),
+    Hash(std::collections::HashSet<i64>),
+}
+
+impl GraphNeighborSeen {
+    fn new(limit: Option<usize>, capacity_hint: usize) -> Self {
+        if limit.is_some_and(|limit| limit <= 16) {
+            Self::Tiny(Vec::with_capacity(capacity_hint))
+        } else {
+            Self::Hash(std::collections::HashSet::with_capacity(capacity_hint))
+        }
+    }
+
+    fn insert(&mut self, id: i64) -> bool {
+        match self {
+            Self::Tiny(ids) => {
+                if ids.contains(&id) {
+                    false
+                } else {
+                    ids.push(id);
+                    true
+                }
+            }
+            Self::Hash(ids) => ids.insert(id),
+        }
+    }
+}
+
 fn push_bigint_neighbor_with_seen(
     value: Option<&Value>,
     output: &mut Vec<Value>,
-    seen: &mut std::collections::HashSet<i64>,
+    seen: &mut GraphNeighborSeen,
 ) -> DbResult<()> {
-    let Some(value) = value.cloned() else {
+    let Some(value) = value else {
         return Ok(());
     };
-    if matches!(value, Value::Null) {
-        return Ok(());
-    }
-    let neighbor = aiondb_eval::coerce_value(value, &DataType::BigInt)?;
-    let Value::BigInt(id) = neighbor else {
-        return Ok(());
+    let id = match value {
+        Value::Int(id) => i64::from(*id),
+        Value::BigInt(id) => *id,
+        Value::Null => return Ok(()),
+        value => {
+            let neighbor = aiondb_eval::coerce_value(value.clone(), &DataType::BigInt)?;
+            let Value::BigInt(id) = neighbor else {
+                return Ok(());
+            };
+            id
+        }
     };
     if seen.insert(id) {
         output.push(Value::BigInt(id));
