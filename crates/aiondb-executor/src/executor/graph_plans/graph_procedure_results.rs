@@ -79,8 +79,15 @@ pub(super) fn procedure_result_bindings(
                             "procedure {procedure} produced result for unknown node index {node_index}"
                         ))
                     })?;
-                    let values = [node_id, Arc::new(BoundValue::Scalar(Value::Double(*score)))];
-                    rows.push(selected_procedure_values_from_indexes(&selected, &values));
+                    let score = Arc::new(BoundValue::Scalar(Value::Double(*score)));
+                    match selected.as_slice() {
+                        [0, 1] => rows.push(vec![node_id, score]),
+                        [1, 0] => rows.push(vec![score, node_id]),
+                        _ => {
+                            let values = [node_id, score];
+                            rows.push(selected_procedure_values_from_indexes(&selected, &values));
+                        }
+                    }
                 }
             }
             AlgorithmResult::NodeDualScores {
