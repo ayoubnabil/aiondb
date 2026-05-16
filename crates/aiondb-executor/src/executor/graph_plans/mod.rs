@@ -1717,6 +1717,12 @@ fn column_ref_name(expr: &TypedExpr) -> Option<&str> {
     }
 }
 
+fn ascending_order_by_matches_column(order_by: &[SortExpr], expected: &str) -> bool {
+    order_by
+        .iter()
+        .all(|sort| !sort.descending && column_ref_name(&sort.expr) == Some(expected))
+}
+
 fn count_return_variable(expr: &TypedExpr) -> Option<&str> {
     let TypedExprKind::AggCount {
         expr: Some(expr),
@@ -2073,6 +2079,66 @@ impl Executor {
         }
 
         Ok(usize_to_u64(frontier.len()))
+    }
+
+    fn fast_graph_collect_fixed_outgoing_endpoint_ids(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        start_id: &Value,
+        hops: usize,
+        ordered: bool,
+        limit: Option<usize>,
+    ) -> DbResult<Vec<Value>> {
+        if hops == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut current = vec![start_id.clone()];
+        for depth in 1..=hops {
+            let mut next = Vec::new();
+            let is_last = depth == hops;
+            'nodes: for mut node_id in current {
+                context.check_deadline()?;
+                if node_id.is_null() {
+                    continue;
+                }
+                normalize_int_key(&mut node_id);
+                let remaining = if is_last && !ordered {
+                    limit.map(|limit| limit.saturating_sub(next.len()))
+                } else {
+                    None
+                };
+                self.fast_graph_push_adjacency_neighbor_ids(
+                    context,
+                    edge_table_id,
+                    &node_id,
+                    true,
+                    remaining,
+                    &mut next,
+                )?;
+                if is_last && !ordered && limit.is_some_and(|limit| next.len() >= limit) {
+                    break 'nodes;
+                }
+            }
+            if next.is_empty() {
+                return Ok(next);
+            }
+            current = next;
+        }
+
+        if ordered {
+            current.sort_by(|left, right| {
+                compare_runtime_values(left, right)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        if let Some(limit) = limit {
+            current.truncate(limit);
+        }
+        Ok(current)
     }
 
     fn fast_graph_id_lookup_cache_get(
@@ -2446,6 +2512,9 @@ impl Executor {
         if let Some(result) = self.try_execute_fast_three_hop_id_lookup(plan, context)? {
             return Ok(result);
         }
+        if let Some(result) = self.try_execute_fast_anchored_path_id_lookup(plan, context)? {
+            return Ok(result);
+        }
         if let Some(result) = self.try_execute_fast_unanchored_one_hop_count(plan, context)? {
             return Ok(result);
         }
@@ -2666,11 +2735,7 @@ impl Executor {
         if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
             return Ok(None);
         }
-        if plan
-            .order_by
-            .iter()
-            .any(|sort| column_ref_name(&sort.expr) != Some(expected_return.as_str()))
-        {
+        if !ascending_order_by_matches_column(&plan.order_by, &expected_return) {
             return Ok(None);
         }
 
@@ -2791,11 +2856,10 @@ impl Executor {
         if !returns_left && !returns_right {
             return Ok(None);
         }
-        if plan
-            .order_by
-            .iter()
-            .any(|sort| column_ref_name(&sort.expr) != return_name)
-        {
+        let Some(return_name) = return_name else {
+            return Ok(None);
+        };
+        if !ascending_order_by_matches_column(&plan.order_by, return_name) {
             return Ok(None);
         }
 
@@ -3064,11 +3128,7 @@ impl Executor {
         if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
             return Ok(None);
         }
-        if plan
-            .order_by
-            .iter()
-            .any(|sort| column_ref_name(&sort.expr) != Some(expected_return.as_str()))
-        {
+        if !ascending_order_by_matches_column(&plan.order_by, &expected_return) {
             return Ok(None);
         }
 
@@ -3225,11 +3285,7 @@ impl Executor {
         if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
             return Ok(None);
         }
-        if plan
-            .order_by
-            .iter()
-            .any(|sort| column_ref_name(&sort.expr) != Some(expected_return.as_str()))
-        {
+        if !ascending_order_by_matches_column(&plan.order_by, &expected_return) {
             return Ok(None);
         }
 
@@ -3328,6 +3384,135 @@ impl Executor {
             limit,
             &rows,
         )?;
+        let columns = plan.returns.iter().map(|r| r.field.clone()).collect();
+        Ok(Some(ExecutionResult::Query { columns, rows }))
+    }
+
+    fn try_execute_fast_anchored_path_id_lookup(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.union.is_some()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        let hops = pattern.relationships.len();
+        if pattern.path_function.is_some() || hops < 4 || pattern.nodes.len() != hops + 1 {
+            return Ok(None);
+        }
+
+        let Some(start) = pattern.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(end) = pattern.nodes.last() else {
+            return Ok(None);
+        };
+        let Some(start_variable) = start.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        let expected_return = format!("{end_variable}.id");
+        if start.table_id.is_none()
+            || pattern
+                .nodes
+                .iter()
+                .skip(1)
+                .any(|node| node.table_id.is_none() || !node.properties.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let Some(edge_table_id) = pattern.relationships.first().and_then(|rel| rel.table_id) else {
+            return Ok(None);
+        };
+        if pattern.relationships.iter().any(|rel| {
+            rel.table_id != Some(edge_table_id)
+                || rel.direction != CypherRelDirection::Outgoing
+                || rel.variable.is_some()
+                || rel.min_hops.is_some()
+                || rel.max_hops.is_some()
+                || !rel.properties.is_empty()
+        }) {
+            return Ok(None);
+        }
+
+        if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
+            return Ok(None);
+        }
+        if !ascending_order_by_matches_column(&plan.order_by, &expected_return) {
+            return Ok(None);
+        }
+
+        let Some(mut start_id) =
+            extract_start_id_literal(start, match_clause.filter.as_ref(), start_variable)
+        else {
+            return Ok(None);
+        };
+        normalize_int_key(&mut start_id);
+        let ordered = !plan.order_by.is_empty();
+        let limit = plan
+            .limit
+            .as_ref()
+            .and_then(literal_i64)
+            .and_then(|value| usize::try_from(value.max(0)).ok());
+        let cache_hops = u8::try_from(hops).ok();
+        if let Some(cache_hops) = cache_hops {
+            if let Some(rows) = self.fast_graph_id_lookup_cache_get(
+                edge_table_id,
+                &start_id,
+                cache_hops,
+                ordered,
+                limit,
+            )? {
+                let columns = plan.returns.iter().map(|r| r.field.clone()).collect();
+                return Ok(Some(ExecutionResult::Query { columns, rows }));
+            }
+        }
+
+        let ids = match self.fast_graph_collect_fixed_outgoing_endpoint_ids(
+            context,
+            edge_table_id,
+            &start_id,
+            hops,
+            ordered,
+            limit,
+        ) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(None),
+        };
+
+        let rows: Vec<Row> = ids.into_iter().map(|id| Row::new(vec![id])).collect();
+        if let Some(cache_hops) = cache_hops {
+            self.fast_graph_id_lookup_cache_put(
+                edge_table_id,
+                &start_id,
+                cache_hops,
+                ordered,
+                limit,
+                &rows,
+            )?;
+        }
         let columns = plan.returns.iter().map(|r| r.field.clone()).collect();
         Ok(Some(ExecutionResult::Query { columns, rows }))
     }

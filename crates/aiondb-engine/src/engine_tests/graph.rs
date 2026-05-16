@@ -1712,6 +1712,63 @@ fn cypher_three_hop_id_lookup_uses_adjacency_chain() {
 }
 
 #[test]
+fn cypher_deep_id_lookup_uses_adjacency_chain() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_depth5_fast (id INT NOT NULL); \
+             CREATE TABLE knows_depth5_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_depth5_fast ON people_depth5_fast; \
+             CREATE EDGE LABEL knows_depth5_fast ON knows_depth5_fast_edges SOURCE person_depth5_fast TARGET person_depth5_fast; \
+             INSERT INTO people_depth5_fast VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10); \
+             INSERT INTO knows_depth5_fast_edges VALUES \
+                (1, 2), (2, 3), (3, 4), (4, 5), \
+                (2, 6), (6, 7), (7, 8), \
+                (5, 9), (8, 10)",
+        )
+        .expect("seed graph");
+
+    let four_hop = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_depth5_fast {id: 1})-[:knows_depth5_fast]->(b:person_depth5_fast)-[:knows_depth5_fast]->(c:person_depth5_fast)-[:knows_depth5_fast]->(d:person_depth5_fast)-[:knows_depth5_fast]->(e:person_depth5_fast) \
+         RETURN e.id ORDER BY e.id",
+    );
+    assert_eq!(
+        four_hop,
+        vec![Row::new(vec![Value::Int(5)]), Row::new(vec![Value::Int(8)])],
+    );
+
+    let four_hop_desc = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_depth5_fast {id: 1})-[:knows_depth5_fast]->(b:person_depth5_fast)-[:knows_depth5_fast]->(c:person_depth5_fast)-[:knows_depth5_fast]->(d:person_depth5_fast)-[:knows_depth5_fast]->(e:person_depth5_fast) \
+         RETURN e.id ORDER BY e.id DESC",
+    );
+    assert_eq!(
+        four_hop_desc,
+        vec![Row::new(vec![Value::Int(8)]), Row::new(vec![Value::Int(5)])],
+    );
+
+    let five_hop = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_depth5_fast {id: 1})-[:knows_depth5_fast]->(b:person_depth5_fast)-[:knows_depth5_fast]->(c:person_depth5_fast)-[:knows_depth5_fast]->(d:person_depth5_fast)-[:knows_depth5_fast]->(e:person_depth5_fast)-[:knows_depth5_fast]->(f:person_depth5_fast) \
+         RETURN f.id ORDER BY f.id",
+    );
+    assert_eq!(
+        five_hop,
+        vec![
+            Row::new(vec![Value::Int(9)]),
+            Row::new(vec![Value::Int(10)])
+        ],
+    );
+}
+
+#[test]
 fn cypher_anchored_path_counts_use_adjacency_chain() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
