@@ -4082,22 +4082,24 @@ impl Executor {
             return Ok(None);
         }
 
-        let start = &pattern.nodes[0];
-        let end = &pattern.nodes[1];
         let rel = &pattern.relationships[0];
-        let Some(end_variable) = end.variable.as_deref() else {
+        let (source, target) = match rel.direction {
+            CypherRelDirection::Outgoing => (&pattern.nodes[0], &pattern.nodes[1]),
+            CypherRelDirection::Incoming => (&pattern.nodes[1], &pattern.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        let Some(target_variable) = target.variable.as_deref() else {
             return Ok(None);
         };
-        let expected_return = format!("{end_variable}.id");
+        let expected_return = format!("{target_variable}.id");
         if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
             return Ok(None);
         }
-        if start.table_id.is_none()
-            || end.table_id.is_none()
-            || !start.properties.is_empty()
-            || !end.properties.is_empty()
+        if source.table_id.is_none()
+            || target.table_id.is_none()
+            || !source.properties.is_empty()
+            || !target.properties.is_empty()
             || rel.table_id.is_none()
-            || rel.direction != CypherRelDirection::Outgoing
             || rel.variable.is_some()
             || rel.min_hops.is_some()
             || rel.max_hops.is_some()
@@ -4107,14 +4109,14 @@ impl Executor {
         }
 
         let Some(filter_value) = match_clause.filter.as_ref().and_then(|filter| {
-            exact_named_column_literal_gt(filter, &format!("{end_variable}.number"))
+            exact_named_column_literal_gt(filter, &format!("{target_variable}.number"))
         }) else {
             return Ok(None);
         };
         let Some(edge_table_id) = rel.table_id else {
             return Ok(None);
         };
-        let Some(target_table_id) = end.table_id else {
+        let Some(target_table_id) = target.table_id else {
             return Ok(None);
         };
         let ((_, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
