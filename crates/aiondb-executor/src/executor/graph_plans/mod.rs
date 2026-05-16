@@ -3501,27 +3501,18 @@ impl Executor {
             if neighbor_ids.is_empty() {
                 continue;
             }
-            let mut left_targets = Vec::with_capacity(neighbor_ids.len());
-            for target_id in &neighbor_ids {
-                if target_id.is_null() {
-                    continue;
-                }
+            for left in neighbor_ids.iter().filter(|id| !id.is_null()) {
                 let first_target_allowed =
                     if let Some(Some(allowed_ids)) = allowed_left_target_ids.as_ref() {
-                        let mut normalized_target_id = target_id.clone();
+                        let mut normalized_target_id = left.clone();
                         normalize_int_key(&mut normalized_target_id);
                         allowed_ids.contains(&build_hash_key(&normalized_target_id)?)
                     } else {
                         true
                     };
-                if first_target_allowed {
-                    left_targets.push(target_id.clone());
+                if !first_target_allowed {
+                    continue;
                 }
-            }
-            if left_targets.is_empty() {
-                continue;
-            }
-            for left in &left_targets {
                 for right in neighbor_ids.iter().filter(|id| !id.is_null()) {
                     let row = Row::new(vec![left.clone(), right.clone()]);
                     result_bytes =
