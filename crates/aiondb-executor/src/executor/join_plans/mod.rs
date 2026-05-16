@@ -1499,6 +1499,28 @@ impl Executor {
         outer_row: &Row,
         context: &ExecutionContext,
     ) -> DbResult<(Vec<Row>, usize)> {
+        if let PhysicalPlan::HybridFunctionScan {
+            function_name,
+            args,
+            output_fields,
+        } = child
+        {
+            let base_function_name = function_name.rsplit('.').next().unwrap_or(function_name);
+            if base_function_name.eq_ignore_ascii_case("graph_neighbors") {
+                let row_cap = JOIN_CHILD_MATERIALIZE_ROW_CAP.min(context.max_result_rows);
+                let rows = self.resolve_graph_neighbors_rows(args, Some(outer_row), context)?;
+                if usize_to_u64(rows.len()) > row_cap {
+                    return Err(DbError::program_limit(
+                        "join child materialization exceeded row cap; consider adding filters or indexes",
+                    ));
+                }
+                for row in &rows {
+                    context.track_memory(estimate_row_bytes(row))?;
+                }
+                return Ok((rows, output_fields.len()));
+            }
+        }
+
         let substituted = substitute_outer_refs_in_physical_plan(child, outer_row);
         let width = self.join_child_width(&substituted, context)?;
         let row_cap = JOIN_CHILD_MATERIALIZE_ROW_CAP.min(context.max_result_rows);
