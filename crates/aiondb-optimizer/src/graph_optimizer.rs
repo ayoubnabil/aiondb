@@ -13,6 +13,10 @@
 
 use std::collections::HashMap;
 
+use aiondb_graph_cbo::{
+    plan_query_graph, ExpansionPlan, GraphStatistics, IndexKind, PhysicalOp, PlannerConfig,
+    PredicateOp, PropertyPredicate, QueryGraph, QueryNode, QueryRel, RelDirection,
+};
 use aiondb_plan::graph::{
     CypherMatchClause, CypherNodePattern, CypherPattern, CypherPipelineOp, CypherPropertyExpr,
     CypherQueryPlan, CypherRelDirection, CypherRelPattern,
@@ -75,6 +79,35 @@ impl GraphStats {
             .get(rel_type)
             .copied()
             .unwrap_or(DEFAULT_DEGREE)
+    }
+}
+
+impl GraphStatistics for GraphStats {
+    fn total_nodes(&self) -> f64 {
+        let total: u64 = self.label_cardinality.values().copied().sum();
+        if total == 0 {
+            u64_to_f64(DEFAULT_NODE_COUNT)
+        } else {
+            u64_to_f64(total)
+        }
+    }
+
+    fn label_cardinality(&self, label: Option<&str>) -> f64 {
+        label.map_or_else(
+            || self.total_nodes(),
+            |label| u64_to_f64(self.node_count(label)),
+        )
+    }
+
+    fn relationship_cardinality(&self, rel_type: Option<&str>) -> f64 {
+        rel_type.map_or_else(
+            || u64_to_f64(DEFAULT_EDGE_COUNT),
+            |rel_type| u64_to_f64(self.edge_count(rel_type)),
+        )
+    }
+
+    fn distinct_values(&self, _label: Option<&str>, _property: &str) -> Option<f64> {
+        None
     }
 }
 
@@ -287,6 +320,48 @@ fn extract_variable_property_ref(expr: &TypedExpr) -> Option<(String, String)> {
     Some((variable.to_owned(), property.to_owned()))
 }
 
+fn typed_expr_predicate_op(expr: &TypedExpr) -> Option<PredicateOp> {
+    use aiondb_plan::TypedExprKind;
+
+    match &expr.kind {
+        TypedExprKind::BinaryEq { .. } => Some(PredicateOp::Equality),
+        TypedExprKind::BinaryGt { .. }
+        | TypedExprKind::BinaryGe { .. }
+        | TypedExprKind::BinaryLt { .. }
+        | TypedExprKind::BinaryLe { .. }
+        | TypedExprKind::Between { .. } => Some(PredicateOp::Range),
+        _ => None,
+    }
+}
+
+fn cypher_direction_to_cbo(direction: CypherRelDirection) -> RelDirection {
+    match direction {
+        CypherRelDirection::Outgoing => RelDirection::Outgoing,
+        CypherRelDirection::Incoming => RelDirection::Incoming,
+        CypherRelDirection::Both => RelDirection::Both,
+    }
+}
+
+fn cbo_seed_node(plan: &ExpansionPlan) -> Option<usize> {
+    match &plan.op {
+        PhysicalOp::AllNodesScan { node }
+        | PhysicalOp::NodeByLabelScan { node, .. }
+        | PhysicalOp::NodeIndexSeek { node, .. } => Some(node.0),
+        PhysicalOp::Expand { input, .. } => cbo_seed_node(input),
+        PhysicalOp::HashJoin { .. } | PhysicalOp::CartesianProduct { .. } => None,
+    }
+}
+
+fn cbo_plan_is_linear(plan: &ExpansionPlan) -> bool {
+    match &plan.op {
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. } => true,
+        PhysicalOp::Expand { input, into, .. } => !into && cbo_plan_is_linear(input),
+        PhysicalOp::HashJoin { .. } | PhysicalOp::CartesianProduct { .. } => false,
+    }
+}
+
 /// Estimate the cost of traversing a relationship from `source_card` source
 /// nodes.
 fn relationship_traversal_cost(
@@ -426,8 +501,9 @@ impl GraphOptimizer {
         self.reorder_patterns(match_clause, &filters);
 
         // Step 3: For each pattern, reorder the starting node.
+        let allow_cbo_start = match_clause.patterns.len() == 1;
         for pattern in &mut match_clause.patterns {
-            self.optimize_pattern_start(pattern, &filters);
+            self.optimize_pattern_start(pattern, &filters, allow_cbo_start);
         }
 
         // Step 4: Tighten variable-length bounds.
@@ -491,7 +567,12 @@ impl GraphOptimizer {
 
     /// Within a single path pattern, consider reversing the traversal direction
     /// to start from the node with the smallest cardinality.
-    fn optimize_pattern_start(&self, pattern: &mut CypherPattern, filters: &[TypedExpr]) {
+    fn optimize_pattern_start(
+        &self,
+        pattern: &mut CypherPattern,
+        filters: &[TypedExpr],
+        allow_cbo_start: bool,
+    ) {
         if pattern.nodes.len() < 2 || pattern.relationships.is_empty() {
             return;
         }
@@ -505,6 +586,15 @@ impl GraphOptimizer {
         {
             return;
         }
+        if allow_cbo_start {
+            if self
+                .cbo_seed_node_for_pattern(pattern, filters)
+                .is_some_and(|seed_node| seed_node + 1 == pattern.nodes.len())
+            {
+                self.reverse_pattern(pattern);
+                return;
+            }
+        }
 
         let first_card = self.node_est_cardinality(&pattern.nodes[0], filters);
         let last_node = match pattern.nodes.last() {
@@ -517,6 +607,108 @@ impl GraphOptimizer {
         if last_card < first_card * 0.5 {
             self.reverse_pattern(pattern);
         }
+    }
+
+    fn cbo_seed_node_for_pattern(
+        &self,
+        pattern: &CypherPattern,
+        filters: &[TypedExpr],
+    ) -> Option<usize> {
+        if pattern
+            .relationships
+            .iter()
+            .any(|rel| rel.direction == CypherRelDirection::Both)
+        {
+            return None;
+        }
+        let query_graph = self.lower_pattern_to_query_graph(pattern, filters)?;
+        let plan = plan_query_graph(&query_graph, &self.stats, &PlannerConfig::default()).ok()?;
+        if !cbo_plan_is_linear(&plan) {
+            return None;
+        }
+        let seed_node = cbo_seed_node(&plan)?;
+        (seed_node == 0 || seed_node + 1 == pattern.nodes.len()).then_some(seed_node)
+    }
+
+    fn lower_pattern_to_query_graph(
+        &self,
+        pattern: &CypherPattern,
+        filters: &[TypedExpr],
+    ) -> Option<QueryGraph> {
+        let mut predicate_map: HashMap<String, Vec<PropertyPredicate>> = HashMap::new();
+        for filter in filters {
+            let Some((variable, property)) = extract_variable_property_ref(filter) else {
+                continue;
+            };
+            let Some(op) = typed_expr_predicate_op(filter) else {
+                continue;
+            };
+            predicate_map
+                .entry(variable)
+                .or_default()
+                .push(PropertyPredicate::new(property, op));
+        }
+
+        let mut query_graph = QueryGraph::new();
+        for (index, node) in pattern.nodes.iter().enumerate() {
+            let mut query_node = if let Some(label) = node.label.as_deref() {
+                QueryNode::labelled(index, label)
+            } else {
+                QueryNode::anonymous(index)
+            };
+            for property in &node.properties {
+                query_node = query_node.with_predicate(PropertyPredicate::equality(&property.key));
+            }
+            if let Some(variable) = node.variable.as_deref() {
+                if let Some(predicates) = predicate_map.get(variable) {
+                    for predicate in predicates {
+                        query_node = query_node.with_predicate(predicate.clone());
+                    }
+                }
+            }
+            if let Some(index_scan) = &node.index_scan {
+                let property = node
+                    .properties
+                    .first()
+                    .map(|property| property.key.as_str())
+                    .or_else(|| {
+                        node.variable
+                            .as_deref()
+                            .and_then(|variable| predicate_map.get(variable))
+                            .and_then(|predicates| predicates.first())
+                            .map(|predicate| predicate.property.as_str())
+                    })
+                    .unwrap_or("id");
+                let index_kind = if property.eq_ignore_ascii_case("id") {
+                    IndexKind::Unique
+                } else {
+                    IndexKind::NonUnique
+                };
+                let _ = index_scan;
+                query_node = query_node.with_index(property, index_kind);
+            }
+            query_graph.add_node(query_node);
+        }
+
+        for (index, rel) in pattern.relationships.iter().enumerate() {
+            let mut query_rel = QueryRel::new(
+                index,
+                index,
+                index + 1,
+                rel.rel_type.as_deref(),
+                cypher_direction_to_cbo(rel.direction),
+            );
+            for property in &rel.properties {
+                query_rel = query_rel.with_predicate(PropertyPredicate::equality(&property.key));
+            }
+            if rel.min_hops.is_some() || rel.max_hops.is_some() {
+                query_rel = query_rel.with_var_length(rel.min_hops.unwrap_or(1), rel.max_hops);
+            }
+            query_graph.add_rel(query_rel);
+        }
+
+        query_graph.validate().ok()?;
+        Some(query_graph)
     }
 
     /// Estimate cardinality of a single node pattern for ordering decisions.
@@ -1101,7 +1293,7 @@ mod tests {
         );
 
         // Person(1000) -> City(50): City is < Person * 0.5, so should reverse
-        optimizer.optimize_pattern_start(&mut pattern, &[]);
+        optimizer.optimize_pattern_start(&mut pattern, &[], true);
 
         // After reversal, City should be first.
         assert_eq!(pattern.nodes[0].label.as_deref(), Some("City"));
@@ -1130,7 +1322,7 @@ mod tests {
         );
         pattern.path_variable = Some("path".to_owned());
 
-        optimizer.optimize_pattern_start(&mut pattern, &[]);
+        optimizer.optimize_pattern_start(&mut pattern, &[], true);
 
         assert_eq!(pattern.nodes[0].label.as_deref(), Some("Person"));
         assert_eq!(
@@ -1155,7 +1347,7 @@ mod tests {
             vec![rel],
         );
 
-        optimizer.optimize_pattern_start(&mut pattern, &[]);
+        optimizer.optimize_pattern_start(&mut pattern, &[], true);
 
         assert_eq!(pattern.nodes[0].label.as_deref(), Some("Person"));
         assert_eq!(

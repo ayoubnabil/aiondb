@@ -19,6 +19,7 @@ members = [
     "crates/aiondb-vector",
     "crates/aiondb-graph-api",
     "crates/aiondb-graph",
+    "crates/aiondb-graph-cbo",
     "crates/aiondb-graph-projection",
     "crates/aiondb-storage-engine",
     "crates/aiondb-extension",

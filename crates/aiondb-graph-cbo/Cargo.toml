@@ -1,0 +1,12 @@
+[package]
+name = "aiondb-graph-cbo"
+description = "Cost-based optimizer for graph (Cypher) traversal: cardinality estimation and IDP join-order search."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

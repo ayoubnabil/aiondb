@@ -322,6 +322,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aiondb-graph-cbo"
+version = "0.1.0"
+
+[[package]]
 name = "aiondb-graph-projection"
 version = "0.1.0"
 dependencies = [
@@ -365,6 +369,7 @@ dependencies = [
  "aiondb-catalog",
  "aiondb-core",
  "aiondb-eval",
+ "aiondb-graph-cbo",
  "aiondb-plan",
  "serde_json",
 ]
@@ -511,12 +516,17 @@ dependencies = [
  "aiondb-engine",
  "aiondb-fragment-transport",
  "aiondb-ha",
+ "aiondb-parser",
  "aiondb-pgwire",
  "aiondb-replication",
  "aiondb-storage-engine",
  "aiondb-wal",
  "axum",
+ "base64",
+ "getrandom 0.3.4",
+ "serde",
  "serde_json",
+ "time",
  "tokio",
  "tower",
  "tracing",

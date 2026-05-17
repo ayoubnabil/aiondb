@@ -9,6 +9,7 @@ authors.workspace = true
 aiondb-catalog = { path = "../aiondb-catalog" }
 aiondb-core = { path = "../aiondb-core" }
 aiondb-eval = { path = "../aiondb-eval" }
+aiondb-graph-cbo = { path = "../aiondb-graph-cbo" }
 aiondb-plan = { path = "../aiondb-plan" }
 serde_json = { workspace = true }
 
