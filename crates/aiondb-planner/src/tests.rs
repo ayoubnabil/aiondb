@@ -2,7 +2,7 @@ pub(super) use std::collections::BTreeSet;
 pub(super) use std::sync::Arc;
 
 pub(super) use super::*;
-pub(super) use aiondb_core::{SqlState, TextTypeModifier};
+pub(super) use aiondb_core::{SqlState, TextTypeModifier, Value};
 pub(super) use aiondb_parser::{
     parse_prepared_statement, CypherClause, CypherForeachClause, CypherStatement, Expr, Literal,
     Span, Statement,
@@ -1183,10 +1183,10 @@ fn cypher_window_function_expression_is_rejected_in_native_pipeline() {
 }
 
 #[test]
-fn cypher_subquery_expression_is_rejected_in_native_pipeline() {
+fn cypher_sql_exists_subquery_is_rejected_in_native_pipeline() {
     let planner = Planner::new(Arc::new(TestCatalog));
     let err = plan_with_catalog("MATCH (n) RETURN EXISTS (SELECT 1) AS e", &planner)
-        .expect_err("subquery expressions should be rejected in native Cypher pipeline");
+        .expect_err("SQL subquery expressions should be rejected in native Cypher pipeline");
     let message = format!("{err}");
     assert!(
         message.contains("subquery expressions")
@@ -1292,6 +1292,437 @@ fn cypher_graph_algorithm_call_defaults_to_registry_yields() {
             };
             assert_eq!(call.procedure, "graph.pageRank");
             assert_eq!(call.yields, vec!["nodeId", "score"]);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog("CALL { RETURN 1 AS x } RETURN x", &planner).expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected CALL subquery in Cypher pipeline");
+            };
+            assert!(subquery.pipeline.is_empty());
+            assert_eq!(subquery.returns.len(), 1);
+            assert_eq!(plan.returns.len(), 1);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_correlated_call_subquery_with_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan =
+        plan_with_catalog("MATCH (n) CALL { WITH n RETURN n.name AS name } RETURN name", &planner)
+            .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::Match(_)) = plan.pipeline.first() else {
+                panic!("expected outer MATCH in Cypher pipeline");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery)) =
+                plan.pipeline.get(1)
+            else {
+                panic!("expected CALL subquery after outer MATCH");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::With(with_clause)) =
+                subquery.pipeline.first()
+            else {
+                panic!("expected WITH passthrough inside CALL subquery");
+            };
+            assert_eq!(with_clause.items.len(), 1);
+            assert_eq!(with_clause.preserve_binding_sources, vec![Some("n".to_owned())]);
+            assert_eq!(subquery.returns.len(), 1);
+            assert_eq!(plan.returns.len(), 1);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_union_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan =
+        plan_with_catalog("CALL { RETURN 1 AS x UNION ALL RETURN 2 AS x } RETURN x", &planner)
+            .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected CALL subquery in Cypher pipeline");
+            };
+            assert_eq!(subquery.returns.len(), 1);
+            let Some(union) = subquery.union.as_ref() else {
+                panic!("expected UNION inside CALL subquery");
+            };
+            assert!(union.all);
+            assert_eq!(union.right.returns.len(), 1);
+            assert_eq!(plan.returns.len(), 1);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_correlated_call_subquery_union_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) CALL { WITH n RETURN n.name AS x UNION WITH n RETURN n.name AS x } RETURN x",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::Match(_)) = plan.pipeline.first() else {
+                panic!("expected outer MATCH in Cypher pipeline");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery)) =
+                plan.pipeline.get(1)
+            else {
+                panic!("expected CALL subquery after outer MATCH");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::With(with_clause)) =
+                subquery.pipeline.first()
+            else {
+                panic!("expected WITH passthrough in left UNION branch");
+            };
+            assert_eq!(with_clause.preserve_binding_sources, vec![Some("n".to_owned())]);
+            let Some(union) = subquery.union.as_ref() else {
+                panic!("expected UNION inside correlated CALL subquery");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::With(right_with)) =
+                union.right.pipeline.first()
+            else {
+                panic!("expected WITH passthrough in right UNION branch");
+            };
+            assert_eq!(right_with.preserve_binding_sources, vec![Some("n".to_owned())]);
+            assert_eq!(plan.returns.len(), 1);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_correlated_call_subquery_union_with_match_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) CALL { WITH n MATCH (n)-[:KNOWS]->(m) RETURN m.name AS friend \
+         UNION WITH n RETURN n.name AS friend } RETURN friend",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::Match(_)) = plan.pipeline.first() else {
+                panic!("expected outer MATCH in Cypher pipeline");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::CallSubquery(subquery)) =
+                plan.pipeline.get(1)
+            else {
+                panic!("expected CALL subquery after outer MATCH");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::With(with_clause)) =
+                subquery.pipeline.first()
+            else {
+                panic!("expected WITH passthrough in left UNION branch");
+            };
+            assert_eq!(with_clause.preserve_binding_sources, vec![Some("n".to_owned())]);
+            assert!(matches!(
+                subquery.pipeline.get(1),
+                Some(aiondb_plan::graph::CypherPipelineOp::Match(_))
+            ));
+            let Some(union) = subquery.union.as_ref() else {
+                panic!("expected UNION inside correlated CALL subquery");
+            };
+            let Some(aiondb_plan::graph::CypherPipelineOp::With(right_with)) =
+                union.right.pipeline.first()
+            else {
+                panic!("expected WITH passthrough in right UNION branch");
+            };
+            assert_eq!(right_with.preserve_binding_sources, vec![Some("n".to_owned())]);
+            assert!(union.right.matches.is_empty());
+            assert_eq!(plan.returns.len(), 1);
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_exists_subquery_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) WHERE EXISTS { MATCH (n)-[:KNOWS]->(m) } RETURN n",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::Match(match_clause)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected MATCH in Cypher pipeline");
+            };
+            let Some(filter) = match_clause.filter.as_ref() else {
+                panic!("expected EXISTS filter on MATCH");
+            };
+            assert!(matches!(
+                &filter.kind,
+                TypedExprKind::ScalarFunction {
+                    func: ScalarFunction::Generic(name),
+                    ..
+                } if name == "__cypher_exists_subquery"
+            ));
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_exists_subquery_union_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) WHERE EXISTS { RETURN 1 AS x UNION ALL RETURN 2 AS x } RETURN n",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let Some(aiondb_plan::graph::CypherPipelineOp::Match(match_clause)) =
+                plan.pipeline.first()
+            else {
+                panic!("expected MATCH in Cypher pipeline");
+            };
+            let Some(filter) = match_clause.filter.as_ref() else {
+                panic!("expected EXISTS filter on MATCH");
+            };
+            let TypedExprKind::ScalarFunction {
+                func: ScalarFunction::Generic(name),
+                args,
+            } = &filter.kind
+            else {
+                panic!("expected EXISTS scalar function");
+            };
+            assert_eq!(name, "__cypher_exists_subquery");
+            let [payload, ..] = args.as_slice() else {
+                panic!("expected EXISTS payload argument");
+            };
+            let TypedExprKind::Literal(Value::Text(payload)) = &payload.kind else {
+                panic!("expected EXISTS payload literal");
+            };
+            let subquery: aiondb_plan::graph::CypherQueryPlan =
+                serde_json::from_str(payload).expect("decode EXISTS payload");
+            let union = subquery.union.expect("expected UNION in EXISTS payload");
+            assert!(union.all, "expected UNION ALL payload");
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_list_comprehension_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) RETURN [x IN [1, 2, 3] WHERE x > 1 | x] AS xs",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            assert_eq!(plan.returns.len(), 1);
+            assert!(matches!(
+                &plan.returns[0].expr.kind,
+                TypedExprKind::ScalarFunction {
+                    func: ScalarFunction::Generic(name),
+                    ..
+                } if name == "__cypher_list_comprehension"
+            ));
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_quantifier_functions_are_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) \
+         RETURN any(x IN [1, 2, 3] WHERE x = 2) AS any_hit, \
+                all(x IN [1, 2, 3] WHERE x > 0) AS all_hit, \
+                none(x IN [1, 2, 3] WHERE x < 0) AS none_hit, \
+                single(x IN [1, 2, 3] WHERE x = 2) AS single_hit",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let names = plan
+                .returns
+                .iter()
+                .map(|item| match &item.expr.kind {
+                    TypedExprKind::ScalarFunction {
+                        func: ScalarFunction::Generic(name),
+                        ..
+                    } => name.clone(),
+                    other => panic!("expected quantifier scalar function, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    "__cypher_any".to_owned(),
+                    "__cypher_all".to_owned(),
+                    "__cypher_none".to_owned(),
+                    "__cypher_single".to_owned()
+                ]
+            );
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_map_projection_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (n) RETURN n {.name, born: n.born, .*} AS payload",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            assert_eq!(plan.returns.len(), 1);
+            assert!(matches!(
+                &plan.returns[0].expr.kind,
+                TypedExprKind::ScalarFunction {
+                    func: ScalarFunction::Generic(name),
+                    ..
+                } if name == "__cypher_map_projection"
+            ));
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_graph_introspection_functions_are_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (a)-[r]->(b) \
+         RETURN id(a), elementId(a), labels(a), type(r), properties(a), properties(r), keys(a), keys(r), startNode(r), endNode(r)",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let names = plan
+                .returns
+                .iter()
+                .map(|item| match &item.expr.kind {
+                    TypedExprKind::ScalarFunction {
+                        func: ScalarFunction::Generic(name),
+                        ..
+                    } => name.clone(),
+                    other => panic!("expected graph scalar function, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    "id".to_owned(),
+                    "elementId".to_owned(),
+                    "labels".to_owned(),
+                    "type".to_owned(),
+                    "properties".to_owned(),
+                    "properties".to_owned(),
+                    "keys".to_owned(),
+                    "keys".to_owned(),
+                    "startNode".to_owned(),
+                    "endNode".to_owned(),
+                ]
+            );
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_path_introspection_functions_are_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH p = (a)-[:KNOWS*2]->(b) RETURN length(p), nodes(p), relationships(p), p",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let names = plan
+                .returns
+                .iter()
+                .map(|item| match &item.expr.kind {
+                    TypedExprKind::ScalarFunction {
+                        func: ScalarFunction::Generic(name),
+                        ..
+                    } => Some(name.clone()),
+                    TypedExprKind::ColumnRef { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![
+                    Some("length".to_owned()),
+                    Some("nodes".to_owned()),
+                    Some("relationships".to_owned()),
+                    Some("p".to_owned()),
+                ]
+            );
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_pattern_comprehension_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let plan = plan_with_catalog(
+        "MATCH (a) RETURN [(a)-[:KNOWS]->(b) WHERE b.active | b.name] AS friends",
+        &planner,
+    )
+    .expect("plan");
+
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            assert_eq!(plan.returns.len(), 1);
+            match &plan.returns[0].expr.kind {
+                TypedExprKind::ScalarFunction {
+                    func: ScalarFunction::Generic(name),
+                    args,
+                } => {
+                    assert_eq!(name, "__cypher_pattern_comprehension");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected pattern comprehension lowering, got {other:?}"),
+            }
         }
         other => panic!("expected CypherQuery plan, got {other:?}"),
     }
@@ -1464,6 +1895,94 @@ fn cypher_foreach_with_set_body_parses_and_lowers() {
                 &foreach.body[0],
                 aiondb_plan::graph::CypherForeachOp::Set(set)
                     if set.variable == "n" && set.property.as_deref() == Some("touched")
+            ));
+        }
+        other => panic!("expected CypherQuery plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn binder_accepts_cypher_foreach_in_direct_pipeline() {
+    let statement = parse_prepared_statement(
+        "MATCH (n) FOREACH (x IN [1, 2] | SET n.touched = x) RETURN n",
+    )
+    .expect("parse");
+    let binder = crate::binder::Binder::new(Arc::new(TestCatalog));
+    let bound = binder
+        .bind(&statement, TxnId::default(), None)
+        .expect("bind should succeed");
+
+    let BoundStatement::CypherQuery(query) = bound else {
+        panic!("expected bound cypher query");
+    };
+
+    assert!(matches!(
+        query.clause_order.as_slice(),
+        [
+            crate::binder::BoundCypherClauseRef::Match(_),
+            crate::binder::BoundCypherClauseRef::Foreach(_)
+        ] | [
+            crate::binder::BoundCypherClauseRef::Match(_),
+            crate::binder::BoundCypherClauseRef::Foreach(_),
+            crate::binder::BoundCypherClauseRef::With(_)
+        ] | [
+            crate::binder::BoundCypherClauseRef::Match(_),
+            crate::binder::BoundCypherClauseRef::Foreach(_),
+            crate::binder::BoundCypherClauseRef::Call(_)
+        ] | [
+            crate::binder::BoundCypherClauseRef::Match(_),
+            crate::binder::BoundCypherClauseRef::Foreach(_),
+            ..
+        ]
+    ));
+    assert_eq!(query.foreachs.len(), 1);
+    assert_eq!(query.foreachs[0].variable, "x");
+    assert!(matches!(
+        query.foreachs[0].body.as_slice(),
+        [crate::binder::BoundCypherForeachOp::Set(set)]
+            if set.variable == "n" && set.property == "touched"
+    ));
+}
+
+#[test]
+fn cypher_nested_foreach_is_lowered_in_native_pipeline() {
+    let planner = Planner::new(Arc::new(TestCatalog));
+    let statement = Statement::Cypher(CypherStatement {
+        clauses: vec![CypherClause::Foreach(CypherForeachClause {
+            variable: "x".to_owned(),
+            expr: Expr::Array {
+                elements: vec![Expr::Literal(Literal::Integer(1), Span::default())],
+                span: Span::default(),
+            },
+            clauses: vec![CypherClause::Foreach(CypherForeachClause {
+                variable: "y".to_owned(),
+                expr: Expr::Array {
+                    elements: vec![Expr::Literal(Literal::Integer(2), Span::default())],
+                    span: Span::default(),
+                },
+                clauses: Vec::new(),
+                span: Span::default(),
+            })],
+            span: Span::default(),
+        })],
+        union: None,
+        span: Span::default(),
+    });
+    let plan = plan_statement_with_catalog(&statement, &planner).expect("plan");
+    match plan {
+        LogicalPlan::CypherQuery(plan) => {
+            let foreach = plan
+                .pipeline
+                .iter()
+                .find_map(|op| match op {
+                    aiondb_plan::graph::CypherPipelineOp::Foreach(f) => Some(f),
+                    _ => None,
+                })
+                .expect("outer FOREACH pipeline op");
+            assert_eq!(foreach.variable, "x");
+            assert!(matches!(
+                foreach.body.as_slice(),
+                [aiondb_plan::graph::CypherForeachOp::Foreach(nested)] if nested.variable == "y"
             ));
         }
         other => panic!("expected CypherQuery plan, got {other:?}"),
