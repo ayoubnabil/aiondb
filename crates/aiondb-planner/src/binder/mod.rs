@@ -565,6 +565,7 @@ pub struct BoundCypherQuery {
     pub sets: Vec<BoundCypherSetItem>,
     pub deletes: Vec<BoundCypherDelete>,
     pub calls: Vec<BoundCypherCall>,
+    pub foreachs: Vec<BoundCypherForeach>,
     pub return_clause: Option<BoundCypherReturn>,
     pub clause_order: Vec<BoundCypherClauseRef>,
     pub union: Option<Box<BoundCypherUnion>>,
@@ -580,6 +581,7 @@ pub enum BoundCypherClauseRef {
     Unwind(usize),
     With(usize),
     Call(usize),
+    Foreach(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -655,6 +657,22 @@ pub enum BoundCypherCall {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundCypherForeach {
+    pub variable: String,
+    pub expr: Expr,
+    pub body: Vec<BoundCypherForeachOp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundCypherForeachOp {
+    Set(BoundCypherSetItem),
+    Create(BoundCypherCreate),
+    Merge(Box<BoundCypherMerge>),
+    Delete(BoundCypherDelete),
+    Foreach(Box<BoundCypherForeach>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundCypherProcedureCall {
     pub procedure: String,
     pub args: Vec<Expr>,
@@ -722,6 +740,14 @@ impl Binder {
             view_depth: std::sync::atomic::AtomicUsize::new(0),
             outer_columns: Vec::new(),
         }
+    }
+
+    pub(crate) fn bind_native_cypher_query(
+        &self,
+        stmt: &aiondb_parser::CypherStatement,
+        txn_id: TxnId,
+    ) -> DbResult<BoundCypherQuery> {
+        self.bind_cypher_query(stmt, txn_id)
     }
 
     pub fn with_outer_columns(mut self, outer_columns: Vec<ColumnDescriptor>) -> Self {
