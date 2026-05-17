@@ -12,6 +12,7 @@ use aiondb_graph::{
 use aiondb_plan::graph::{CypherPathFunction, CypherPattern, CypherRelDirection};
 
 use super::{ExecutionContext, Executor};
+use crate::executor::graph_plans::GraphMatchRuntimeCache;
 use crate::executor::graph_plans::{
     ensure_graph_result_row_capacity, ensure_graph_workset_capacity, estimate_bfs_path_bytes,
     estimate_shortest_path_queue_entry_bytes, size_of_u64, usize_to_u32, value_to_bfs_key,
@@ -252,8 +253,11 @@ impl Executor {
                 rel_pat.rel_type.as_deref(),
             )?;
 
-        let start_bindings = self.match_node(context, start_node_pat, input_bindings)?;
-        let start_and_end_bindings = self.match_node(context, end_node_pat, start_bindings)?;
+        let mut runtime_cache = GraphMatchRuntimeCache::default();
+        let start_bindings =
+            self.match_node(context, start_node_pat, input_bindings, &mut runtime_cache)?;
+        let start_and_end_bindings =
+            self.match_node(context, end_node_pat, start_bindings, &mut runtime_cache)?;
 
         let start_var = start_node_pat.variable.as_deref().unwrap_or("__sp_start__");
         let end_var = end_node_pat.variable.as_deref().unwrap_or("__sp_end__");
