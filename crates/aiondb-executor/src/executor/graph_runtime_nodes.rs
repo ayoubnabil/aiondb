@@ -7,8 +7,9 @@ use aiondb_plan::{TypedExpr, TypedExprKind};
 
 use super::{ExecutionContext, Executor};
 use crate::executor::graph_plans::{
-    format_cypher_bound_node_literal, format_cypher_node_literal, format_cypher_property_value,
-    push_graph_binding, BindingRow, BoundValue, SharedStrings,
+    compact_node_bound_value, format_cypher_bound_node_literal, format_cypher_node_literal,
+    format_cypher_property_value, push_graph_binding, BindingRow, BoundValue,
+    GraphMatchRuntimeCache, SharedStrings,
 };
 use crate::executor::helpers::exact_lookup_key_range;
 
@@ -547,8 +548,15 @@ impl Executor {
                         .cloned()
                         .unwrap_or(Value::Null);
 
-                    let new_binding = binding.clone().with_binding(
-                        &var_name,
+                    let bound_value = if binding.get("__edge_next_node_id__").is_some() {
+                        compact_node_bound_value(
+                            table_id,
+                            id_value.clone(),
+                            record.tuple_id,
+                            Arc::clone(&label_names),
+                            Arc::clone(&shared_union_cols),
+                        )
+                    } else {
                         BoundValue::Node {
                             table_id,
                             row: Arc::new(compat_row),
@@ -557,8 +565,10 @@ impl Executor {
                             tuple_id: record.tuple_id,
                             labels: Arc::clone(&label_names),
                             column_names: Arc::clone(&shared_union_cols),
-                        },
-                    );
+                        }
+                    };
+
+                    let new_binding = binding.clone().with_binding(&var_name, bound_value);
                     push_graph_binding(context, &mut output, new_binding)?;
                 }
             }
@@ -572,6 +582,7 @@ impl Executor {
         context: &ExecutionContext,
         node: &CypherNodePattern,
         input_bindings: Vec<BindingRow>,
+        runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
         let Some(table_id) = node.table_id else {
             if node.variable.is_some() {
@@ -614,7 +625,6 @@ impl Executor {
             )?,
             None => None,
         };
-
         for binding in &input_bindings {
             context.check_deadline()?;
 
@@ -646,6 +656,52 @@ impl Executor {
                 };
                 row.values.first().filter(|value| !value.is_null())
             });
+            let edge_target_key = edge_next_node_id.and_then(value_to_bfs_key);
+
+            if let Some(ref cache_key) = edge_target_key {
+                if let Some(cached) = runtime_cache
+                    .edge_target_cache
+                    .get(&(table_id, cache_key.clone()))
+                {
+                    let Some((compat_row, raw_row, id_value, tuple_id)) = cached.as_ref() else {
+                        continue;
+                    };
+                    if !self.check_property_filters(
+                        context,
+                        &node.properties,
+                        column_names.as_ref(),
+                        compat_row.as_ref(),
+                        binding,
+                    )? {
+                        continue;
+                    }
+
+                    let bound_value = if edge_next_node_id.is_some() {
+                        compact_node_bound_value(
+                            table_id,
+                            id_value.clone(),
+                            *tuple_id,
+                            Arc::clone(&labels),
+                            Arc::clone(&column_names),
+                        )
+                    } else {
+                        BoundValue::Node {
+                            table_id,
+                            row: Arc::clone(compat_row),
+                            raw_row: Arc::clone(raw_row),
+                            id_value: id_value.clone(),
+                            tuple_id: *tuple_id,
+                            labels: Arc::clone(&labels),
+                            column_names: Arc::clone(&column_names),
+                        }
+                    };
+
+                    let new_binding = binding.clone().with_binding(&var_name, bound_value);
+                    push_graph_binding(context, &mut output, new_binding)?;
+                    continue;
+                }
+            }
+
             let mut stream = self.scan_node_candidates(
                 context,
                 table_id,
@@ -693,20 +749,50 @@ impl Executor {
                 }
 
                 let id_value = compat_row.values.first().cloned().unwrap_or(Value::Null);
+                let compat_row = Arc::new(compat_row);
+                let raw_row = Arc::new(record.row);
 
-                let new_binding = binding.clone().with_binding(
-                    &var_name,
+                if let Some(ref cache_key) = edge_target_key {
+                    runtime_cache.edge_target_cache.insert(
+                        (table_id, cache_key.clone()),
+                        Some((
+                            Arc::clone(&compat_row),
+                            Arc::clone(&raw_row),
+                            id_value.clone(),
+                            record.tuple_id,
+                        )),
+                    );
+                }
+
+                let bound_value = if edge_next_node_id.is_some() {
+                    compact_node_bound_value(
+                        table_id,
+                        id_value.clone(),
+                        record.tuple_id,
+                        Arc::clone(&labels),
+                        Arc::clone(&column_names),
+                    )
+                } else {
                     BoundValue::Node {
                         table_id,
-                        row: Arc::new(compat_row),
-                        raw_row: Arc::new(record.row),
+                        row: compat_row,
+                        raw_row,
                         id_value,
                         tuple_id: record.tuple_id,
                         labels: Arc::clone(&labels),
                         column_names: Arc::clone(&column_names),
-                    },
-                );
+                    }
+                };
+
+                let new_binding = binding.clone().with_binding(&var_name, bound_value);
                 push_graph_binding(context, &mut output, new_binding)?;
+            }
+
+            if let Some(cache_key) = edge_target_key {
+                runtime_cache
+                    .edge_target_cache
+                    .entry((table_id, cache_key))
+                    .or_insert(None);
             }
         }
 
@@ -744,7 +830,7 @@ mod tests {
 
         assert!(
             !node_has_static_candidate_filter(&node),
-            "range-only filters should stay as direct target probes instead of precomputing all candidate ids"
+            "range-only filters should not precompute candidate ids eagerly"
         );
     }
 
