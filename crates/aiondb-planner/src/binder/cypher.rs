@@ -3,7 +3,7 @@
 // pipeline in engine/cypher_sql.rs.
 
 use aiondb_core::{DbError, DbResult, TxnId};
-use aiondb_parser::{CypherClause, CypherStatement};
+use aiondb_parser::{CypherClause, CypherStatement, Expr, Literal};
 
 use super::*;
 
@@ -21,6 +21,7 @@ impl Binder {
         let mut sets = Vec::new();
         let mut deletes = Vec::new();
         let mut calls = Vec::new();
+        let mut foreachs = Vec::new();
         let mut return_clause = None;
         let mut clause_order = Vec::new();
 
@@ -218,10 +219,10 @@ impl Binder {
                         }));
                     }
                 }
-                CypherClause::Foreach(_) => {
-                    return Err(DbError::feature_not_supported(
-                        "FOREACH is not supported in native Cypher yet",
-                    ));
+                CypherClause::Foreach(f) => {
+                    let bound = self.bind_cypher_foreach(f, txn_id)?;
+                    clause_order.push(BoundCypherClauseRef::Foreach(foreachs.len()));
+                    foreachs.push(bound);
                 }
             }
         }
@@ -246,9 +247,111 @@ impl Binder {
             sets,
             deletes,
             calls,
+            foreachs,
             return_clause,
             clause_order,
             union,
+        })
+    }
+
+    fn bind_cypher_foreach(
+        &self,
+        f: &aiondb_parser::CypherForeachClause,
+        txn_id: TxnId,
+    ) -> DbResult<BoundCypherForeach> {
+        let mut body = Vec::new();
+        for clause in &f.clauses {
+            match clause {
+                CypherClause::Set(s) => {
+                    for item in &s.items {
+                        match item {
+                            aiondb_parser::CypherSetItem::Property {
+                                variable,
+                                property,
+                                expr,
+                                ..
+                            } => body.push(BoundCypherForeachOp::Set(BoundCypherSetItem {
+                                variable: variable.clone(),
+                                property: property.clone(),
+                                expr: expr.clone(),
+                            })),
+                            aiondb_parser::CypherSetItem::Label {
+                                variable, label, ..
+                            } => {
+                                return Err(DbError::feature_not_supported(format!(
+                                    "SET {variable}:{label} inside FOREACH — label assignment is not yet supported in the direct pipeline"
+                                )));
+                            }
+                            aiondb_parser::CypherSetItem::ReplaceProperties {
+                                variable,
+                                entries,
+                                ..
+                            }
+                            | aiondb_parser::CypherSetItem::MergeProperties {
+                                variable,
+                                entries,
+                                ..
+                            } => {
+                                for (key, value_expr) in entries {
+                                    body.push(BoundCypherForeachOp::Set(BoundCypherSetItem {
+                                        variable: variable.clone(),
+                                        property: key.clone(),
+                                        expr: (**value_expr).clone(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                CypherClause::Remove(r) => {
+                    for item in &r.items {
+                        match item {
+                            aiondb_parser::CypherRemoveItem::Property {
+                                variable,
+                                property,
+                                span,
+                            } => body.push(BoundCypherForeachOp::Set(BoundCypherSetItem {
+                                variable: variable.clone(),
+                                property: property.clone(),
+                                expr: Expr::Literal(Literal::Null, *span),
+                            })),
+                            aiondb_parser::CypherRemoveItem::Label {
+                                variable, label, ..
+                            } => {
+                                return Err(DbError::feature_not_supported(format!(
+                                    "REMOVE {variable}:{label} inside FOREACH — label removal is not yet supported in the direct pipeline"
+                                )));
+                            }
+                        }
+                    }
+                }
+                CypherClause::Create(c) => body.push(BoundCypherForeachOp::Create(
+                    self.bind_cypher_create(c, txn_id)?,
+                )),
+                CypherClause::Merge(m) => body.push(BoundCypherForeachOp::Merge(Box::new(
+                    self.bind_cypher_merge(m, txn_id)?,
+                ))),
+                CypherClause::Delete(d) => body.push(BoundCypherForeachOp::Delete(
+                    BoundCypherDelete {
+                        detach: d.detach,
+                        variables: d.variables.clone(),
+                    },
+                )),
+                CypherClause::Foreach(nested) => body.push(BoundCypherForeachOp::Foreach(
+                    Box::new(self.bind_cypher_foreach(nested, txn_id)?),
+                )),
+                _ => {
+                    return Err(DbError::feature_not_supported(
+                        "only SET, REMOVE, CREATE, MERGE, DELETE and nested FOREACH are allowed inside FOREACH",
+                    ));
+                }
+            }
+        }
+
+        Ok(BoundCypherForeach {
+            variable: f.variable.clone(),
+            expr: f.expr.clone(),
+            body,
         })
     }
 
