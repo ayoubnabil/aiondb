@@ -2,6 +2,29 @@ use super::*;
 
 include!("graph_mutate_create_helpers.rs");
 
+pub(in crate::executor) fn compare_cypher_sort_keys(
+    left: &[Value],
+    right: &[Value],
+    order_by: &[SortExpr],
+) -> DbResult<Ordering> {
+    for (i, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+        let descending = order_by.get(i).is_some_and(|o| o.descending);
+        let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
+        let cmp = compare_sort_values(a, b, descending, nulls_first)?;
+        if cmp != Ordering::Equal {
+            return Ok(cmp);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+fn cypher_return_referenced_variables(
+    returns: &[ProjectionExpr],
+    order_by: &[SortExpr],
+) -> std::collections::HashSet<String> {
+    cypher_query_output_variables(returns, order_by)
+}
+
 impl Executor {
     // -----------------------------------------------------------------------
     // CREATE
@@ -370,8 +393,13 @@ impl Executor {
             context.check_deadline()?;
 
             // Try to match.
-            let mut matched =
-                self.execute_cypher_match(&merge_context, &match_clause, vec![binding.clone()])?;
+            let mut matched = self.execute_cypher_match(
+                &merge_context,
+                &match_clause,
+                vec![binding.clone()],
+                None,
+                None,
+            )?;
 
             if matched.is_empty() {
                 // No match: CREATE the pattern.
@@ -902,10 +930,42 @@ impl Executor {
         skip: Option<&TypedExpr>,
         limit: Option<&TypedExpr>,
         bindings: Vec<BindingRow>,
+        binding_reduction: Option<&GraphBindingReduction>,
     ) -> DbResult<Vec<Row>> {
+        let required_variables = cypher_return_referenced_variables(returns, order_by);
+        let mut bindings = bindings;
+        if !required_variables.is_empty() {
+            for binding in &mut bindings {
+                retain_graph_binding_variables(binding, &required_variables);
+            }
+        }
+
         // Check if any RETURN expression contains an aggregate function.
         let has_aggregates = returns.iter().any(|r| expr_contains_aggregate(&r.expr));
         let early_limit = if !has_aggregates && !distinct && order_by.is_empty() && skip.is_none() {
+            match limit {
+                Some(limit_expr) => {
+                    let limit_val = self.evaluate_expr(limit_expr, context)?;
+                    match limit_val {
+                        Value::BigInt(n) if n >= 0 => Some(nonneg_i64_to_usize(n)),
+                        Value::Int(n) if n >= 0 => Some(nonneg_i64_to_usize(i64::from(n))),
+                        Value::BigInt(_) | Value::Int(_) => {
+                            return Err(DbError::syntax_error(
+                                "LIMIT requires a non-negative integer value",
+                            ));
+                        }
+                        Value::Real(_) | Value::Double(_) | Value::Numeric(_) => {
+                            return Err(DbError::syntax_error("LIMIT requires an integer value"));
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let topn_limit = if !has_aggregates && !distinct && !order_by.is_empty() && skip.is_none() {
             match limit {
                 Some(limit_expr) => {
                     let limit_val = self.evaluate_expr(limit_expr, context)?;
@@ -944,46 +1004,50 @@ impl Executor {
                 .filter(|is_aggregate| !**is_aggregate)
                 .count();
 
-            let mut groups = HashMap::<Vec<ValueHashKey>, (Vec<Value>, Vec<AggAccumulator>)>::new();
-
-            if bindings.is_empty() && group_key_count == 0 {
-                groups.insert(
-                    Vec::new(),
-                    (
-                        Vec::new(),
-                        aggregate_templates
-                            .iter()
-                            .map(AggAccumulator::from_template)
-                            .collect(),
-                    ),
-                );
-            }
-
-            for binding in &bindings {
-                context.check_deadline()?;
-                let mut group_values = Vec::with_capacity(group_key_count);
-                let mut group_key = Vec::with_capacity(group_key_count);
-                for (item, is_aggregate) in returns.iter().zip(aggregate_slots.iter()) {
-                    if *is_aggregate {
-                        continue;
+            if group_key_count == 0
+                && returns.len() == 1
+                && aggregate_templates.len() == 1
+                && matches!(aggregate_templates[0].kind, AggKind::CountExpr(_))
+                && aggregate_templates[0].distinct
+            {
+                let template = &aggregate_templates[0];
+                let AggKind::CountExpr(inner) = &template.kind else {
+                    unreachable!();
+                };
+                if matches!(
+                    binding_reduction,
+                    Some(GraphBindingReduction::GlobalDistinctExpr(reduced_expr))
+                        if reduced_expr == inner.as_ref()
+                ) {
+                    let mut count = 0i64;
+                    for binding in &bindings {
+                        context.check_deadline()?;
+                        if let Some(ref filter_expr) = template.filter {
+                            let filter_val = self.evaluate_cypher_expr_with_binding(
+                                filter_expr,
+                                binding,
+                                context,
+                            )?;
+                            if !matches!(filter_val, Value::Boolean(true)) {
+                                continue;
+                            }
+                        }
+                        if cypher_direct_distinct_key(inner, binding).is_some() {
+                            count = count.saturating_add(1);
+                            continue;
+                        }
+                        let value =
+                            self.evaluate_cypher_expr_with_binding(inner, binding, context)?;
+                        if !value.is_null() {
+                            count = count.saturating_add(1);
+                        }
                     }
-                    let value =
-                        self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
-                    group_key.push(build_hash_key(&value)?);
-                    group_values.push(value);
+                    return Ok(vec![Row::new(vec![Value::BigInt(count)])]);
                 }
-
-                let (_, accumulators) = groups.entry(group_key).or_insert_with(|| {
-                    (
-                        group_values,
-                        aggregate_templates
-                            .iter()
-                            .map(AggAccumulator::from_template)
-                            .collect(),
-                    )
-                });
-
-                for (template, acc) in aggregate_templates.iter().zip(accumulators.iter_mut()) {
+                let mut seen = HashSet::<ValueHashKey>::new();
+                let mut count = 0i64;
+                for binding in &bindings {
+                    context.check_deadline()?;
                     if let Some(ref filter_expr) = template.filter {
                         let filter_val =
                             self.evaluate_cypher_expr_with_binding(filter_expr, binding, context)?;
@@ -991,112 +1055,295 @@ impl Executor {
                             continue;
                         }
                     }
-                    self.accumulate_cypher_aggregate_value(acc, template, binding, context)?;
-                }
-            }
-
-            let mut rows = Vec::with_capacity(groups.len());
-            for (_, (group_values, accumulators)) in groups {
-                context.check_deadline()?;
-                let mut projected_values = Vec::with_capacity(returns.len());
-                let mut group_idx = 0usize;
-                let mut aggregate_idx = 0usize;
-                for is_aggregate in &aggregate_slots {
-                    if *is_aggregate {
-                        let template = &aggregate_templates[aggregate_idx];
-                        let acc = &accumulators[aggregate_idx];
-                        projected_values.push(finalize_accumulator(
-                            acc,
-                            template,
-                            &self.evaluator,
-                            context,
-                        )?);
-                        aggregate_idx = aggregate_idx.saturating_add(1);
-                    } else {
-                        projected_values
-                            .push(group_values.get(group_idx).cloned().unwrap_or(Value::Null));
-                        group_idx = group_idx.saturating_add(1);
+                    if let Some(key) = cypher_direct_distinct_key(inner, binding) {
+                        if seen.insert(key) {
+                            context.track_memory(80)?;
+                            count = count.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    let value = self.evaluate_cypher_expr_with_binding(inner, binding, context)?;
+                    if value.is_null() {
+                        continue;
+                    }
+                    let key = build_hash_key(&value)?;
+                    if seen.insert(key) {
+                        context
+                            .track_memory(super::estimate_value_bytes(&value).saturating_add(64))?;
+                        count = count.saturating_add(1);
                     }
                 }
-                rows.push(Row::new(projected_values));
-            }
-            if distinct {
-                rows = dedup_rows_by_values(rows)?;
-            }
-            rows
-        } else {
-            // Keep both the flattened input row and the projected output row so
-            // ORDER BY can evaluate expressions that are not part of RETURN.
-            let projected_capacity =
-                early_limit.map_or(bindings.len(), |limit| bindings.len().min(limit));
-            let mut projected_rows: Vec<(BindingRow, Row)> = Vec::with_capacity(projected_capacity);
-            for binding in &bindings {
-                if early_limit.is_some_and(|limit| projected_rows.len() >= limit) {
-                    break;
-                }
-                context.check_deadline()?;
-                let mut projected_values = Vec::with_capacity(returns.len());
-                for item in returns {
-                    let value =
-                        self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
-                    projected_values.push(value);
-                }
-                projected_rows.push((binding.clone(), Row::new(projected_values)));
-            }
-
-            if distinct {
-                projected_rows = dedup_projected_rows_by_values(projected_rows)?;
-            }
-
-            if order_by.is_empty() {
-                projected_rows.into_iter().map(|(_, row)| row).collect()
+                vec![Row::new(vec![Value::BigInt(count)])]
             } else {
-                let mut keyed_rows: Vec<(Vec<Value>, Row)> =
-                    Vec::with_capacity(projected_rows.len());
-                for (binding, row) in projected_rows.drain(..) {
+                let mut groups =
+                    HashMap::<Vec<ValueHashKey>, (Vec<Value>, Vec<AggAccumulator>)>::new();
+
+                if bindings.is_empty() && group_key_count == 0 {
+                    groups.insert(
+                        Vec::new(),
+                        (
+                            Vec::new(),
+                            aggregate_templates
+                                .iter()
+                                .map(AggAccumulator::from_template)
+                                .collect(),
+                        ),
+                    );
+                }
+
+                for binding in &bindings {
                     context.check_deadline()?;
+                    let mut group_values = Vec::with_capacity(group_key_count);
+                    let mut group_key = Vec::with_capacity(group_key_count);
+                    for (item, is_aggregate) in returns.iter().zip(aggregate_slots.iter()) {
+                        if *is_aggregate {
+                            continue;
+                        }
+                        let value =
+                            self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
+                        group_key.push(build_hash_key(&value)?);
+                        group_values.push(value);
+                    }
+
+                    let (_, accumulators) = groups.entry(group_key).or_insert_with(|| {
+                        (
+                            group_values,
+                            aggregate_templates
+                                .iter()
+                                .map(AggAccumulator::from_template)
+                                .collect(),
+                        )
+                    });
+
+                    for (template, acc) in aggregate_templates.iter().zip(accumulators.iter_mut()) {
+                        if let Some(ref filter_expr) = template.filter {
+                            let filter_val = self.evaluate_cypher_expr_with_binding(
+                                filter_expr,
+                                binding,
+                                context,
+                            )?;
+                            if !matches!(filter_val, Value::Boolean(true)) {
+                                continue;
+                            }
+                        }
+                        self.accumulate_cypher_aggregate_value(acc, template, binding, context)?;
+                    }
+                }
+
+                let mut rows = Vec::with_capacity(groups.len());
+                for (_, (group_values, accumulators)) in groups {
+                    context.check_deadline()?;
+                    let mut projected_values = Vec::with_capacity(returns.len());
+                    let mut group_idx = 0usize;
+                    let mut aggregate_idx = 0usize;
+                    for is_aggregate in &aggregate_slots {
+                        if *is_aggregate {
+                            let template = &aggregate_templates[aggregate_idx];
+                            let acc = &accumulators[aggregate_idx];
+                            projected_values.push(finalize_accumulator(
+                                acc,
+                                template,
+                                &self.evaluator,
+                                context,
+                            )?);
+                            aggregate_idx = aggregate_idx.saturating_add(1);
+                        } else {
+                            projected_values
+                                .push(group_values.get(group_idx).cloned().unwrap_or(Value::Null));
+                            group_idx = group_idx.saturating_add(1);
+                        }
+                    }
+                    rows.push(Row::new(projected_values));
+                }
+                if distinct {
+                    rows = dedup_rows_by_values(rows)?;
+                }
+                // ORDER BY after aggregation. Cypher only permits ordering by a
+                // returned column/alias (a grouping key or an aggregate that
+                // appears in RETURN), because the pre-aggregation bindings are
+                // gone. Resolve each sort key to its projected column, then sort
+                // with the same comparison logic as the non-aggregate path.
+                if !order_by.is_empty() {
+                    let mut order_cols = Vec::with_capacity(order_by.len());
+                    for ob in order_by {
+                        let idx = resolve_aggregate_order_column(&ob.expr, returns).ok_or_else(
+                        || {
+                            DbError::syntax_error(
+                                "ORDER BY after aggregation must reference a returned column or alias",
+                            )
+                        },
+                    )?;
+                        order_cols.push(idx);
+                    }
+                    let mut keyed: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
+                    for row in rows.drain(..) {
+                        context.check_deadline()?;
+                        let keys = order_cols
+                            .iter()
+                            .map(|&c| row.values.get(c).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        keyed.push((keys, row));
+                    }
+                    let failed = std::cell::Cell::new(false);
+                    let error: std::cell::RefCell<Option<DbError>> = std::cell::RefCell::new(None);
+                    keyed.sort_by(|(a_keys, _), (b_keys, _)| {
+                        if failed.get() {
+                            return Ordering::Equal;
+                        }
+                        if let Err(e) = context.check_deadline() {
+                            failed.set(true);
+                            *error.borrow_mut() = Some(e);
+                            return Ordering::Equal;
+                        }
+                        for (i, (a, b)) in a_keys.iter().zip(b_keys.iter()).enumerate() {
+                            let descending = order_by.get(i).is_some_and(|o| o.descending);
+                            let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
+                            let cmp = match compare_sort_values(a, b, descending, nulls_first) {
+                                Ok(cmp) => cmp,
+                                Err(e) => {
+                                    failed.set(true);
+                                    *error.borrow_mut() = Some(e);
+                                    return Ordering::Equal;
+                                }
+                            };
+                            if cmp != Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    if let Some(e) = error.into_inner() {
+                        return Err(e);
+                    }
+                    rows = keyed.into_iter().map(|(_, row)| row).collect();
+                }
+                rows
+            }
+        } else {
+            if let Some(limit) = topn_limit {
+                let mut top_rows: Vec<(Vec<Value>, Row)> =
+                    Vec::with_capacity(limit.min(bindings.len()));
+                for binding in &bindings {
+                    context.check_deadline()?;
+                    let mut projected_values = Vec::with_capacity(returns.len());
+                    for item in returns {
+                        let value =
+                            self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
+                        projected_values.push(value);
+                    }
+                    let row = Row::new(projected_values);
                     let mut keys = Vec::with_capacity(order_by.len());
                     for ob in order_by {
                         keys.push(
-                            self.evaluate_cypher_expr_with_binding(&ob.expr, &binding, context)?,
+                            self.evaluate_cypher_expr_with_binding(&ob.expr, binding, context)?,
                         );
                     }
-                    keyed_rows.push((keys, row));
-                }
 
-                let failed = std::cell::Cell::new(false);
-                let error: std::cell::RefCell<Option<DbError>> = std::cell::RefCell::new(None);
-                keyed_rows.sort_by(|(a_keys, _), (b_keys, _)| {
-                    if failed.get() {
-                        return Ordering::Equal;
+                    if top_rows.len() < limit {
+                        top_rows.push((keys, row));
+                        continue;
                     }
-                    if let Err(e) = context.check_deadline() {
-                        failed.set(true);
-                        *error.borrow_mut() = Some(e);
-                        return Ordering::Equal;
-                    }
-                    for (i, (a, b)) in a_keys.iter().zip(b_keys.iter()).enumerate() {
-                        let descending = order_by.get(i).is_some_and(|o| o.descending);
-                        let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
-                        let cmp = match compare_sort_values(a, b, descending, nulls_first) {
-                            Ok(cmp) => cmp,
-                            Err(e) => {
-                                failed.set(true);
-                                *error.borrow_mut() = Some(e);
-                                return Ordering::Equal;
-                            }
-                        };
-                        if cmp != Ordering::Equal {
-                            return cmp;
+
+                    let mut worst_idx = 0usize;
+                    for idx in 1..top_rows.len() {
+                        if compare_cypher_sort_keys(
+                            &top_rows[worst_idx].0,
+                            &top_rows[idx].0,
+                            order_by,
+                        )? == Ordering::Less
+                        {
+                            worst_idx = idx;
                         }
                     }
-                    Ordering::Equal
-                });
-                if let Some(e) = error.into_inner() {
-                    return Err(e);
+
+                    if compare_cypher_sort_keys(&keys, &top_rows[worst_idx].0, order_by)?
+                        == Ordering::Less
+                    {
+                        top_rows[worst_idx] = (keys, row);
+                    }
                 }
 
-                keyed_rows.into_iter().map(|(_, row)| row).collect()
+                top_rows.sort_by(|(a_keys, _), (b_keys, _)| {
+                    compare_cypher_sort_keys(a_keys, b_keys, order_by).unwrap_or(Ordering::Equal)
+                });
+                top_rows.into_iter().map(|(_, row)| row).collect()
+            } else {
+                // Keep both the flattened input row and the projected output row so
+                // ORDER BY can evaluate expressions that are not part of RETURN.
+                let projected_capacity =
+                    early_limit.map_or(bindings.len(), |limit| bindings.len().min(limit));
+                let mut projected_rows: Vec<(BindingRow, Row)> =
+                    Vec::with_capacity(projected_capacity);
+                for binding in &bindings {
+                    if early_limit.is_some_and(|limit| projected_rows.len() >= limit) {
+                        break;
+                    }
+                    context.check_deadline()?;
+                    let mut projected_values = Vec::with_capacity(returns.len());
+                    for item in returns {
+                        let value =
+                            self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
+                        projected_values.push(value);
+                    }
+                    projected_rows.push((binding.clone(), Row::new(projected_values)));
+                }
+
+                if distinct {
+                    projected_rows = dedup_projected_rows_by_values(projected_rows)?;
+                }
+
+                if order_by.is_empty() {
+                    projected_rows.into_iter().map(|(_, row)| row).collect()
+                } else {
+                    let mut keyed_rows: Vec<(Vec<Value>, Row)> =
+                        Vec::with_capacity(projected_rows.len());
+                    for (binding, row) in projected_rows.drain(..) {
+                        context.check_deadline()?;
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for ob in order_by {
+                            keys.push(
+                                self.evaluate_cypher_expr_with_binding(
+                                    &ob.expr, &binding, context,
+                                )?,
+                            );
+                        }
+                        keyed_rows.push((keys, row));
+                    }
+
+                    let failed = std::cell::Cell::new(false);
+                    let error: std::cell::RefCell<Option<DbError>> = std::cell::RefCell::new(None);
+                    keyed_rows.sort_by(|(a_keys, _), (b_keys, _)| {
+                        if failed.get() {
+                            return Ordering::Equal;
+                        }
+                        if let Err(e) = context.check_deadline() {
+                            failed.set(true);
+                            *error.borrow_mut() = Some(e);
+                            return Ordering::Equal;
+                        }
+                        for (i, (a, b)) in a_keys.iter().zip(b_keys.iter()).enumerate() {
+                            let descending = order_by.get(i).is_some_and(|o| o.descending);
+                            let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
+                            let cmp = match compare_sort_values(a, b, descending, nulls_first) {
+                                Ok(cmp) => cmp,
+                                Err(e) => {
+                                    failed.set(true);
+                                    *error.borrow_mut() = Some(e);
+                                    return Ordering::Equal;
+                                }
+                            };
+                            if cmp != Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    if let Some(e) = error.into_inner() {
+                        return Err(e);
+                    }
+
+                    keyed_rows.into_iter().map(|(_, row)| row).collect()
+                }
             }
         };
 
@@ -1141,7 +1388,7 @@ impl Executor {
 
         Ok(rows)
     }
-    pub(super) fn evaluate_cypher_expr_with_binding(
+    pub(in crate::executor) fn evaluate_cypher_expr_with_binding(
         &self,
         expr: &TypedExpr,
         binding: &BindingRow,
@@ -1177,8 +1424,8 @@ impl Executor {
         binding: &BindingRow,
         name: &str,
     ) -> Option<DbResult<Value>> {
-        if let Some(value) = self.resolve_cypher_variable(binding, name) {
-            return Some(Ok(value));
+        if let Some(value) = self.resolve_cypher_variable_with_context(context, binding, name) {
+            return Some(value);
         }
 
         let (variable, property) = name.split_once('.')?;
@@ -1251,6 +1498,92 @@ impl Executor {
                 }
             }
             _ => None,
+        }
+    }
+
+    fn resolve_cypher_variable_with_context(
+        &self,
+        context: &ExecutionContext,
+        binding: &BindingRow,
+        name: &str,
+    ) -> Option<DbResult<Value>> {
+        match binding.get(name) {
+            Some(BoundValue::Scalar(v)) => Some(Ok(v.clone())),
+            Some(BoundValue::Null { .. }) => Some(Ok(Value::Null)),
+            Some(BoundValue::Node {
+                table_id,
+                tuple_id,
+                row,
+                column_names,
+                labels,
+                ..
+            }) => Some(if row.values.len() >= column_names.len() {
+                Ok(Value::Text(format_cypher_node_literal(
+                    column_names,
+                    row,
+                    labels,
+                )))
+            } else {
+                self.storage_dml
+                    .fetch(
+                        context.txn_id,
+                        &context.snapshot,
+                        *table_id,
+                        *tuple_id,
+                        None,
+                    )
+                    .map(|fetched| {
+                        let rendered = fetched.as_ref().unwrap_or(row.as_ref());
+                        Value::Text(format_cypher_node_literal(column_names, rendered, labels))
+                    })
+            }),
+            Some(BoundValue::Edge {
+                table_id,
+                tuple_id,
+                row,
+                column_names,
+                rel_type,
+                ..
+            }) => Some(if row.values.len() >= column_names.len() {
+                Ok(Value::Text(format_cypher_edge_literal(
+                    column_names,
+                    row,
+                    rel_type,
+                )))
+            } else {
+                self.storage_dml
+                    .fetch(
+                        context.txn_id,
+                        &context.snapshot,
+                        *table_id,
+                        *tuple_id,
+                        None,
+                    )
+                    .map(|fetched| {
+                        let rendered = fetched.as_ref().unwrap_or(row.as_ref());
+                        Value::Text(format_cypher_edge_literal(column_names, rendered, rel_type))
+                    })
+            }),
+            Some(BoundValue::Path {
+                nodes,
+                relationships,
+                directions,
+            }) => Some(Ok(Value::Text(format_cypher_path_literal(
+                binding,
+                nodes,
+                relationships,
+                directions,
+            )))),
+            Some(BoundValue::PathValues {
+                nodes,
+                relationships,
+                directions,
+            }) => Some(Ok(Value::Text(format_cypher_path_value_literal(
+                nodes,
+                relationships,
+                directions,
+            )))),
+            None => None,
         }
     }
 
@@ -1383,14 +1716,17 @@ impl Executor {
                 "failed to decode Cypher EXISTS subquery plan: {error}",
             ))
         })?;
-        if subquery.union.is_some() {
-            return Err(DbError::feature_not_supported(
-                "UNION inside Cypher EXISTS subqueries is not yet supported",
-            ));
-        }
-
-        let rows = self.execute_cypher_subquery_body(context, &subquery, vec![binding.clone()])?;
-        let exists = !rows.is_empty();
+        let left_rows =
+            self.execute_cypher_subquery_body(context, &subquery, vec![binding.clone()])?;
+        let exists = if !left_rows.is_empty() {
+            true
+        } else if let Some(union_plan) = subquery.union.as_ref() {
+            !self
+                .execute_cypher_subquery_body(context, &union_plan.right, vec![binding.clone()])?
+                .is_empty()
+        } else {
+            false
+        };
         Ok(Value::Boolean(if negated { !exists } else { exists }))
     }
 
@@ -1400,9 +1736,9 @@ impl Executor {
         binding: &BindingRow,
         context: &ExecutionContext,
     ) -> DbResult<Value> {
-        if args.len() != 1 {
+        if args.len() != 1 && args.len() != 2 {
             return Err(DbError::internal(
-                "__cypher_pattern_comprehension expects exactly one argument",
+                "__cypher_pattern_comprehension expects one or two arguments",
             ));
         }
 
@@ -1414,46 +1750,171 @@ impl Executor {
                 )));
             }
         };
-        let subquery: CypherQueryPlan = serde_json::from_str(&payload).map_err(|error| {
+        let imported_vars = if let Some(vars_expr) = args.get(1) {
+            match self.evaluate_cypher_expr_with_binding(vars_expr, binding, context)? {
+                Value::Array(values) => values
+                    .into_iter()
+                    .filter_map(|value| match value {
+                        Value::Text(name) if binding.get(&name).is_some() => Some(Ok(name)),
+                        Value::Text(_) => None,
+                        other => Some(Err(DbError::internal(format!(
+                            "__cypher_pattern_comprehension imported vars must be text, got {other:?}",
+                        )))),
+                    })
+                    .collect::<DbResult<Vec<_>>>()?,
+                other => {
+                    return Err(DbError::internal(format!(
+                        "__cypher_pattern_comprehension imported vars must be an array, got {other:?}",
+                    )));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut subquery: CypherQueryPlan = serde_json::from_str(&payload).map_err(|error| {
             DbError::internal(format!(
                 "failed to decode Cypher pattern comprehension plan: {error}",
             ))
         })?;
-        if subquery.union.is_some() {
-            return Err(DbError::feature_not_supported(
-                "UNION inside Cypher pattern comprehensions is not supported",
-            ));
+        self.hydrate_pattern_comprehension_imported_graph_bindings(&mut subquery, binding);
+        let mut subquery_binding = BindingRow::new();
+        for name in &imported_vars {
+            if let Some(value) = binding.get_shared(name) {
+                subquery_binding.insert_shared_binding(name.clone(), value);
+            }
+        }
+        if matches!(subquery.pipeline.first(), Some(CypherPipelineOp::With(_))) {
+            subquery.pipeline.remove(0);
         }
         if subquery.returns.is_empty() {
             return Ok(Value::Array(Vec::new()));
         }
 
-        let rows = self.execute_cypher_subquery_body(context, &subquery, vec![binding.clone()])?;
-        let alias = subquery.returns[0].field.name.clone();
-        let projected = self.execute_cypher_with(
-            context,
-            &aiondb_plan::graph::CypherWithClause {
-                distinct: subquery.distinct,
-                items: subquery.returns.clone(),
-                preserve_binding_sources: vec![None; subquery.returns.len()],
-                filter: None,
-                order_by: subquery.order_by.clone(),
-                skip: subquery.skip.clone(),
-                limit: subquery.limit.clone(),
-            },
-            rows,
-        )?;
+        let projection_alias = subquery.returns[0].field.name.clone();
+        let mut projected =
+            self.execute_cypher_call_subquery_branch(context, &subquery, subquery_binding.clone())?;
+        if let Some(union_plan) = subquery.union.as_ref() {
+            let right_returned = self.execute_cypher_call_subquery_branch(
+                context,
+                &union_plan.right,
+                subquery_binding,
+            )?;
+            projected.extend(right_returned);
+            if !union_plan.all {
+                let mut seen = HashSet::<Vec<ValueHashKey>>::new();
+                let mut deduped = Vec::with_capacity(projected.len());
+                for binding in projected.drain(..) {
+                    context.check_deadline()?;
+                    let key = self
+                        .build_flat_row(&binding)
+                        .values
+                        .iter()
+                        .map(build_hash_key)
+                        .collect::<DbResult<Vec<_>>>()?;
+                    if seen.insert(key) {
+                        deduped.push(binding);
+                    }
+                }
+                projected = deduped;
+            }
+        }
 
         let mut output = Vec::with_capacity(projected.len());
         for row in projected {
             context.check_deadline()?;
-            let value = self
-                .resolve_cypher_variable(&row, &alias)
-                .unwrap_or(Value::Null);
+            let value = match row.get(&projection_alias) {
+                Some(BoundValue::Scalar(value)) => value.clone(),
+                Some(other) => {
+                    return Err(DbError::internal(format!(
+                        "Cypher pattern comprehension expected scalar projection, got {other:?}",
+                    )));
+                }
+                None => Value::Null,
+            };
             context.track_memory(super::estimate_value_bytes(&value).saturating_add(64))?;
             output.push(value);
         }
         Ok(Value::Array(output))
+    }
+
+    fn hydrate_pattern_comprehension_imported_graph_bindings(
+        &self,
+        subquery: &mut CypherQueryPlan,
+        binding: &BindingRow,
+    ) {
+        for op in &mut subquery.pipeline {
+            if let CypherPipelineOp::Match(clause) = op {
+                self.hydrate_pattern_comprehension_match_clause(clause, binding);
+            }
+        }
+        for clause in &mut subquery.matches {
+            self.hydrate_pattern_comprehension_match_clause(clause, binding);
+        }
+    }
+
+    fn hydrate_pattern_comprehension_match_clause(
+        &self,
+        clause: &mut CypherMatchClause,
+        binding: &BindingRow,
+    ) {
+        for pattern in &mut clause.patterns {
+            for node in &mut pattern.nodes {
+                let Some(variable) = node.variable.as_deref() else {
+                    continue;
+                };
+                let Some(BoundValue::Node {
+                    table_id,
+                    id_value,
+                    labels,
+                    column_names,
+                    ..
+                }) = binding.get(variable)
+                else {
+                    continue;
+                };
+                if node.table_id.is_none() {
+                    node.table_id = Some(*table_id);
+                }
+                if node.label.is_none() {
+                    node.label = labels
+                        .iter()
+                        .find(|label| label.as_str() != "_default")
+                        .cloned();
+                }
+                if let Some(id_column) = column_names.first() {
+                    let has_id_constraint = node.properties.iter().any(|property| {
+                        property.key.eq_ignore_ascii_case(id_column)
+                    });
+                    if !has_id_constraint {
+                        node.properties.push(CypherPropertyExpr {
+                            key: id_column.clone(),
+                            value: TypedExpr::literal(
+                                id_value.clone(),
+                                id_value.data_type().unwrap_or(DataType::Text),
+                                id_value.is_null(),
+                            ),
+                        });
+                    }
+                }
+            }
+            for rel in &mut pattern.relationships {
+                let Some(variable) = rel.variable.as_deref() else {
+                    continue;
+                };
+                let Some(BoundValue::Edge {
+                    table_id, rel_type, ..
+                }) = binding.get(variable)
+                else {
+                    continue;
+                };
+                if rel.table_id.is_none() {
+                    rel.table_id = Some(*table_id);
+                }
+                if rel.rel_type.is_none() {
+                    rel.rel_type = Some(rel_type.to_string());
+                }
+            }
+        }
     }
 
     fn evaluate_cypher_map_projection(
@@ -1662,6 +2123,17 @@ impl Executor {
                 acc.count = acc.count.saturating_add(1);
             }
             AggKind::CountExpr(inner) => {
+                if let Some(distinct_key) = template
+                    .distinct
+                    .then(|| cypher_direct_distinct_key(inner, binding))
+                    .flatten()
+                {
+                    if !check_cypher_distinct_key(acc, distinct_key, 80, context)? {
+                        return Ok(());
+                    }
+                    acc.count = acc.count.saturating_add(1);
+                    return Ok(());
+                }
                 let value = self.evaluate_cypher_expr_with_binding(inner, binding, context)?;
                 if !value.is_null() {
                     if !check_cypher_distinct(acc, &value, context)? {
@@ -1988,11 +2460,15 @@ fn cypher_bound_properties_object(
 ) -> DbResult<Option<serde_json::Map<String, serde_json::Value>>> {
     match bound {
         BoundValue::Node {
-            row, column_names, ..
+            raw_row,
+            column_names,
+            ..
         }
         | BoundValue::Edge {
-            row, column_names, ..
-        } => Ok(Some(cypher_row_properties_object(column_names, row))),
+            raw_row,
+            column_names,
+            ..
+        } => Ok(Some(cypher_row_properties_object(column_names, raw_row))),
         BoundValue::Null { .. } => Ok(None),
         _ => Err(DbError::internal(
             "properties() argument must be a graph node or relationship",
@@ -2054,15 +2530,63 @@ fn check_cypher_distinct(
     value: &Value,
     context: &ExecutionContext,
 ) -> DbResult<bool> {
-    if let Some(ref mut seen) = acc.distinct_seen {
+    if acc.distinct_seen.is_some() {
         let key = build_hash_key(value)?;
+        check_cypher_distinct_key(
+            acc,
+            key,
+            super::estimate_value_bytes(value).saturating_add(64),
+            context,
+        )
+    } else {
+        Ok(true)
+    }
+}
+
+fn check_cypher_distinct_key(
+    acc: &mut AggAccumulator,
+    key: ValueHashKey,
+    estimated_bytes: u64,
+    context: &ExecutionContext,
+) -> DbResult<bool> {
+    if let Some(ref mut seen) = acc.distinct_seen {
         let is_new = seen.insert(key);
         if is_new {
-            context.track_memory(super::estimate_value_bytes(value).saturating_add(64))?;
+            context.track_memory(estimated_bytes)?;
         }
         Ok(is_new)
     } else {
         Ok(true)
+    }
+}
+
+fn cypher_direct_distinct_key(expr: &TypedExpr, binding: &BindingRow) -> Option<ValueHashKey> {
+    match &expr.kind {
+        TypedExprKind::ColumnRef { name, .. } => {
+            let (variable, property) = name.split_once('.')?;
+            if !property.eq_ignore_ascii_case("id") {
+                return None;
+            }
+            match binding.get(variable) {
+                Some(BoundValue::Node { id_value, .. }) if !id_value.is_null() => {
+                    build_hash_key(id_value).ok()
+                }
+                _ => None,
+            }
+        }
+        TypedExprKind::ScalarFunction {
+            func: ScalarFunction::Generic(function_name),
+            args,
+        } if function_name.eq_ignore_ascii_case("id") && args.len() == 1 => {
+            let variable = cypher_direct_binding_variable(&args[0])?;
+            match binding.get(variable) {
+                Some(BoundValue::Node { id_value, .. }) if !id_value.is_null() => {
+                    build_hash_key(id_value).ok()
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2079,6 +2603,20 @@ where
         }
     }
     Ok(deduped)
+}
+
+/// Resolve an ORDER BY expression that follows an aggregation to the index of
+/// the RETURN projection it refers to. Cypher only allows ordering by a
+/// returned alias or a returned expression (a grouping key or an aggregate
+/// present in RETURN); anything else has no meaning after aggregation because
+/// the pre-aggregation bindings no longer exist.
+fn resolve_aggregate_order_column(expr: &TypedExpr, returns: &[ProjectionExpr]) -> Option<usize> {
+    if let TypedExprKind::ColumnRef { name, .. } = &expr.kind {
+        if let Some(idx) = returns.iter().position(|r| r.field.name == *name) {
+            return Some(idx);
+        }
+    }
+    returns.iter().position(|r| r.expr == *expr)
 }
 
 pub(super) fn dedup_rows_by_values(rows: Vec<Row>) -> DbResult<Vec<Row>> {
