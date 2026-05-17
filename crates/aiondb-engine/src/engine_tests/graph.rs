@@ -641,6 +641,36 @@ fn cypher_graph_element_introspection_functions_use_native_bindings() {
 }
 
 #[test]
+fn cypher_properties_survive_binding_compaction() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people (id INT NOT NULL, name TEXT, born INT); \
+             INSERT INTO people VALUES (1, 'alice', 1984), (2, 'bob', 1990); \
+             CREATE NODE LABEL Person ON people",
+        )
+        .expect("setup graph property compaction data");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person) \
+         RETURN properties(n) \
+         ORDER BY n.id \
+         LIMIT 1",
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0],
+        Value::Jsonb(serde_json::json!({"name": "alice", "born": 1984}))
+    );
+}
+
+#[test]
 fn cypher_map_projection_returns_native_graph_properties() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -1417,6 +1447,116 @@ fn cypher_call_subquery_can_return_correlated_match_results() {
 }
 
 #[test]
+fn cypher_call_subquery_union_all_returns_combined_rows() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "CALL { RETURN 1 AS x UNION ALL RETURN 2 AS x } RETURN x ORDER BY x",
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::BigInt(1));
+    assert_eq!(rows[1].values[0], Value::BigInt(2));
+}
+
+#[test]
+fn cypher_call_subquery_union_deduplicates_rows() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "CALL { RETURN 1 AS x UNION RETURN 1 AS x } RETURN x",
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::BigInt(1));
+}
+
+#[test]
+fn cypher_call_subquery_union_all_can_reference_outer_binding() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'}); CREATE (:Person {name: 'bob'})",
+        )
+        .expect("seed graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person) \
+         CALL { WITH n RETURN n.name AS x UNION ALL WITH n RETURN n.name AS x } \
+         RETURN x ORDER BY x",
+    );
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].values[0], Value::Text("alice".to_owned()));
+    assert_eq!(rows[1].values[0], Value::Text("alice".to_owned()));
+    assert_eq!(rows[2].values[0], Value::Text("bob".to_owned()));
+    assert_eq!(rows[3].values[0], Value::Text("bob".to_owned()));
+}
+
+#[test]
+fn cypher_call_subquery_union_can_deduplicate_outer_binding_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'}); CREATE (:Person {name: 'bob'})",
+        )
+        .expect("seed graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person) \
+         CALL { WITH n RETURN n.name AS x UNION WITH n RETURN n.name AS x } \
+         RETURN x ORDER BY x",
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Text("alice".to_owned()));
+    assert_eq!(rows[1].values[0], Value::Text("bob".to_owned()));
+}
+
+#[test]
+fn cypher_call_subquery_union_can_mix_correlated_match_and_passthrough() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'})-[:KNOWS]->(:Person {name: 'bob'})",
+        )
+        .expect("seed graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person {name: 'alice'}) \
+         CALL { WITH n MATCH (n)-[:KNOWS]->(m) RETURN m.name AS friend \
+                UNION \
+                WITH n RETURN n.name AS friend } \
+         RETURN friend ORDER BY friend",
+    );
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Text("alice".to_owned()));
+    assert_eq!(rows[1].values[0], Value::Text("bob".to_owned()));
+}
+
+#[test]
 fn cypher_exists_subquery_filters_with_correlated_match() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -1459,6 +1599,43 @@ fn cypher_exists_subquery_filters_with_correlated_match() {
 }
 
 #[test]
+fn cypher_exists_subquery_can_use_union_branches() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'})-[:KNOWS]->(:Person {name: 'bob'}); \
+             CREATE (:Person {name: 'carol'}); \
+             CREATE (:Person {name: 'dave'})",
+        )
+        .expect("seed graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person) \
+         WHERE EXISTS { \
+           WITH n MATCH (n)-[:KNOWS]->(m) RETURN m.name AS hit \
+           UNION \
+           WITH n WHERE n.name = 'carol' RETURN n.name AS hit \
+         } \
+         RETURN n.name ORDER BY n.name",
+    );
+
+    assert_eq!(
+        rows.into_iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Text("alice".to_owned()),
+            Value::Text("carol".to_owned())
+        ]
+    );
+}
+
+#[test]
 fn cypher_pattern_comprehension_returns_correlated_projection_list() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -1482,6 +1659,43 @@ fn cypher_pattern_comprehension_returns_correlated_projection_list() {
     assert_eq!(
         rows[0].values[0],
         Value::Array(vec![Value::Text("bob".to_owned())])
+    );
+}
+
+#[test]
+fn cypher_nested_foreach_updates_each_matched_row_once() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'}), (:Person {name: 'bob'})",
+        )
+        .expect("seed graph");
+
+    engine
+        .execute_sql(
+            &session,
+            "MATCH (n:Person) \
+             FOREACH (x IN [1,2] | \
+               FOREACH (y IN [10,20] | \
+                 SET n.name = 'nested')) \
+             RETURN 1",
+        )
+        .expect("nested foreach update");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+    );
+    assert_eq!(
+        rows.into_iter().map(|row| row.values[0].clone()).collect::<Vec<_>>(),
+        vec![
+            Value::Text("nested".to_owned()),
+            Value::Text("nested".to_owned()),
+        ],
     );
 }
 
@@ -1536,6 +1750,66 @@ fn cypher_return_groups_by_non_aggregate_projection_after_traversal() {
 
     assert_eq!(
         rows,
+        vec![
+            Row::new(vec![Value::Text("dev".to_owned()), Value::BigInt(2)]),
+            Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
+        ],
+    );
+}
+
+#[test]
+fn cypher_order_by_after_aggregation_sorts_by_alias_and_key() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE (:Person {name: 'alice'})-[:KNOWS]->(:Person {kind: 'dev'}); \
+             MATCH (a:Person {name: 'alice'}) CREATE (a)-[:KNOWS]->(:Person {kind: 'dev'}); \
+             MATCH (a:Person {name: 'alice'}) CREATE (a)-[:KNOWS]->(:Person {kind: 'ops'})",
+        )
+        .expect("seed graph");
+
+    // ORDER BY an aggregation alias, descending: dev(2) before ops(1).
+    let by_count_desc = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person {name: 'alice'})-[:KNOWS]->(b) \
+         RETURN b.kind AS kind, count(*) AS c ORDER BY c DESC",
+    );
+    assert_eq!(
+        by_count_desc,
+        vec![
+            Row::new(vec![Value::Text("dev".to_owned()), Value::BigInt(2)]),
+            Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
+        ],
+    );
+
+    // Ascending must reverse it — proves the sort is real, not incidental.
+    let by_count_asc = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person {name: 'alice'})-[:KNOWS]->(b) \
+         RETURN b.kind AS kind, count(*) AS c ORDER BY c ASC",
+    );
+    assert_eq!(
+        by_count_asc,
+        vec![
+            Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
+            Row::new(vec![Value::Text("dev".to_owned()), Value::BigInt(2)]),
+        ],
+    );
+
+    // ORDER BY a grouping-key alias also works after aggregation.
+    let by_key_asc = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person {name: 'alice'})-[:KNOWS]->(b) \
+         RETURN b.kind AS kind, count(*) AS c ORDER BY kind ASC",
+    );
+    assert_eq!(
+        by_key_asc,
         vec![
             Row::new(vec![Value::Text("dev".to_owned()), Value::BigInt(2)]),
             Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
@@ -1943,6 +2217,44 @@ fn cypher_anchored_path_counts_use_adjacency_chain() {
 }
 
 #[test]
+fn cypher_anchored_variable_path_count_uses_adjacency_edges() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_var_count_fast (id INT NOT NULL); \
+             CREATE TABLE knows_var_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_var_count_fast ON people_var_count_fast; \
+             CREATE EDGE LABEL knows_var_count_fast ON knows_var_count_fast_edges SOURCE person_var_count_fast TARGET person_var_count_fast; \
+             INSERT INTO people_var_count_fast VALUES (1), (2), (3), (4); \
+             INSERT INTO knows_var_count_fast_edges VALUES \
+                (1, 2), (2, 1), (2, 3), (3, 4)",
+        )
+        .expect("seed variable path count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_var_count_fast {id: 1})-[:knows_var_count_fast*..2]->(b:person_var_count_fast) \
+             RETURN count(b)",
+        ),
+        3,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_var_count_fast {id: 1})-[:knows_var_count_fast*2]->(b:person_var_count_fast) \
+             RETURN count(b)",
+        ),
+        2,
+    );
+}
+
+#[test]
 fn cypher_anchored_distinct_path_counts_use_adjacency_chain() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -2046,6 +2358,188 @@ fn cypher_unanchored_group_count_uses_target_property() {
             Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
         ],
     );
+
+    let ordered_rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_group_fast)-[:knows_group_fast]->(b:person_group_fast) \
+         WHERE b.number > 20 \
+         RETURN b.category, count(b) ORDER BY b.category",
+    );
+    assert_eq!(
+        ordered_rows,
+        vec![
+            Row::new(vec![Value::Text("dev".to_owned()), Value::BigInt(1)]),
+            Row::new(vec![Value::Text("ops".to_owned()), Value::BigInt(1)]),
+        ],
+    );
+}
+
+#[test]
+fn cypher_unanchored_edge_property_count_uses_projected_edge_scan() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_edge_count_fast (id INT NOT NULL); \
+             CREATE TABLE knows_edge_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_edge_count_fast ON people_edge_count_fast; \
+             CREATE EDGE LABEL knows_edge_count_fast ON knows_edge_count_fast_edges SOURCE person_edge_count_fast TARGET person_edge_count_fast; \
+             CREATE INDEX knows_edge_count_fast_weight_idx ON knows_edge_count_fast_edges (weight); \
+             INSERT INTO people_edge_count_fast VALUES (1), (2), (3), (4); \
+             INSERT INTO knows_edge_count_fast_edges VALUES \
+                (1, 2, 5), (1, 3, 15), (2, 3, 20), (3, 4, 1)",
+        )
+        .expect("seed edge filter count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (:person_edge_count_fast)-[e:knows_edge_count_fast]->(b:person_edge_count_fast) \
+             WHERE e.weight > 10 RETURN count(b)",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn cypher_multi_out_filtered_count_uses_grouped_edge_counts() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_count_fast (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_multi_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_count_fast ON people_multi_count_fast; \
+             CREATE EDGE LABEL knows_multi_count_fast ON knows_multi_count_fast_edges SOURCE person_multi_count_fast TARGET person_multi_count_fast; \
+             INSERT INTO people_multi_count_fast VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_multi_count_fast_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed multi-out count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_multi_count_fast)-[:knows_multi_count_fast]->(b:person_multi_count_fast), \
+                   (a)-[:knows_multi_count_fast]->(c:person_multi_count_fast) \
+             WHERE b.number > 20 AND b.id <> c.id RETURN count(*)",
+        ),
+        8,
+    );
+}
+
+#[test]
+fn cypher_multi_out_filtered_count_distinct_c_id_is_stable() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_count_distinct (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_multi_count_distinct_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_count_distinct ON people_multi_count_distinct; \
+             CREATE EDGE LABEL knows_multi_count_distinct ON knows_multi_count_distinct_edges SOURCE person_multi_count_distinct TARGET person_multi_count_distinct; \
+             INSERT INTO people_multi_count_distinct VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_multi_count_distinct_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed multi-out distinct-count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_multi_count_distinct)-[:knows_multi_count_distinct]->(b:person_multi_count_distinct), \
+                   (a)-[:knows_multi_count_distinct]->(c:person_multi_count_distinct) \
+             WHERE b.number > 20 AND b.id <> c.id RETURN count(DISTINCT c.id)",
+        ),
+        4,
+    );
+}
+
+#[test]
+fn cypher_global_count_distinct_survives_duplicate_input_bindings() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_count_distinct_dups (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_multi_count_distinct_dups_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_count_distinct_dups ON people_multi_count_distinct_dups; \
+             CREATE EDGE LABEL knows_multi_count_distinct_dups ON knows_multi_count_distinct_dups_edges SOURCE person_multi_count_distinct_dups TARGET person_multi_count_distinct_dups; \
+             INSERT INTO people_multi_count_distinct_dups VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_multi_count_distinct_dups_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed duplicate-input distinct-count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "UNWIND [1, 1] AS dup \
+             MATCH (a:person_multi_count_distinct_dups)-[:knows_multi_count_distinct_dups]->(b:person_multi_count_distinct_dups), \
+                   (a)-[:knows_multi_count_distinct_dups]->(c:person_multi_count_distinct_dups) \
+             WHERE b.number > 20 AND b.id <> c.id \
+             RETURN count(DISTINCT c.id)",
+        ),
+        4,
+    );
+}
+
+#[test]
+fn cypher_unanchored_two_hop_end_filter_counts_from_reverse_adjacency() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_twohop_filter_fast (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_twohop_filter_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_twohop_filter_fast ON people_twohop_filter_fast; \
+             CREATE EDGE LABEL knows_twohop_filter_fast ON knows_twohop_filter_fast_edges SOURCE person_twohop_filter_fast TARGET person_twohop_filter_fast; \
+             INSERT INTO people_twohop_filter_fast VALUES \
+                (1, 0), (2, 0), (3, 0), (4, 70), (5, 80), (6, 10); \
+             INSERT INTO knows_twohop_filter_fast_edges VALUES \
+                (1, 2), (1, 3), (2, 4), (3, 4), (3, 5), (6, 3)",
+        )
+        .expect("seed two-hop filtered graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_twohop_filter_fast)-[:knows_twohop_filter_fast]->(b:person_twohop_filter_fast)-[:knows_twohop_filter_fast]->(c:person_twohop_filter_fast) \
+             WHERE c.number > 63 RETURN count(c)",
+        ),
+        5,
+    );
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_twohop_filter_fast)-[:knows_twohop_filter_fast]->(b:person_twohop_filter_fast)-[:knows_twohop_filter_fast]->(c:person_twohop_filter_fast) \
+             WHERE c.number > 63 RETURN count(DISTINCT c.id)",
+        ),
+        2,
+    );
 }
 
 #[test]
@@ -2117,6 +2611,42 @@ fn cypher_multi_out_where_limit_filters_left_branch() {
             Row::new(vec![Value::Int(2), Value::Int(3)]),
             Row::new(vec![Value::Int(2), Value::Int(4)]),
             Row::new(vec![Value::Int(4), Value::Int(2)]),
+        ],
+    );
+}
+
+#[test]
+fn cypher_multi_out_order_by_limit_keeps_sorted_prefix() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_ordered (id INT NOT NULL, number INT); \
+             CREATE TABLE knows_multi_ordered_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_ordered ON people_multi_ordered; \
+             CREATE EDGE LABEL knows_multi_ordered ON knows_multi_ordered_edges SOURCE person_multi_ordered TARGET person_multi_ordered; \
+             INSERT INTO people_multi_ordered VALUES (1, 0), (2, 30), (3, 10), (4, 40); \
+             INSERT INTO knows_multi_ordered_edges VALUES (1, 2), (1, 3), (1, 4)",
+        )
+        .expect("seed graph");
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:person_multi_ordered)-[:knows_multi_ordered]->(b:person_multi_ordered), \
+               (a)-[:knows_multi_ordered]->(c:person_multi_ordered) \
+         RETURN b.id, c.id ORDER BY b.id, c.id LIMIT 4",
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            Row::new(vec![Value::Int(2), Value::Int(2)]),
+            Row::new(vec![Value::Int(2), Value::Int(3)]),
+            Row::new(vec![Value::Int(2), Value::Int(4)]),
+            Row::new(vec![Value::Int(3), Value::Int(2)]),
         ],
     );
 }
