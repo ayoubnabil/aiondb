@@ -40,14 +40,17 @@ use aiondb_catalog::{
 };
 use aiondb_core::{
     convert::usize_to_i16_saturating, DataType, DbError, DbResult, IndexId, RelationId, SchemaId,
-    TxnId,
+    TxnId, Value,
 };
 use aiondb_eval::{
     current_search_path_schemas, current_session_context, with_session_context, EvalSessionContext,
 };
 use aiondb_optimizer::{OptimizeRequest, Optimizer};
-use aiondb_parser::{Expr, Literal, SelectStatement, Statement};
-use aiondb_plan::{LogicalPlan, ResultField};
+use aiondb_parser::{
+    CypherClause, CypherMatchClause, CypherReturnClause, CypherReturnItem, CypherStatement, Expr,
+    Literal, ObjectName, SelectStatement, Statement,
+};
+use aiondb_plan::{LogicalPlan, ResultField, ScalarFunction, TypedExpr};
 
 use crate::{
     binder::{Binder, BoundStatement},
@@ -135,6 +138,102 @@ pub struct Planner {
 }
 
 impl Planner {
+    fn lower_native_cypher_expr(&self, expr: &Expr, txn_id: TxnId) -> DbResult<TypedExpr> {
+        match expr {
+            Expr::CypherPatternComprehension {
+                pattern,
+                where_clause,
+                map_expr,
+                span,
+            } => {
+                let imported_vars = pattern
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.variable.as_ref())
+                    .chain(pattern.rels.iter().filter_map(|rel| rel.variable.as_ref()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut clauses = Vec::new();
+                if !imported_vars.is_empty() {
+                    clauses.push(CypherClause::With(aiondb_parser::CypherWithClause {
+                        distinct: false,
+                        items: imported_vars
+                            .iter()
+                            .map(|name| CypherReturnItem {
+                                expr: Expr::Identifier(ObjectName {
+                                    parts: vec![name.clone()],
+                                    span: *span,
+                                }),
+                                alias: Some(name.clone()),
+                                span: *span,
+                            })
+                            .collect(),
+                        where_clause: None,
+                        order_by: Vec::new(),
+                        skip: None,
+                        limit: None,
+                        span: *span,
+                    }));
+                }
+                clauses.push(CypherClause::Match(CypherMatchClause {
+                    optional: false,
+                    patterns: vec![pattern.clone()],
+                    where_clause: where_clause.as_deref().cloned(),
+                    span: *span,
+                }));
+                clauses.push(CypherClause::Return(CypherReturnClause {
+                    distinct: false,
+                    items: vec![CypherReturnItem {
+                        expr: map_expr.as_ref().clone(),
+                        alias: Some("__pattern".to_owned()),
+                        span: *span,
+                    }],
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                    span: *span,
+                }));
+
+                let bound = self.binder.bind_native_cypher_query(
+                    &CypherStatement {
+                        clauses,
+                        union: None,
+                        span: *span,
+                    },
+                    txn_id,
+                )?;
+                let plan = self.build_cypher_plan(bound, txn_id)?;
+                let payload = serde_json::to_string(&plan).map_err(|error| {
+                    DbError::internal(format!(
+                        "failed to encode Cypher pattern comprehension plan: {error}"
+                    ))
+                })?;
+
+                Ok(TypedExpr::scalar_function(
+                    ScalarFunction::Generic("__cypher_pattern_comprehension".to_owned()),
+                    vec![
+                        TypedExpr::literal(Value::Text(payload), DataType::Text, false),
+                        TypedExpr::array_construct(
+                            imported_vars
+                                .into_iter()
+                                .map(|name| TypedExpr::literal(Value::Text(name), DataType::Text, false))
+                                .collect(),
+                            DataType::Text,
+                            false,
+                        ),
+                    ],
+                    DataType::Array(Box::new(DataType::Text)),
+                    true,
+                ))
+            }
+            _ => self.logical_builder.cypher_expr_to_typed_with_subqueries(
+                expr,
+                self.catalog.as_ref(),
+                txn_id,
+            ),
+        }
+    }
+
     pub fn new(catalog: Arc<dyn CatalogReader>) -> Self {
         Self {
             catalog: Arc::clone(&catalog),
@@ -767,14 +866,12 @@ impl Planner {
     ) -> DbResult<aiondb_plan::graph::CypherQueryPlan> {
         use aiondb_plan::graph::{
             CypherCreateClause, CypherDeleteClause, CypherDeleteTarget, CypherMatchClause,
-            CypherMergeClause, CypherNodePattern, CypherPattern, CypherPipelineOp,
-            CypherProcedureCall, CypherPropertyExpr, CypherQueryPlan, CypherRelDirection,
-            CypherRelPattern, CypherSetItem, CypherUnionPlan, CypherUnwindClause, CypherWithClause,
+            CypherMergeClause, CypherPipelineOp, CypherProcedureCall, CypherQueryPlan,
+            CypherSetItem, CypherUnionPlan, CypherUnwindClause, CypherWithClause,
         };
 
-        // Use the standalone type_check_expression for Cypher expressions.
         let tc_expr = |expr: &Expr| -> DbResult<aiondb_plan::TypedExpr> {
-            type_check_expression(expr, &mut Vec::new())
+            self.lower_native_cypher_expr(expr, txn_id)
         };
         let cypher_projection_name = |expr: &Expr, alias: Option<&str>| -> String {
             alias.map_or_else(
@@ -836,6 +933,7 @@ impl Planner {
             sets: bound_sets,
             deletes: bound_deletes,
             calls: bound_calls,
+            foreachs: bound_foreachs,
             return_clause,
             clause_order,
             union,
@@ -849,93 +947,7 @@ impl Planner {
         let mut bound_sets = bound_sets.into_iter().map(Some).collect::<Vec<_>>();
         let mut bound_deletes = bound_deletes.into_iter().map(Some).collect::<Vec<_>>();
         let mut bound_calls = bound_calls.into_iter().map(Some).collect::<Vec<_>>();
-
-        // Helper closures for converting bound types to plan types.
-        let convert_node = |node: binder::BoundCypherNode| -> DbResult<CypherNodePattern> {
-            let binder::BoundCypherNode {
-                variable,
-                label,
-                table_id,
-                columns: _,
-                property_filters,
-            } = node;
-            let properties = property_filters
-                .into_iter()
-                .map(|(key, expr)| {
-                    tc_expr(&expr).map(|typed_expr| CypherPropertyExpr {
-                        key,
-                        value: typed_expr,
-                    })
-                })
-                .collect::<DbResult<Vec<_>>>()?;
-            Ok(CypherNodePattern {
-                variable,
-                label,
-                table_id,
-                properties,
-                index_scan: None,
-                range_pushdown: Vec::new(),
-            })
-        };
-
-        let convert_rel = |rel: binder::BoundCypherRel| -> DbResult<CypherRelPattern> {
-            let binder::BoundCypherRel {
-                variable,
-                rel_type,
-                rel_type_alternatives,
-                table_id,
-                columns: _,
-                direction,
-                property_filters,
-                min_hops,
-                max_hops,
-            } = rel;
-            let properties = property_filters
-                .into_iter()
-                .map(|(key, expr)| {
-                    tc_expr(&expr).map(|typed_expr| CypherPropertyExpr {
-                        key,
-                        value: typed_expr,
-                    })
-                })
-                .collect::<DbResult<Vec<_>>>()?;
-            let direction = match direction {
-                aiondb_parser::CypherDirection::Outgoing => CypherRelDirection::Outgoing,
-                aiondb_parser::CypherDirection::Incoming => CypherRelDirection::Incoming,
-                aiondb_parser::CypherDirection::Both => CypherRelDirection::Both,
-            };
-            Ok(CypherRelPattern {
-                variable,
-                rel_type,
-                rel_type_alternatives,
-                table_id,
-                direction,
-                properties,
-                min_hops,
-                max_hops,
-                index_scan: None,
-            })
-        };
-
-        let convert_pattern = |pattern: binder::BoundCypherPattern| -> DbResult<CypherPattern> {
-            let binder::BoundCypherPattern {
-                path_variable,
-                nodes,
-                rels,
-            } = pattern;
-            Ok(CypherPattern {
-                path_function: None,
-                path_variable,
-                nodes: nodes
-                    .into_iter()
-                    .map(&convert_node)
-                    .collect::<DbResult<Vec<_>>>()?,
-                relationships: rels
-                    .into_iter()
-                    .map(&convert_rel)
-                    .collect::<DbResult<Vec<_>>>()?,
-            })
-        };
+        let mut bound_foreachs = bound_foreachs.into_iter().map(Some).collect::<Vec<_>>();
 
         // Build pipeline operations and main clauses based on clause_order.
         let mut pipeline = Vec::new();
@@ -991,7 +1003,7 @@ impl Planner {
                     let patterns = m
                         .patterns
                         .into_iter()
-                        .map(&convert_pattern)
+                        .map(|pattern| self.convert_bound_pattern(pattern))
                         .collect::<DbResult<Vec<_>>>()?;
                     // Preserve read-clause order in the pipeline.
                     pipeline.push(CypherPipelineOp::Match(CypherMatchClause {
@@ -1006,7 +1018,7 @@ impl Planner {
                         patterns: c
                             .patterns
                             .into_iter()
-                            .map(&convert_pattern)
+                            .map(|pattern| self.convert_bound_pattern(pattern))
                             .collect::<DbResult<Vec<_>>>()?,
                     });
                 }
@@ -1039,7 +1051,7 @@ impl Planner {
                         })
                         .collect::<DbResult<Vec<_>>>()?;
                     merges.push(CypherMergeClause {
-                        pattern: convert_pattern(m.pattern)?,
+                        pattern: self.convert_bound_pattern(m.pattern)?,
                         on_create_set: on_create,
                         on_match_set: on_match,
                     });
@@ -1090,6 +1102,12 @@ impl Planner {
                         }
                     }
                 }
+                binder::BoundCypherClauseRef::Foreach(idx) => {
+                    let foreach = take_clause(&mut bound_foreachs, idx, "FOREACH")?;
+                    pipeline.push(CypherPipelineOp::Foreach(Box::new(
+                        self.convert_bound_foreach(foreach, txn_id)?,
+                    )));
+                }
             }
         }
 
@@ -1133,6 +1151,204 @@ impl Planner {
             limit,
             distinct,
             union,
+        })
+    }
+
+    fn convert_bound_node(
+        &self,
+        node: binder::BoundCypherNode,
+    ) -> DbResult<aiondb_plan::graph::CypherNodePattern> {
+        let binder::BoundCypherNode {
+            variable,
+            label,
+            table_id,
+            columns: _,
+            property_filters,
+        } = node;
+        let properties = property_filters
+            .into_iter()
+            .map(|(key, expr)| {
+                type_check_expression(&expr, &mut Vec::new()).map(|typed_expr| {
+                    aiondb_plan::graph::CypherPropertyExpr {
+                        key,
+                        value: typed_expr,
+                    }
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        Ok(aiondb_plan::graph::CypherNodePattern {
+            variable,
+            label,
+            table_id,
+            properties,
+            index_scan: None,
+            range_pushdown: Vec::new(),
+        })
+    }
+
+    fn convert_bound_rel(
+        &self,
+        rel: binder::BoundCypherRel,
+    ) -> DbResult<aiondb_plan::graph::CypherRelPattern> {
+        let binder::BoundCypherRel {
+            variable,
+            rel_type,
+            rel_type_alternatives,
+            table_id,
+            columns: _,
+            direction,
+            property_filters,
+            min_hops,
+            max_hops,
+        } = rel;
+        let properties = property_filters
+            .into_iter()
+            .map(|(key, expr)| {
+                type_check_expression(&expr, &mut Vec::new()).map(|typed_expr| {
+                    aiondb_plan::graph::CypherPropertyExpr {
+                        key,
+                        value: typed_expr,
+                    }
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        let direction = match direction {
+            aiondb_parser::CypherDirection::Outgoing => {
+                aiondb_plan::graph::CypherRelDirection::Outgoing
+            }
+            aiondb_parser::CypherDirection::Incoming => {
+                aiondb_plan::graph::CypherRelDirection::Incoming
+            }
+            aiondb_parser::CypherDirection::Both => aiondb_plan::graph::CypherRelDirection::Both,
+        };
+        Ok(aiondb_plan::graph::CypherRelPattern {
+            variable,
+            rel_type,
+            rel_type_alternatives,
+            table_id,
+            direction,
+            properties,
+            min_hops,
+            max_hops,
+            index_scan: None,
+        })
+    }
+
+    fn convert_bound_pattern(
+        &self,
+        pattern: binder::BoundCypherPattern,
+    ) -> DbResult<aiondb_plan::graph::CypherPattern> {
+        let binder::BoundCypherPattern {
+            path_variable,
+            nodes,
+            rels,
+        } = pattern;
+        Ok(aiondb_plan::graph::CypherPattern {
+            path_function: None,
+            path_variable,
+            nodes: nodes
+                .into_iter()
+                .map(|node| self.convert_bound_node(node))
+                .collect::<DbResult<Vec<_>>>()?,
+            relationships: rels
+                .into_iter()
+                .map(|rel| self.convert_bound_rel(rel))
+                .collect::<DbResult<Vec<_>>>()?,
+        })
+    }
+
+    fn convert_bound_foreach(
+        &self,
+        foreach: binder::BoundCypherForeach,
+        txn_id: TxnId,
+    ) -> DbResult<aiondb_plan::graph::CypherForeachPlan> {
+        use aiondb_plan::graph::{
+            CypherCreateClause, CypherDeleteClause, CypherDeleteTarget, CypherForeachOp,
+            CypherForeachPlan, CypherMergeClause, CypherSetItem,
+        };
+
+        let tc_expr = |expr: &Expr| -> DbResult<aiondb_plan::TypedExpr> {
+            self.logical_builder
+                .cypher_expr_to_typed_with_subqueries(expr, self.catalog.as_ref(), txn_id)
+        };
+
+        let mut body = Vec::with_capacity(foreach.body.len());
+        for op in foreach.body {
+            match op {
+                binder::BoundCypherForeachOp::Set(s) => {
+                    body.push(CypherForeachOp::Set(CypherSetItem {
+                        variable: s.variable,
+                        property: Some(s.property),
+                        expr: tc_expr(&s.expr)?,
+                        table_id: None,
+                    }));
+                }
+                binder::BoundCypherForeachOp::Create(c) => {
+                    body.push(CypherForeachOp::Create(CypherCreateClause {
+                        patterns: c
+                            .patterns
+                            .into_iter()
+                            .map(|pattern| self.convert_bound_pattern(pattern))
+                            .collect::<DbResult<Vec<_>>>()?,
+                    }));
+                }
+                binder::BoundCypherForeachOp::Merge(m) => {
+                    let m = *m;
+                    let on_create = m
+                        .on_create
+                        .into_iter()
+                        .map(|s| {
+                            Ok(CypherSetItem {
+                                variable: s.variable,
+                                property: Some(s.property),
+                                expr: tc_expr(&s.expr)?,
+                                table_id: None,
+                            })
+                        })
+                        .collect::<DbResult<Vec<_>>>()?;
+                    let on_match = m
+                        .on_match
+                        .into_iter()
+                        .map(|s| {
+                            Ok(CypherSetItem {
+                                variable: s.variable,
+                                property: Some(s.property),
+                                expr: tc_expr(&s.expr)?,
+                                table_id: None,
+                            })
+                        })
+                        .collect::<DbResult<Vec<_>>>()?;
+                    body.push(CypherForeachOp::Merge(Box::new(CypherMergeClause {
+                        pattern: self.convert_bound_pattern(m.pattern)?,
+                        on_create_set: on_create,
+                        on_match_set: on_match,
+                    })));
+                }
+                binder::BoundCypherForeachOp::Delete(d) => {
+                    body.push(CypherForeachOp::Delete(CypherDeleteClause {
+                        detach: d.detach,
+                        variables: d
+                            .variables
+                            .into_iter()
+                            .map(|variable| CypherDeleteTarget {
+                                variable,
+                                connected_edge_table_ids: Vec::new(),
+                            })
+                            .collect(),
+                    }));
+                }
+                binder::BoundCypherForeachOp::Foreach(nested) => {
+                    body.push(CypherForeachOp::Foreach(Box::new(
+                        self.convert_bound_foreach(*nested, txn_id)?,
+                    )));
+                }
+            }
+        }
+
+        Ok(CypherForeachPlan {
+            variable: foreach.variable,
+            expr: tc_expr(&foreach.expr)?,
+            body,
         })
     }
 }
