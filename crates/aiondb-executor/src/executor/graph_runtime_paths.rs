@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use aiondb_core::{DbResult, RelationId, TupleId, Value};
 use aiondb_eval::{build_hash_key, ValueHashKey};
@@ -14,9 +11,8 @@ use super::{ExecutionContext, Executor};
 use crate::executor::graph_plans::{
     ensure_graph_result_row_capacity, ensure_graph_workset_capacity, estimate_binding_row_bytes,
     estimate_variable_frontier_entry_bytes, format_cypher_edge_literal, push_graph_binding,
-    BindingRow, BoundValue, SharedRow, SharedStrings, SharedText,
+    BindingRow, BoundValue, GraphMatchRuntimeCache, SharedRow, SharedStrings, SharedText,
 };
-use crate::executor::helpers::estimate_value_bytes;
 
 fn value_to_bfs_key(v: &Value) -> Option<ValueHashKey> {
     build_hash_key(v).ok()
@@ -36,6 +32,29 @@ fn adjacency_neighbor_allowed(
         return allowed_ids.contains(&neighbor_key);
     }
     true
+}
+
+fn excluded_next_node_id_match(
+    excluded_next_node_id_keys: &[ValueHashKey],
+    neighbor_id: &Value,
+) -> bool {
+    let Some(neighbor_key) = value_to_bfs_key(neighbor_id) else {
+        return false;
+    };
+    excluded_next_node_id_keys.contains(&neighbor_key)
+}
+
+fn collect_excluded_next_node_id_keys(
+    binding: &BindingRow,
+    excluded_next_node_id_vars: &[String],
+) -> Vec<ValueHashKey> {
+    excluded_next_node_id_vars
+        .iter()
+        .filter_map(|variable| match binding.get(variable) {
+            Some(BoundValue::Node { id_value, .. }) => value_to_bfs_key(id_value),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(super) struct VariableTraversalFrontierEntry {
@@ -120,9 +139,9 @@ pub(super) fn record_variable_traversal_step(
         );
     }
 
-    new_binding.insert_binding(
+    new_binding.push_fresh_shared_binding(
         "__edge_next_node_id__".to_owned(),
-        BoundValue::Node {
+        Arc::new(BoundValue::Node {
             table_id: RelationId::new(0),
             row: Arc::new(aiondb_core::Row::new(vec![far_end.clone()])),
             raw_row: Arc::new(aiondb_core::Row::new(vec![far_end.clone()])),
@@ -130,7 +149,7 @@ pub(super) fn record_variable_traversal_step(
             tuple_id: TupleId::new(0),
             labels: Arc::new(Vec::new()),
             column_names: Arc::new(Vec::new()),
-        },
+        }),
     );
 
     if depth >= min_hops {
@@ -202,9 +221,9 @@ pub(super) fn build_traversed_edge_binding(
         }
     };
 
-    new_binding.insert_binding(
+    new_binding.push_fresh_shared_binding(
         "__edge_next_node_id__".to_owned(),
-        BoundValue::Node {
+        Arc::new(BoundValue::Node {
             table_id: RelationId::new(0),
             row: Arc::new(aiondb_core::Row::new(vec![next_node_id.clone()])),
             raw_row: Arc::new(aiondb_core::Row::new(vec![next_node_id])),
@@ -212,7 +231,7 @@ pub(super) fn build_traversed_edge_binding(
             tuple_id: TupleId::new(0),
             labels: Arc::new(Vec::new()),
             column_names: Arc::new(Vec::new()),
-        },
+        }),
     );
 
     new_binding
@@ -230,7 +249,9 @@ impl Executor {
         rel: &CypherRelPattern,
         next_node: Option<&CypherNodePattern>,
         input_bindings: Vec<BindingRow>,
+        excluded_next_node_id_vars: &[String],
         path_variable: Option<&str>,
+        runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
         let rel_variants = self.relationship_pattern_variants(context, rel)?;
         if rel_variants.is_empty() {
@@ -257,7 +278,9 @@ impl Executor {
                     variant,
                     next_node,
                     input_bindings.clone(),
+                    excluded_next_node_id_vars,
                     path_variable,
+                    runtime_cache,
                 )?;
                 output.extend(bindings);
             }
@@ -273,7 +296,9 @@ impl Executor {
             rel,
             next_node,
             input_bindings,
+            excluded_next_node_id_vars,
             path_variable,
+            runtime_cache,
         )
     }
 
@@ -482,9 +507,9 @@ impl Executor {
     fn build_neighbor_marker_binding(binding: &BindingRow, next_node_id: Value) -> BindingRow {
         let mut new_binding = binding.clone();
         let marker_row = Arc::new(aiondb_core::Row::new(vec![next_node_id.clone()]));
-        new_binding.insert_binding(
+        new_binding.push_fresh_shared_binding(
             "__edge_next_node_id__".to_owned(),
-            BoundValue::Node {
+            Arc::new(BoundValue::Node {
                 table_id: RelationId::new(0),
                 row: Arc::clone(&marker_row),
                 raw_row: marker_row,
@@ -492,7 +517,7 @@ impl Executor {
                 tuple_id: aiondb_core::TupleId::new(0),
                 labels: Arc::new(Vec::new()),
                 column_names: Arc::new(Vec::new()),
-            },
+            }),
         );
         new_binding
     }
@@ -504,7 +529,9 @@ impl Executor {
         rel: &CypherRelPattern,
         next_node: Option<&CypherNodePattern>,
         input_bindings: Vec<BindingRow>,
+        excluded_next_node_id_vars: &[String],
         _path_variable: Option<&str>,
+        runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
         let Some(table_id) = rel.table_id else {
             return Ok(input_bindings);
@@ -563,7 +590,6 @@ impl Executor {
         let mut output = Vec::new();
         let has_interrupts = context.has_execution_interrupts();
         let mut tid_counter: u32 = 0;
-        let mut neighbor_cache: HashMap<(ValueHashKey, bool), Arc<Vec<Value>>> = HashMap::new();
         let traversal =
             self.native_graph_traversal_ref(context, table_id, src_col_idx, tgt_col_idx)?;
         let traversal_generation = traversal.snapshot().generation;
@@ -579,6 +605,8 @@ impl Executor {
             if has_interrupts && binding_idx.trailing_zeros() >= 9 {
                 context.check_deadline()?;
             }
+            let excluded_next_node_id_keys =
+                collect_excluded_next_node_id_keys(binding, excluded_next_node_id_vars);
 
             let current_id = self.find_current_node_id_for_pattern(binding, Some(current_node));
             let directions: &[(bool, bool)] = match rel.direction {
@@ -593,8 +621,13 @@ impl Executor {
                 for &(is_outgoing, _) in directions {
                     if neighbor_only_adjacency {
                         let cached_neighbors = value_to_bfs_key(node_id)
-                            .map(|node_key| (node_key, is_outgoing))
-                            .and_then(|cache_key| neighbor_cache.get(&cache_key).cloned());
+                            .map(|node_key| (table_id, node_key, is_outgoing))
+                            .and_then(|cache_key| {
+                                runtime_cache
+                                    .adjacency_neighbor_cache
+                                    .get(&cache_key)
+                                    .cloned()
+                            });
                         if let Some(neighbor_ids) = cached_neighbors {
                             used_adjacency = true;
                             for neighbor_id in neighbor_ids.iter().cloned() {
@@ -610,25 +643,32 @@ impl Executor {
                                 ) {
                                     continue;
                                 }
+                                if excluded_next_node_id_match(
+                                    &excluded_next_node_id_keys,
+                                    &neighbor_id,
+                                ) {
+                                    continue;
+                                }
                                 let new_binding =
                                     Self::build_neighbor_marker_binding(binding, neighbor_id);
                                 push_graph_binding(context, &mut output, new_binding)?;
                             }
-                        } else if let Some(node_key) = value_to_bfs_key(node_id) {
-                            let mut cursor = GraphStorage::neighbor_ids(
-                                traversal_store,
-                                node_id,
-                                if is_outgoing {
-                                    GraphDirection::Outgoing
-                                } else {
-                                    GraphDirection::Incoming
-                                },
+                        } else if let Some(node_key) =
+                            value_to_bfs_key(node_id).filter(|_| traversal.uses_traversal_store())
+                        {
+                            let neighbor_ids =
+                                Arc::new(self.fast_graph_adjacency_neighbors_cached(
+                                    context,
+                                    table_id,
+                                    node_id,
+                                    is_outgoing,
+                                )?);
+                            runtime_cache.adjacency_neighbor_cache.insert(
+                                (table_id, node_key, is_outgoing),
+                                Arc::clone(&neighbor_ids),
                             );
-                            let mut neighbor_ids = Vec::new();
-                            let mut saw_neighbor = false;
-                            context.track_memory(64)?;
-                            while let Some(neighbor_id) = cursor.next_neighbor() {
-                                saw_neighbor = true;
+                            used_adjacency = true;
+                            for neighbor_id in neighbor_ids.iter().cloned() {
                                 if has_interrupts {
                                     tid_counter = tid_counter.wrapping_add(1);
                                     if tid_counter.trailing_zeros() >= 10 {
@@ -641,28 +681,12 @@ impl Executor {
                                 ) {
                                     continue;
                                 }
-                                ensure_graph_workset_capacity(
-                                    context,
-                                    neighbor_ids.len(),
-                                    "adjacency neighbor cache",
-                                )?;
-                                context.track_memory(
-                                    estimate_value_bytes(&neighbor_id).saturating_add(8),
-                                )?;
-                                neighbor_ids.push(neighbor_id);
-                            }
-                            if !saw_neighbor && !traversal.uses_traversal_store() {
-                                debug!(
-                                    "adjacency neighbor lookup unavailable, falling back to scan"
-                                );
-                                adj_ok = false;
-                                break;
-                            }
-                            let neighbor_ids = Arc::new(neighbor_ids);
-                            neighbor_cache
-                                .insert((node_key, is_outgoing), Arc::clone(&neighbor_ids));
-                            used_adjacency = true;
-                            for neighbor_id in neighbor_ids.iter().cloned() {
+                                if excluded_next_node_id_match(
+                                    &excluded_next_node_id_keys,
+                                    &neighbor_id,
+                                ) {
+                                    continue;
+                                }
                                 let new_binding =
                                     Self::build_neighbor_marker_binding(binding, neighbor_id);
                                 push_graph_binding(context, &mut output, new_binding)?;
@@ -690,6 +714,12 @@ impl Executor {
                                 if !adjacency_neighbor_allowed(
                                     &neighbor_id,
                                     next_node_candidate_ids.as_ref(),
+                                ) {
+                                    continue;
+                                }
+                                if excluded_next_node_id_match(
+                                    &excluded_next_node_id_keys,
+                                    &neighbor_id,
                                 ) {
                                     continue;
                                 }
@@ -799,6 +829,24 @@ impl Executor {
                             continue;
                         }
 
+                        let next_node_id = match rel.direction {
+                            CypherRelDirection::Outgoing => target_id.clone(),
+                            CypherRelDirection::Incoming => source_id.clone(),
+                            CypherRelDirection::Both => {
+                                if current_id
+                                    .as_ref()
+                                    .is_some_and(|current| *current == source_id)
+                                {
+                                    target_id.clone()
+                                } else {
+                                    source_id.clone()
+                                }
+                            }
+                        };
+                        if excluded_next_node_id_match(&excluded_next_node_id_keys, &next_node_id) {
+                            continue;
+                        }
+
                         let new_binding = build_traversed_edge_binding(
                             binding,
                             rel,
@@ -858,6 +906,27 @@ impl Executor {
                                     compat_row.as_ref(),
                                     binding,
                                 )? {
+                                    continue;
+                                }
+
+                                let next_node_id = match rel.direction {
+                                    CypherRelDirection::Outgoing => target_id.clone(),
+                                    CypherRelDirection::Incoming => source_id.clone(),
+                                    CypherRelDirection::Both => {
+                                        if current_id
+                                            .as_ref()
+                                            .is_some_and(|current| *current == source_id)
+                                        {
+                                            target_id.clone()
+                                        } else {
+                                            source_id.clone()
+                                        }
+                                    }
+                                };
+                                if excluded_next_node_id_match(
+                                    &excluded_next_node_id_keys,
+                                    &next_node_id,
+                                ) {
                                     continue;
                                 }
 
@@ -943,6 +1012,24 @@ impl Executor {
                         &compat_row,
                         binding,
                     )? {
+                        continue;
+                    }
+
+                    let next_node_id = match rel.direction {
+                        CypherRelDirection::Outgoing => target_id.clone(),
+                        CypherRelDirection::Incoming => source_id.clone(),
+                        CypherRelDirection::Both => {
+                            if current_id
+                                .as_ref()
+                                .is_some_and(|current| *current == source_id)
+                            {
+                                target_id.clone()
+                            } else {
+                                source_id.clone()
+                            }
+                        }
+                    };
+                    if excluded_next_node_id_match(&excluded_next_node_id_keys, &next_node_id) {
                         continue;
                     }
 
