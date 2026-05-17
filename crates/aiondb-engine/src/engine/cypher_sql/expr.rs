@@ -12,6 +12,7 @@ use aiondb_core::{DataType, VectorValue};
 use aiondb_parser::ast::{BinaryOperator, Expr, Literal, UnaryOperator};
 
 use super::escape::{escape_json_key, escape_sq, qi};
+use super::UNSUPPORTED_CYPHER_PATTERN_COMPREHENSION_SENTINEL;
 #[path = "expr_function_call.rs"]
 mod expr_function_call;
 #[path = "expr_support.rs"]
@@ -1021,7 +1022,9 @@ fn expr_to_sql_generic(expr: &Expr, _ctx: &CypherSqlContext) -> String {
                 "EXISTS (SELECT 1)".into()
             }
         }
-        Expr::CypherPatternComprehension { .. } => "ARRAY[]::text[]".into(),
+        Expr::CypherPatternComprehension { .. } => {
+            UNSUPPORTED_CYPHER_PATTERN_COMPREHENSION_SENTINEL.into()
+        }
         Expr::WindowFunction { .. } => "NULL".into(),
     }
 }

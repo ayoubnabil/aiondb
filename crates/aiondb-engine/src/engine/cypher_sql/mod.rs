@@ -37,6 +37,8 @@ pub(crate) const CYPHER_NODES_TABLE: &str = "__cypher_nodes";
 /// Table name for the Cypher edge (relationship) store. All graph edges are
 /// stored here with type, source/target node IDs, and properties as JSONB.
 pub(crate) const CYPHER_EDGES_TABLE: &str = "__cypher_edges";
+pub(crate) const UNSUPPORTED_CYPHER_PATTERN_COMPREHENSION_SENTINEL: &str =
+    "__aiondb_unsupported_cypher_pattern_comprehension__";
 
 // ── Error type ─────────────────────────────────────────────────────
 
@@ -128,6 +130,11 @@ pub(crate) fn cypher_to_sql(stmt: &CypherStatement) -> Result<String, CypherTran
                 .into(),
         )
     })?;
+    if sql.contains(UNSUPPORTED_CYPHER_PATTERN_COMPREHENSION_SENTINEL) {
+        return Err(CypherTranslateError::Unsupported(
+            "Cypher pattern comprehensions are not supported by the SQL fallback path".into(),
+        ));
+    }
     if sql.len() > MAX_GENERATED_SQL_LEN {
         return Err(CypherTranslateError::TooComplex);
     }
@@ -214,6 +221,17 @@ mod tests {
     fn translate(cypher: &str) -> Result<String, CypherTranslateError> {
         let stmt = aiondb_parser::parse_cypher(cypher).expect("Cypher parse failed");
         cypher_to_sql(&stmt)
+    }
+
+    #[test]
+    fn pattern_comprehension_is_rejected_by_sql_fallback() {
+        let err = translate("MATCH (n) RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends")
+            .expect_err("pattern comprehension must not silently translate through SQL fallback");
+        assert!(matches!(err, CypherTranslateError::Unsupported(_)));
+        assert!(
+            err.to_string()
+                .contains("Cypher pattern comprehensions are not supported by the SQL fallback path")
+        );
     }
 
     // ── RETURN-only (pure expressions) ──────────────────────────────
