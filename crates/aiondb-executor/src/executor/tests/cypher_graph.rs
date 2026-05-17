@@ -7,7 +7,9 @@ use aiondb_plan::graph::{
     CypherPathFunction, CypherPattern, CypherPipelineOp, CypherProcedureCall, CypherPropertyExpr,
     CypherQueryPlan, CypherRelDirection, CypherRelPattern, CypherSetItem, CypherWithClause,
 };
-use aiondb_plan::{ColumnPlan, PhysicalPlan, ProjectionExpr, ResultField, SortExpr, TypedExpr};
+use aiondb_plan::{
+    ColumnPlan, PhysicalPlan, ProjectionExpr, ResultField, ScalarFunction, SortExpr, TypedExpr,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -3048,6 +3050,92 @@ fn current_pattern_node_is_preferred_over_unrelated_bindings_and_markers() {
     );
 }
 
+#[test]
+fn prebound_match_pattern_keeps_current_node_correlation() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+    insert_person(&executor, person_id, 3, "Carol");
+    insert_knows(&executor, knows_id, 1, 2, 10);
+    insert_knows(&executor, knows_id, 1, 3, 20);
+
+    let clause = CypherMatchClause {
+        optional: false,
+        patterns: vec![CypherPattern {
+            path_function: None,
+            path_variable: None,
+            nodes: vec![
+                CypherNodePattern {
+                    variable: Some("n".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("m".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+            ],
+            relationships: vec![CypherRelPattern {
+                variable: None,
+                rel_type: Some("KNOWS".to_owned()),
+                rel_type_alternatives: Vec::new(),
+                table_id: Some(knows_id),
+                direction: CypherRelDirection::Outgoing,
+                properties: vec![],
+                min_hops: None,
+                max_hops: None,
+                index_scan: None,
+            }],
+        }],
+        filter: Some(TypedExpr {
+            kind: aiondb_plan::TypedExprKind::BinaryNe {
+                left: Box::new(TypedExpr::column_ref("m.name", 0, DataType::Text, true)),
+                right: Box::new(lit_text("Carol")),
+            },
+            data_type: DataType::Boolean,
+            nullable: true,
+        }),
+    };
+
+    let input = BindingRow::new().with_binding(
+        "n",
+        BoundValue::Node {
+            table_id: person_id,
+            row: Arc::new(Row::new(vec![
+                Value::Int(1),
+                Value::Text("Alice".to_owned()),
+            ])),
+            raw_row: Arc::new(Row::new(vec![
+                Value::Int(1),
+                Value::Text("Alice".to_owned()),
+            ])),
+            id_value: Value::Int(1),
+            tuple_id: TupleId::new(1),
+            labels: Arc::new(vec!["Person".to_owned()]),
+            column_names: Arc::new(vec!["id".to_owned(), "name".to_owned()]),
+        },
+    );
+
+    let rows = executor
+        .execute_cypher_match(&default_context(), &clause, vec![input], None, None)
+        .expect("prebound correlated match should execute");
+
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    match rows[0].get("m") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(2)),
+        other => panic!("expected bound node m, got {other:?}"),
+    }
+}
+
 fn int_array_literal(values: &[i32]) -> TypedExpr {
     TypedExpr::literal(
         Value::Array(values.iter().map(|v| Value::Int(*v)).collect()),
@@ -3183,6 +3271,619 @@ fn cypher_foreach_create_runs_body_once_per_element() {
         ExecutionResult::Query { rows, .. } => {
             // 2 original + 3 created by FOREACH over [1,2,3]
             assert_eq!(rows.len(), 5);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_pattern_comprehension_union_all_returns_combined_list() {
+    let (executor, _catalog, _) = make_executor();
+    let payload = serde_json::to_string(&CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: lit_int(1),
+            field: ResultField {
+                name: "x".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: Some(Box::new(aiondb_plan::graph::CypherUnionPlan {
+            all: true,
+            right: CypherQueryPlan {
+                pipeline: vec![],
+                matches: vec![],
+                creates: vec![],
+                merges: vec![],
+                sets: vec![],
+                deletes: vec![],
+                returns: vec![ProjectionExpr {
+                    expr: lit_int(2),
+                    field: ResultField {
+                        name: "x".to_owned(),
+                        data_type: DataType::Int,
+                        text_type_modifier: None,
+                        nullable: false,
+                    },
+                }],
+                order_by: vec![],
+                skip: None,
+                limit: None,
+                distinct: false,
+                union: None,
+            },
+        })),
+    })
+    .expect("serialize pattern comprehension payload");
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: TypedExpr::scalar_function(
+                ScalarFunction::Generic("__cypher_pattern_comprehension".to_owned()),
+                vec![lit_text(&payload)],
+                DataType::Array(Box::new(DataType::Int)),
+                false,
+            ),
+            field: ResultField {
+                name: "xs".to_owned(),
+                data_type: DataType::Array(Box::new(DataType::Int)),
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute cypher pattern comprehension union all");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values,
+                vec![Value::Array(vec![Value::Int(1), Value::Int(2)])]
+            );
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_pattern_comprehension_union_deduplicates_list() {
+    let (executor, _catalog, _) = make_executor();
+    let payload = serde_json::to_string(&CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: lit_int(1),
+            field: ResultField {
+                name: "x".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: Some(Box::new(aiondb_plan::graph::CypherUnionPlan {
+            all: false,
+            right: CypherQueryPlan {
+                pipeline: vec![],
+                matches: vec![],
+                creates: vec![],
+                merges: vec![],
+                sets: vec![],
+                deletes: vec![],
+                returns: vec![ProjectionExpr {
+                    expr: lit_int(1),
+                    field: ResultField {
+                        name: "x".to_owned(),
+                        data_type: DataType::Int,
+                        text_type_modifier: None,
+                        nullable: false,
+                    },
+                }],
+                order_by: vec![],
+                skip: None,
+                limit: None,
+                distinct: false,
+                union: None,
+            },
+        })),
+    })
+    .expect("serialize pattern comprehension payload");
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: TypedExpr::scalar_function(
+                ScalarFunction::Generic("__cypher_pattern_comprehension".to_owned()),
+                vec![lit_text(&payload)],
+                DataType::Array(Box::new(DataType::Int)),
+                false,
+            ),
+            field: ResultField {
+                name: "xs".to_owned(),
+                data_type: DataType::Array(Box::new(DataType::Int)),
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute cypher pattern comprehension union distinct");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values, vec![Value::Array(vec![Value::Int(1)])]);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_nested_foreach_set_preserves_outer_binding_cardinality() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![
+            CypherPipelineOp::Match(match_node_clause(person_id, vec![])),
+            CypherPipelineOp::Foreach(Box::new(CypherForeachPlan {
+                variable: "x".to_owned(),
+                expr: int_array_literal(&[1, 2]),
+                body: vec![CypherForeachOp::Foreach(Box::new(CypherForeachPlan {
+                    variable: "y".to_owned(),
+                    expr: int_array_literal(&[10, 20]),
+                    body: vec![CypherForeachOp::Set(CypherSetItem {
+                        variable: "n".to_owned(),
+                        property: Some("name".to_owned()),
+                        expr: lit_text("NESTED"),
+                        table_id: None,
+                    })],
+                }))],
+            })),
+        ],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![return_name_projection()],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute nested FOREACH SET");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_with_passthrough_preserves_outer_cardinality() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![
+            CypherPipelineOp::Match(match_node_clause(person_id, vec![])),
+            CypherPipelineOp::CallSubquery(Box::new(CypherQueryPlan {
+                pipeline: vec![CypherPipelineOp::With(Box::new(CypherWithClause {
+                    distinct: false,
+                    items: vec![ProjectionExpr {
+                        expr: col_ref(0, DataType::Int, false),
+                        field: ResultField {
+                            name: "n".to_owned(),
+                            data_type: DataType::Int,
+                            text_type_modifier: None,
+                            nullable: false,
+                        },
+                    }],
+                    preserve_binding_sources: vec![Some("n".to_owned())],
+                    filter: None,
+                    order_by: vec![],
+                    skip: None,
+                    limit: None,
+                }))],
+                matches: vec![],
+                creates: vec![],
+                merges: vec![],
+                sets: vec![],
+                deletes: vec![],
+                returns: vec![ProjectionExpr {
+                    expr: col_ref(1, DataType::Text, true),
+                    field: ResultField {
+                        name: "name".to_owned(),
+                        data_type: DataType::Text,
+                        text_type_modifier: None,
+                        nullable: true,
+                    },
+                }],
+                order_by: vec![],
+                skip: None,
+                limit: None,
+                distinct: false,
+                union: None,
+            })),
+        ],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(2, DataType::Text, true),
+            field: ResultField {
+                name: "name".to_owned(),
+                data_type: DataType::Text,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![SortExpr {
+            expr: col_ref(2, DataType::Text, true),
+            descending: false,
+            nulls_first: Some(false),
+        }],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute cypher call subquery with passthrough");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_union_preserves_combined_cardinality() {
+    let (executor, _catalog, _) = make_executor();
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::CallSubquery(Box::new(CypherQueryPlan {
+            pipeline: vec![],
+            matches: vec![],
+            creates: vec![],
+            merges: vec![],
+            sets: vec![],
+            deletes: vec![],
+            returns: vec![ProjectionExpr {
+                expr: lit_int(1),
+                field: ResultField {
+                    name: "x".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+            }],
+            order_by: vec![],
+            skip: None,
+            limit: None,
+            distinct: false,
+            union: Some(Box::new(aiondb_plan::graph::CypherUnionPlan {
+                all: true,
+                right: CypherQueryPlan {
+                    pipeline: vec![],
+                    matches: vec![],
+                    creates: vec![],
+                    merges: vec![],
+                    sets: vec![],
+                    deletes: vec![],
+                    returns: vec![ProjectionExpr {
+                        expr: lit_int(2),
+                        field: ResultField {
+                            name: "x".to_owned(),
+                            data_type: DataType::Int,
+                            text_type_modifier: None,
+                            nullable: false,
+                        },
+                    }],
+                    order_by: vec![],
+                    skip: None,
+                    limit: None,
+                    distinct: false,
+                    union: None,
+                },
+            })),
+        }))],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(0, DataType::Int, false),
+            field: ResultField {
+                name: "x".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![SortExpr {
+            expr: col_ref(0, DataType::Int, false),
+            descending: false,
+            nulls_first: Some(false),
+        }],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute cypher call subquery union");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_union_deduplicates_combined_cardinality() {
+    let (executor, _catalog, _) = make_executor();
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::CallSubquery(Box::new(CypherQueryPlan {
+            pipeline: vec![],
+            matches: vec![],
+            creates: vec![],
+            merges: vec![],
+            sets: vec![],
+            deletes: vec![],
+            returns: vec![ProjectionExpr {
+                expr: lit_int(1),
+                field: ResultField {
+                    name: "x".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+            }],
+            order_by: vec![],
+            skip: None,
+            limit: None,
+            distinct: false,
+            union: Some(Box::new(aiondb_plan::graph::CypherUnionPlan {
+                all: false,
+                right: CypherQueryPlan {
+                    pipeline: vec![],
+                    matches: vec![],
+                    creates: vec![],
+                    merges: vec![],
+                    sets: vec![],
+                    deletes: vec![],
+                    returns: vec![ProjectionExpr {
+                        expr: lit_int(1),
+                        field: ResultField {
+                            name: "x".to_owned(),
+                            data_type: DataType::Int,
+                            text_type_modifier: None,
+                            nullable: false,
+                        },
+                    }],
+                    order_by: vec![],
+                    skip: None,
+                    limit: None,
+                    distinct: false,
+                    union: None,
+                },
+            })),
+        }))],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(0, DataType::Int, false),
+            field: ResultField {
+                name: "x".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute cypher call subquery union distinct");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 1);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_call_subquery_correlated_union_deduplicates_per_outer_row() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+
+    let branch = |preserve_binding_sources: Vec<Option<String>>| CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::With(Box::new(CypherWithClause {
+            distinct: false,
+            items: vec![ProjectionExpr {
+                expr: col_ref(0, DataType::Int, false),
+                field: ResultField {
+                    name: "n".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+            }],
+            preserve_binding_sources,
+            filter: None,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        }))],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(1, DataType::Text, true),
+            field: ResultField {
+                name: "name".to_owned(),
+                data_type: DataType::Text,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![
+            CypherPipelineOp::Match(match_node_clause(person_id, vec![])),
+            CypherPipelineOp::CallSubquery(Box::new(CypherQueryPlan {
+                pipeline: branch(vec![Some("n".to_owned())]).pipeline,
+                matches: vec![],
+                creates: vec![],
+                merges: vec![],
+                sets: vec![],
+                deletes: vec![],
+                returns: vec![ProjectionExpr {
+                    expr: col_ref(1, DataType::Text, true),
+                    field: ResultField {
+                        name: "name".to_owned(),
+                        data_type: DataType::Text,
+                        text_type_modifier: None,
+                        nullable: true,
+                    },
+                }],
+                order_by: vec![],
+                skip: None,
+                limit: None,
+                distinct: false,
+                union: Some(Box::new(aiondb_plan::graph::CypherUnionPlan {
+                    all: false,
+                    right: branch(vec![Some("n".to_owned())]),
+                })),
+            })),
+        ],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(2, DataType::Text, true),
+            field: ResultField {
+                name: "name".to_owned(),
+                data_type: DataType::Text,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute correlated call subquery union distinct");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 2);
         }
         other => panic!("expected query result, got {other:?}"),
     }
