@@ -230,6 +230,8 @@ pub(super) fn execute_final_aggregate_plan(
     // 5. Build the final `AggregateSource` over the materialised partial
     //    rows, now including HAVING, ORDER BY, LIMIT and OFFSET.
     let final_aggregates = build_identity_projections(output_fields);
+    let final_order_by =
+        super::projection_plans::rebase_order_by_to_output_ordinals(&final_aggregates, order_by);
 
     let final_plan = PhysicalPlan::AggregateSource {
         source: Box::new(values_plan),
@@ -238,7 +240,7 @@ pub(super) fn execute_final_aggregate_plan(
         aggregates: final_aggregates,
         having: having.clone(),
         filter: None,
-        order_by: order_by.to_vec(),
+        order_by: final_order_by,
         limit: limit.clone(),
         offset: offset.clone(),
         distinct: false,
