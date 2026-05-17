@@ -55,6 +55,7 @@
 //!   password must satisfy the server security baseline (≥12 chars, mixed case,
 //!   digit, symbol).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,10 +83,12 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 mod ha_runtime;
+mod bolt_compat;
+mod query_api;
 mod replica_runtime;
 mod runtime_bootstrap;
 
@@ -94,6 +97,9 @@ const DEFAULT_OBSERVABILITY_PORT: u16 = 9187;
 const OBSERVABILITY_FAIL_FAST_ENV: &str = "AIONDB_OBSERVABILITY_FAIL_FAST";
 const FRAGMENT_TRANSPORT_FAIL_FAST_ENV: &str = "AIONDB_DISTRIBUTED_FRAGMENT_TRANSPORT_FAIL_FAST";
 const EXPERIMENTAL_DISTRIBUTED_ENV: &str = "AIONDB_ENABLE_EXPERIMENTAL_DISTRIBUTED";
+const BOLT_COMPAT_ENABLE_ENV: &str = "AIONDB_ENABLE_BOLT_COMPAT";
+const BOLT_COMPAT_BIND_ENV: &str = "AIONDB_BOLT_COMPAT_BIND";
+const BOLT_COMPAT_PORT_ENV: &str = "AIONDB_BOLT_COMPAT_PORT";
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 const MEMORY_GUARD_FALLBACK_HOST_BYTES: u64 = 8 * GIB;
@@ -458,10 +464,22 @@ fn fragment_transport_fail_fast() -> bool {
     env_bool(FRAGMENT_TRANSPORT_FAIL_FAST_ENV, false)
 }
 
+fn bolt_compat_enabled() -> bool {
+    env_bool(BOLT_COMPAT_ENABLE_ENV, false)
+}
+
+fn bolt_compat_config() -> bolt_compat::BoltCompatConfig {
+    let mut config = bolt_compat::BoltCompatConfig::default();
+    config.bind_address = env_string(BOLT_COMPAT_BIND_ENV, &config.bind_address);
+    config.port = env_u16(BOLT_COMPAT_PORT_ENV, config.port);
+    config
+}
+
 #[derive(Clone)]
 struct ObservabilityState {
     server: Arc<PgWireServer<Engine>>,
     replica_metrics: Option<aiondb_replication::ReplicaMetrics>,
+    query_api_transactions: Arc<Mutex<HashMap<String, query_api::QueryApiTransactionSession>>>,
 }
 
 fn product_support_metric_value(level: ProductSupportLevel) -> u8 {
@@ -1073,6 +1091,7 @@ fn observability_router(
     replica_metrics: Option<aiondb_replication::ReplicaMetrics>,
 ) -> Router {
     Router::new()
+        .merge(query_api::routes())
         .route("/metrics", get(metrics_handler))
         .route("/livez", get(live_handler))
         .route("/healthz", get(health_handler))
@@ -1081,6 +1100,7 @@ fn observability_router(
         .with_state(Arc::new(ObservabilityState {
             server,
             replica_metrics,
+            query_api_transactions: Arc::new(Mutex::new(HashMap::new())),
         }))
 }
 
@@ -1282,6 +1302,11 @@ Common environment:
   AIONDB_OBSERVABILITY_BIND=127.0.0.1
   AIONDB_OBSERVABILITY_PORT=9187
       HTTP observability endpoint: /livez, /healthz, /readyz, /metrics, /info.
+
+  AIONDB_ENABLE_BOLT_COMPAT=true
+  AIONDB_BOLT_COMPAT_BIND=127.0.0.1
+  AIONDB_BOLT_COMPAT_PORT=7687
+      Experimental Neo4j Bolt compatibility listener. Loopback only.
 
   AIONDB_PGWIRE_TLS_MODE=disable|prefer|require
       TLS policy for pgwire. The default is prefer.
@@ -2522,6 +2547,7 @@ async fn async_main() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let fragment_transport_shutdown_rx = shutdown_rx.clone();
     let observability_shutdown_rx = shutdown_rx.clone();
+    let bolt_compat_shutdown_rx = shutdown_rx.clone();
     let replica_runtime_shutdown_rx = shutdown_rx.clone();
     let _fragment_transport_task = init_fragment_transport_server(
         fragment_transport_engine,
@@ -2570,6 +2596,32 @@ async fn async_main() {
             observability_fail_fast(),
         )
         .await
+    };
+
+    let _bolt_compat_task = if bolt_compat_enabled() {
+        let config = bolt_compat_config();
+        if !bind_address_is_loopback(&config.bind_address) {
+            error!(
+                bind_address = %config.bind_address,
+                "bolt compatibility listener must remain loopback-only"
+            );
+            std::process::exit(1);
+        }
+        match bolt_compat::spawn_bolt_compat_server(
+            config,
+            Arc::clone(server.engine()),
+            bolt_compat_shutdown_rx,
+        )
+        .await
+        {
+            Ok(task) => Some(task),
+            Err(err) => {
+                error!(%err, "failed to initialize bolt compatibility server");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
 
     // Listen for SIGINT (Ctrl+C) AND SIGTERM (the default `kill`/Docker/k8s
