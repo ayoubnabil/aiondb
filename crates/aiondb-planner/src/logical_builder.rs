@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use aiondb_catalog::CatalogReader;
 use aiondb_core::{DataType, DbError, DbResult, TxnId, Value};
 use aiondb_plan::{
@@ -5,7 +7,10 @@ use aiondb_plan::{
     ProjectionExpr, ResultField, ScalarFunction, TypedExpr, TypedExprKind,
 };
 
-use aiondb_parser::{CopyDirection, Expr, Literal, ObjectName};
+use aiondb_parser::{
+    CopyDirection, CypherClause, CypherMatchClause, CypherReturnClause, CypherReturnItem,
+    CypherStatement, CypherWithClause, Expr, Literal, ObjectName,
+};
 
 use crate::type_check::{
     TypedAlterRole, TypedAlterTable, TypedAnalyze, TypedCopy, TypedCreateEdgeLabel,
@@ -1182,41 +1187,68 @@ impl LogicalBuilder {
     // Cypher query plan builder
     // -------------------------------------------------------------------
 
-    fn cypher_expr_to_typed_with_subqueries(
+    pub(crate) fn cypher_expr_to_typed_with_subqueries(
         &self,
         expr: &Expr,
         catalog: &dyn CatalogReader,
         txn_id: TxnId,
     ) -> DbResult<TypedExpr> {
-        let lowered = self.lower_cypher_exists_expr(expr, catalog, txn_id)?;
+        let lowered =
+            self.lower_cypher_exists_expr_in_scope(expr, &BTreeSet::new(), catalog, txn_id)?;
         cypher_expr_to_typed(&lowered)
     }
 
-    fn cypher_projection_expr_with_subqueries(
+    pub(crate) fn cypher_expr_to_typed_with_subqueries_in_scope(
+        &self,
+        expr: &Expr,
+        outer_scope: &BTreeSet<String>,
+        catalog: &dyn CatalogReader,
+        txn_id: TxnId,
+    ) -> DbResult<TypedExpr> {
+        let lowered =
+            self.lower_cypher_exists_expr_in_scope(expr, outer_scope, catalog, txn_id)?;
+        cypher_expr_to_typed(&lowered)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cypher_projection_expr_with_subqueries(
         &self,
         item: &aiondb_parser::CypherReturnItem,
         catalog: &dyn CatalogReader,
         txn_id: TxnId,
     ) -> DbResult<ProjectionExpr> {
         let mut lowered = item.clone();
-        lowered.expr = self.lower_cypher_exists_expr(&item.expr, catalog, txn_id)?;
+        lowered.expr =
+            self.lower_cypher_exists_expr_in_scope(&item.expr, &BTreeSet::new(), catalog, txn_id)?;
         cypher_projection_expr(&lowered)
     }
 
-    fn cypher_sort_expr_with_subqueries(
+    pub(crate) fn cypher_sort_expr_with_subqueries(
         &self,
         item: &aiondb_parser::OrderByItem,
         catalog: &dyn CatalogReader,
         txn_id: TxnId,
     ) -> DbResult<aiondb_plan::SortExpr> {
         let mut lowered = item.clone();
-        lowered.expr = self.lower_cypher_exists_expr(&item.expr, catalog, txn_id)?;
+        lowered.expr =
+            self.lower_cypher_exists_expr_in_scope(&item.expr, &BTreeSet::new(), catalog, txn_id)?;
         cypher_sort_expr(&lowered)
     }
 
-    fn lower_cypher_exists_expr(
+    #[allow(dead_code)]
+    pub(crate) fn lower_cypher_exists_expr(
         &self,
         expr: &Expr,
+        catalog: &dyn CatalogReader,
+        txn_id: TxnId,
+    ) -> DbResult<Expr> {
+        self.lower_cypher_exists_expr_in_scope(expr, &BTreeSet::new(), catalog, txn_id)
+    }
+
+    fn lower_cypher_exists_expr_in_scope(
+        &self,
+        expr: &Expr,
+        outer_scope: &BTreeSet<String>,
         catalog: &dyn CatalogReader,
         txn_id: TxnId,
     ) -> DbResult<Expr> {
@@ -1252,50 +1284,84 @@ impl LogicalBuilder {
                 map_expr,
                 span,
             } => {
-                let match_clause = aiondb_plan::graph::CypherMatchClause {
+                let imported_vars = pattern
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.variable.as_ref())
+                    .chain(pattern.rels.iter().filter_map(|rel| rel.variable.as_ref()))
+                    .filter(|name| outer_scope.contains(*name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut clauses = Vec::new();
+                if !imported_vars.is_empty() {
+                    clauses.push(CypherClause::With(CypherWithClause {
+                        distinct: false,
+                        items: imported_vars
+                            .iter()
+                            .map(|name| CypherReturnItem {
+                                expr: Expr::Identifier(ObjectName {
+                                    parts: vec![name.clone()],
+                                    span: *span,
+                                }),
+                                alias: Some(name.clone()),
+                                span: *span,
+                            })
+                            .collect(),
+                        where_clause: None,
+                        order_by: Vec::new(),
+                        skip: None,
+                        limit: None,
+                        span: *span,
+                    }));
+                }
+                clauses.push(CypherClause::Match(CypherMatchClause {
                     optional: false,
-                    patterns: vec![self.build_cypher_pattern(pattern, catalog, txn_id)?],
-                    filter: where_clause
-                        .as_deref()
-                        .map(|expr| {
-                            self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
-                        })
-                        .transpose()?,
-                };
-                let projection = self.cypher_projection_expr_with_subqueries(
-                    &aiondb_parser::CypherReturnItem {
-                        expr: (**map_expr).clone(),
-                        alias: Some("__value".to_owned()),
+                    patterns: vec![pattern.clone()],
+                    where_clause: where_clause.as_deref().cloned(),
+                    span: *span,
+                }));
+                clauses.push(CypherClause::Return(CypherReturnClause {
+                    distinct: false,
+                    items: vec![CypherReturnItem {
+                        expr: map_expr.as_ref().clone(),
+                        alias: Some("__pattern".to_owned()),
+                        span: *span,
+                    }],
+                    order_by: Vec::new(),
+                    skip: None,
+                    limit: None,
+                    span: *span,
+                }));
+                let plan = self.build_cypher_query_plan(
+                    &CypherStatement {
+                        clauses,
+                        union: None,
                         span: *span,
                     },
                     catalog,
                     txn_id,
                 )?;
-                let plan = aiondb_plan::graph::CypherQueryPlan {
-                    pipeline: vec![aiondb_plan::graph::CypherPipelineOp::Match(match_clause)],
-                    matches: Vec::new(),
-                    creates: Vec::new(),
-                    merges: Vec::new(),
-                    sets: Vec::new(),
-                    deletes: Vec::new(),
-                    returns: vec![projection],
-                    order_by: Vec::new(),
-                    skip: None,
-                    limit: None,
-                    distinct: false,
-                    union: None,
-                };
                 let payload = serde_json::to_string(&plan).map_err(|error| {
                     DbError::internal(format!(
                         "failed to encode Cypher pattern comprehension plan: {error}"
                     ))
                 })?;
+                let imported_vars = imported_vars
+                    .into_iter()
+                    .map(|name| Expr::Literal(Literal::String(name), *span))
+                    .collect::<Vec<_>>();
                 Ok(Expr::FunctionCall {
                     name: ObjectName {
                         parts: vec!["__cypher_pattern_comprehension".to_owned()],
                         span: *span,
                     },
-                    args: vec![Expr::Literal(Literal::String(payload), *span)],
+                    args: vec![
+                        Expr::Literal(Literal::String(payload), *span),
+                        Expr::Array {
+                            elements: imported_vars,
+                            span: *span,
+                        },
+                    ],
                     distinct: false,
                     filter: None,
                     span: *span,
@@ -1311,19 +1377,33 @@ impl LogicalBuilder {
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| self.lower_cypher_exists_expr(arg, catalog, txn_id))
+                    .map(|arg| {
+                        self.lower_cypher_exists_expr_in_scope(arg, outer_scope, catalog, txn_id)
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 distinct: *distinct,
                 filter: filter
                     .as_deref()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .transpose()?
                     .map(Box::new),
                 span: *span,
             }),
             Expr::UnaryOp { op, expr, span } => Ok(Expr::UnaryOp {
                 op: *op,
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 span: *span,
             }),
             Expr::BinaryOp {
@@ -1332,9 +1412,19 @@ impl LogicalBuilder {
                 right,
                 span,
             } => Ok(Expr::BinaryOp {
-                left: Box::new(self.lower_cypher_exists_expr(left, catalog, txn_id)?),
+                left: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    left,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 op: *op,
-                right: Box::new(self.lower_cypher_exists_expr(right, catalog, txn_id)?),
+                right: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    right,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 span: *span,
             }),
             Expr::IsNull {
@@ -1342,7 +1432,12 @@ impl LogicalBuilder {
                 negated,
                 span,
             } => Ok(Expr::IsNull {
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 negated: *negated,
                 span: *span,
             }),
@@ -1352,8 +1447,18 @@ impl LogicalBuilder {
                 negated,
                 span,
             } => Ok(Expr::IsDistinctFrom {
-                left: Box::new(self.lower_cypher_exists_expr(left, catalog, txn_id)?),
-                right: Box::new(self.lower_cypher_exists_expr(right, catalog, txn_id)?),
+                left: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    left,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
+                right: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    right,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 negated: *negated,
                 span: *span,
             }),
@@ -1364,8 +1469,18 @@ impl LogicalBuilder {
                 case_insensitive,
                 span,
             } => Ok(Expr::Like {
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
-                pattern: Box::new(self.lower_cypher_exists_expr(pattern, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
+                pattern: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    pattern,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 negated: *negated,
                 case_insensitive: *case_insensitive,
                 span: *span,
@@ -1376,10 +1491,17 @@ impl LogicalBuilder {
                 negated,
                 span,
             } => Ok(Expr::InList {
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 list: list
                     .iter()
-                    .map(|item| self.lower_cypher_exists_expr(item, catalog, txn_id))
+                    .map(|item| {
+                        self.lower_cypher_exists_expr_in_scope(item, outer_scope, catalog, txn_id)
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 negated: *negated,
                 span: *span,
@@ -1391,9 +1513,24 @@ impl LogicalBuilder {
                 negated,
                 span,
             } => Ok(Expr::Between {
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
-                low: Box::new(self.lower_cypher_exists_expr(low, catalog, txn_id)?),
-                high: Box::new(self.lower_cypher_exists_expr(high, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
+                low: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    low,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
+                high: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    high,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 negated: *negated,
                 span: *span,
             }),
@@ -1402,7 +1539,12 @@ impl LogicalBuilder {
                 data_type,
                 span,
             } => Ok(Expr::Cast {
-                expr: Box::new(self.lower_cypher_exists_expr(expr, catalog, txn_id)?),
+                expr: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    expr,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 data_type: data_type.clone(),
                 span: *span,
             }),
@@ -1415,20 +1557,48 @@ impl LogicalBuilder {
             } => Ok(Expr::CaseWhen {
                 operand: operand
                     .as_deref()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .transpose()?
                     .map(Box::new),
                 conditions: conditions
                     .iter()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 results: results
                     .iter()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 else_result: else_result
                     .as_deref()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .transpose()?
                     .map(Box::new),
                 span: *span,
@@ -1436,7 +1606,14 @@ impl LogicalBuilder {
             Expr::Array { elements, span } => Ok(Expr::Array {
                 elements: elements
                     .iter()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 span: *span,
             }),
@@ -1447,10 +1624,22 @@ impl LogicalBuilder {
                 window_name,
                 span,
             } => Ok(Expr::WindowFunction {
-                function: Box::new(self.lower_cypher_exists_expr(function, catalog, txn_id)?),
+                function: Box::new(self.lower_cypher_exists_expr_in_scope(
+                    function,
+                    outer_scope,
+                    catalog,
+                    txn_id,
+                )?),
                 partition_by: partition_by
                     .iter()
-                    .map(|expr| self.lower_cypher_exists_expr(expr, catalog, txn_id))
+                    .map(|expr| {
+                        self.lower_cypher_exists_expr_in_scope(
+                            expr,
+                            outer_scope,
+                            catalog,
+                            txn_id,
+                        )
+                    })
                     .collect::<DbResult<Vec<_>>>()?,
                 order_by: order_by.clone(),
                 window_name: window_name.clone(),
@@ -1487,6 +1676,7 @@ impl LogicalBuilder {
         let mut skip = None;
         let mut limit = None;
         let mut distinct = false;
+        let mut scope = BTreeSet::new();
 
         for clause in &stmt.clauses {
             match clause {
@@ -1495,12 +1685,55 @@ impl LogicalBuilder {
                     // Preserve read-clause order exactly in the pipeline so
                     // MATCH/WITH/UNWIND semantics stay consistent.
                     pipeline.push(graph::CypherPipelineOp::Match(plan_match));
+                    for pattern in &m.patterns {
+                        if let Some(path_variable) = pattern.path_variable.as_ref() {
+                            scope.insert(path_variable.clone());
+                        }
+                        for node in &pattern.nodes {
+                            if let Some(variable) = node.variable.as_ref() {
+                                scope.insert(variable.clone());
+                            }
+                        }
+                        for rel in &pattern.rels {
+                            if let Some(variable) = rel.variable.as_ref() {
+                                scope.insert(variable.clone());
+                            }
+                        }
+                    }
                 }
                 CypherClause::Create(c) => {
                     creates.push(self.build_cypher_create(c, catalog, txn_id)?);
+                    for pattern in &c.patterns {
+                        if let Some(path_variable) = pattern.path_variable.as_ref() {
+                            scope.insert(path_variable.clone());
+                        }
+                        for node in &pattern.nodes {
+                            if let Some(variable) = node.variable.as_ref() {
+                                scope.insert(variable.clone());
+                            }
+                        }
+                        for rel in &pattern.rels {
+                            if let Some(variable) = rel.variable.as_ref() {
+                                scope.insert(variable.clone());
+                            }
+                        }
+                    }
                 }
                 CypherClause::Merge(m) => {
                     merges.push(self.build_cypher_merge(m, catalog, txn_id)?);
+                    if let Some(path_variable) = m.pattern.path_variable.as_ref() {
+                        scope.insert(path_variable.clone());
+                    }
+                    for node in &m.pattern.nodes {
+                        if let Some(variable) = node.variable.as_ref() {
+                            scope.insert(variable.clone());
+                        }
+                    }
+                    for rel in &m.pattern.rels {
+                        if let Some(variable) = rel.variable.as_ref() {
+                            scope.insert(variable.clone());
+                        }
+                    }
                 }
                 CypherClause::Set(s) => {
                     for item in &s.items {
@@ -1526,42 +1759,71 @@ impl LogicalBuilder {
                         .items
                         .iter()
                         .map(|item| {
-                            self.cypher_projection_expr_with_subqueries(item, catalog, txn_id)
+                            let mut lowered = item.clone();
+                            lowered.expr = self.lower_cypher_exists_expr_in_scope(
+                                &item.expr,
+                                &scope,
+                                catalog,
+                                txn_id,
+                            )?;
+                            cypher_projection_expr(&lowered)
                         })
                         .collect::<DbResult<Vec<_>>>()?;
                     order_by = r
                         .order_by
                         .iter()
-                        .map(|item| self.cypher_sort_expr_with_subqueries(item, catalog, txn_id))
+                        .map(|item| {
+                            let mut lowered = item.clone();
+                            lowered.expr = self.lower_cypher_exists_expr_in_scope(
+                                &item.expr,
+                                &scope,
+                                catalog,
+                                txn_id,
+                            )?;
+                            cypher_sort_expr(&lowered)
+                        })
                         .collect::<DbResult<Vec<_>>>()?;
                     skip = r
                         .skip
                         .as_ref()
                         .map(|expr| {
-                            self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                            self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                expr, &scope, catalog, txn_id,
+                            )
                         })
                         .transpose()?;
                     limit = r
                         .limit
                         .as_ref()
                         .map(|expr| {
-                            self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                            self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                expr, &scope, catalog, txn_id,
+                            )
                         })
                         .transpose()?;
                 }
                 CypherClause::Unwind(u) => {
                     pipeline.push(graph::CypherPipelineOp::Unwind(graph::CypherUnwindClause {
-                        expr: self
-                            .cypher_expr_to_typed_with_subqueries(&u.expr, catalog, txn_id)?,
+                        expr: self.cypher_expr_to_typed_with_subqueries_in_scope(
+                            &u.expr, &scope, catalog, txn_id,
+                        )?,
                         variable: u.variable.clone(),
                     }));
+                    scope.insert(u.variable.clone());
                 }
                 CypherClause::With(w) => {
                     let items = w
                         .items
                         .iter()
                         .map(|item| {
-                            self.cypher_projection_expr_with_subqueries(item, catalog, txn_id)
+                            let mut lowered = item.clone();
+                            lowered.expr = self.lower_cypher_exists_expr_in_scope(
+                                &item.expr,
+                                &scope,
+                                catalog,
+                                txn_id,
+                            )?;
+                            cypher_projection_expr(&lowered)
                         })
                         .collect::<DbResult<Vec<_>>>()?;
                     let preserve_binding_sources = w
@@ -1583,7 +1845,9 @@ impl LogicalBuilder {
                                 .where_clause
                                 .as_ref()
                                 .map(|expr| {
-                                    self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                                    self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                        expr, &scope, catalog, txn_id,
+                                    )
                                 })
                                 .transpose()?,
                             order_by: with_order_by,
@@ -1591,18 +1855,29 @@ impl LogicalBuilder {
                                 .skip
                                 .as_ref()
                                 .map(|expr| {
-                                    self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                                    self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                        expr, &scope, catalog, txn_id,
+                                    )
                                 })
                                 .transpose()?,
                             limit: w
                                 .limit
                                 .as_ref()
                                 .map(|expr| {
-                                    self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                                    self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                        expr, &scope, catalog, txn_id,
+                                    )
                                 })
                                 .transpose()?,
                         },
                     )));
+                    scope = w
+                        .items
+                        .iter()
+                        .map(|item| {
+                            item.alias.clone().unwrap_or_else(|| cypher_expr_alias(&item.expr))
+                        })
+                        .collect();
                 }
                 CypherClause::Remove(r) => {
                     // REMOVE n.prop is equivalent to SET n.prop = NULL
@@ -1649,7 +1924,9 @@ impl LogicalBuilder {
                             .args
                             .iter()
                             .map(|expr| {
-                                self.cypher_expr_to_typed_with_subqueries(expr, catalog, txn_id)
+                                self.cypher_expr_to_typed_with_subqueries_in_scope(
+                                    expr, &scope, catalog, txn_id,
+                                )
                             })
                             .collect::<DbResult<Vec<_>>>()?;
                         pipeline.push(graph::CypherPipelineOp::ProcedureCall(
@@ -1659,6 +1936,21 @@ impl LogicalBuilder {
                                 yields: procedure.yields,
                             },
                         ));
+                    }
+                    if let Some(subquery) = call.subquery.as_deref() {
+                        if let Some(CypherClause::Return(ret)) = subquery.clauses.last() {
+                            for item in &ret.items {
+                                scope.insert(
+                                    item.alias
+                                        .clone()
+                                        .unwrap_or_else(|| cypher_expr_alias(&item.expr)),
+                                );
+                            }
+                        }
+                    } else {
+                        for name in &call.yields {
+                            scope.insert(name.clone());
+                        }
                     }
                 }
                 CypherClause::Foreach(fc) => {
