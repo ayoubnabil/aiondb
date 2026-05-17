@@ -12,6 +12,7 @@ mod graph_procedure;
 mod graph_procedure_render;
 mod graph_procedure_results;
 
+pub(in crate::executor) use graph_mutate::compare_cypher_sort_keys;
 use graph_mutate::dedup_rows_by_values;
 
 use std::cmp::Ordering;
@@ -25,7 +26,7 @@ use aiondb_catalog::{
 };
 use aiondb_core::{
     ColumnId, DataType, DbError, DbResult, IndexId, RelationId, Row, SchemaId, SequenceId,
-    SqlState, TxnId, Value,
+    SqlState, TupleId, TxnId, Value,
 };
 use aiondb_eval::{build_hash_key, compare_runtime_values, ValueHashKey};
 use aiondb_graph::{
@@ -76,6 +77,13 @@ pub(super) type SharedRow = Arc<Row>;
 pub(super) type SharedStrings = Arc<Vec<String>>;
 pub(super) type SharedText = Arc<str>;
 
+#[derive(Default)]
+pub(in crate::executor) struct GraphMatchRuntimeCache {
+    pub edge_target_cache:
+        HashMap<(RelationId, ValueHashKey), Option<(SharedRow, SharedRow, Value, TupleId)>>,
+    pub adjacency_neighbor_cache: HashMap<(RelationId, ValueHashKey, bool), Arc<Vec<Value>>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CypherGraphAccessClauseKind {
     Match,
@@ -98,6 +106,15 @@ pub(super) struct CypherProcedureGraphAccessPlanHint {
     pub projection: NamedGraphProjectionDescriptor,
     pub projection_ready: bool,
     pub plan: HybridGraphPlan,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::executor) enum GraphBindingReduction {
+    GlobalDistinctExpr(TypedExpr),
+    TopN {
+        order_by: Vec<SortExpr>,
+        limit: usize,
+    },
 }
 
 /// Format a graph node as the Cypher textual literal `(:Label[:Label2] {props})`.
@@ -154,12 +171,73 @@ pub(super) fn format_cypher_bound_node_literal(
 ) -> Option<String> {
     match binding.get(variable) {
         Some(BoundValue::Node {
-            row,
+            raw_row,
             column_names,
             labels,
             ..
-        }) => Some(format_cypher_node_literal(column_names, row, labels)),
+        }) => Some(format_cypher_node_literal(column_names, raw_row, labels)),
         _ => None,
+    }
+}
+
+pub(in crate::executor) fn compact_graph_binding_node_payloads(binding: &mut BindingRow) {
+    for (_, value) in &mut binding.entries {
+        let compacted = match value.as_ref() {
+            BoundValue::Node {
+                table_id,
+                id_value,
+                tuple_id,
+                labels,
+                column_names,
+                raw_row,
+                ..
+            } => Some(Arc::new(BoundValue::Node {
+                table_id: *table_id,
+                row: if table_id.get() == 0 && id_value.is_null() {
+                    Arc::clone(raw_row)
+                } else {
+                    Arc::new(Row::new(vec![id_value.clone()]))
+                },
+                raw_row: Arc::clone(raw_row),
+                id_value: id_value.clone(),
+                tuple_id: *tuple_id,
+                labels: Arc::clone(labels),
+                column_names: Arc::clone(column_names),
+            })),
+            _ => None,
+        };
+        if let Some(compacted) = compacted {
+            *value = compacted;
+        }
+    }
+}
+
+pub(in crate::executor) fn retain_graph_binding_variables(
+    binding: &mut BindingRow,
+    keep: &std::collections::HashSet<String>,
+) {
+    if keep.is_empty() {
+        binding.entries.clear();
+        return;
+    }
+    binding.entries.retain(|(name, _)| keep.contains(name));
+}
+
+pub(in crate::executor) fn compact_node_bound_value(
+    table_id: RelationId,
+    id_value: Value,
+    tuple_id: aiondb_core::TupleId,
+    labels: SharedStrings,
+    column_names: SharedStrings,
+) -> BoundValue {
+    BoundValue::Node {
+        table_id,
+        row: Arc::new(Row::new(vec![id_value.clone()])),
+        raw_row: Arc::new(Row::new(vec![id_value.clone()])),
+        id_value,
+        tuple_id,
+        labels,
+        column_names,
     }
 }
 
@@ -521,6 +599,14 @@ impl BindingRow {
         }
     }
 
+    pub(super) fn push_fresh_shared_binding(
+        &mut self,
+        name: impl Into<String>,
+        value: SharedBoundValue,
+    ) {
+        self.entries.push((name.into(), value));
+    }
+
     pub(super) fn get(&self, name: &str) -> Option<&BoundValue> {
         self.entries
             .iter()
@@ -540,6 +626,14 @@ impl BindingRow {
     /// Remove a binding by name. Returns `true` when an entry
     /// was removed, `false` when the name was not bound.
     pub(super) fn remove(&mut self, name: &str) -> bool {
+        if self
+            .entries
+            .last()
+            .is_some_and(|(last_name, _)| last_name == name)
+        {
+            self.entries.pop();
+            return true;
+        }
         if let Some(idx) = self.entries.iter().position(|(k, _)| k == name) {
             self.entries.remove(idx);
             true
@@ -1280,6 +1374,7 @@ pub(super) fn collect_graph_filter_conjuncts<'a>(
     }
 }
 
+#[derive(Clone)]
 pub(super) struct GraphFilterConjunct<'a> {
     pub(super) expr: &'a TypedExpr,
     pub(super) referenced_vars: Option<HashSet<String>>,
@@ -1300,6 +1395,13 @@ impl<'a> GraphFilterConjunct<'a> {
         vars.iter()
             .all(|variable| binding.get(variable.as_str()).is_some())
     }
+
+    pub(super) fn is_ready_with_names(&self, bound_names: &HashSet<String>) -> bool {
+        let Some(vars) = self.referenced_vars.as_ref() else {
+            return false;
+        };
+        vars.iter().all(|variable| bound_names.contains(variable))
+    }
 }
 
 pub(super) fn build_graph_filter_conjuncts(filter: &TypedExpr) -> Vec<GraphFilterConjunct<'_>> {
@@ -1317,6 +1419,48 @@ fn referenced_graph_variables(expr: &TypedExpr) -> Option<HashSet<String>> {
         Some(vars)
     } else {
         None
+    }
+}
+
+pub(in crate::executor) fn referenced_graph_variables_set(
+    expr: &TypedExpr,
+) -> Option<HashSet<String>> {
+    referenced_graph_variables(expr)
+}
+
+pub(in crate::executor) fn cypher_query_output_variables(
+    returns: &[ProjectionExpr],
+    order_by: &[SortExpr],
+) -> HashSet<String> {
+    let mut keep = HashSet::new();
+    for item in returns {
+        if let Some(vars) = referenced_graph_variables_set(&item.expr) {
+            keep.extend(vars);
+        }
+    }
+    for sort in order_by {
+        if let Some(vars) = referenced_graph_variables_set(&sort.expr) {
+            keep.extend(vars);
+        }
+    }
+    keep
+}
+
+pub(in crate::executor) fn cypher_query_binding_reduction(
+    returns: &[ProjectionExpr],
+    distinct: bool,
+    order_by: &[SortExpr],
+) -> Option<GraphBindingReduction> {
+    if distinct || !order_by.is_empty() || returns.len() != 1 {
+        return None;
+    }
+    match &returns[0].expr.kind {
+        TypedExprKind::AggCount {
+            expr: Some(expr),
+            distinct: true,
+            filter: None,
+        } => Some(GraphBindingReduction::GlobalDistinctExpr((**expr).clone())),
+        _ => None,
     }
 }
 
@@ -1398,13 +1542,76 @@ fn collect_referenced_graph_variables(expr: &TypedExpr, vars: &mut HashSet<Strin
                     .map_or(true, |item| collect_referenced_graph_variables(item, vars))
         }
         TypedExprKind::Coalesce { args }
-        | TypedExprKind::ScalarFunction { args, .. }
         | TypedExprKind::ArrayConstruct { elements: args }
         | TypedExprKind::UserFunction { args, .. } => args
             .iter()
             .all(|arg| collect_referenced_graph_variables(arg, vars)),
+        TypedExprKind::ScalarFunction { func, args } => {
+            if let ScalarFunction::Generic(function_name) = func {
+                if function_name.eq_ignore_ascii_case("__cypher_pattern_comprehension") {
+                    if let Some(imported) = args.get(1) {
+                        return collect_pattern_comprehension_imported_variables(imported, vars);
+                    }
+                    return false;
+                }
+            }
+            args.iter()
+                .all(|arg| collect_referenced_graph_variables(arg, vars))
+        }
+        TypedExprKind::AggCount { expr, filter, .. } => {
+            expr.as_deref().map_or(true, |inner| {
+                collect_referenced_graph_variables(inner, vars)
+            }) && filter.as_deref().map_or(true, |inner| {
+                collect_referenced_graph_variables(inner, vars)
+            })
+        }
+        TypedExprKind::AggSum { expr, filter, .. }
+        | TypedExprKind::AggAvg { expr, filter, .. }
+        | TypedExprKind::AggAnyValue { expr, filter }
+        | TypedExprKind::AggMin { expr, filter }
+        | TypedExprKind::AggMax { expr, filter }
+        | TypedExprKind::AggBoolAnd { expr, filter }
+        | TypedExprKind::AggBoolOr { expr, filter }
+        | TypedExprKind::AggStddevPop { expr, filter }
+        | TypedExprKind::AggStddevSamp { expr, filter }
+        | TypedExprKind::AggVarPop { expr, filter }
+        | TypedExprKind::AggVarSamp { expr, filter }
+        | TypedExprKind::AggArrayAgg { expr, filter, .. } => {
+            collect_referenced_graph_variables(expr, vars)
+                && filter.as_deref().map_or(true, |inner| {
+                    collect_referenced_graph_variables(inner, vars)
+                })
+        }
+        TypedExprKind::AggStringAgg {
+            expr,
+            delimiter,
+            filter,
+            ..
+        } => {
+            collect_referenced_graph_variables(expr, vars)
+                && collect_referenced_graph_variables(delimiter, vars)
+                && filter.as_deref().map_or(true, |inner| {
+                    collect_referenced_graph_variables(inner, vars)
+                })
+        }
         _ => false,
     }
+}
+
+fn collect_pattern_comprehension_imported_variables(
+    expr: &TypedExpr,
+    vars: &mut HashSet<String>,
+) -> bool {
+    let TypedExprKind::ArrayConstruct { elements } = &expr.kind else {
+        return false;
+    };
+    for element in elements {
+        let TypedExprKind::Literal(Value::Text(name)) = &element.kind else {
+            return false;
+        };
+        vars.insert(name.clone());
+    }
+    true
 }
 
 pub(super) fn exact_column_literal_equality(expr: &TypedExpr) -> Option<(&str, Value)> {
@@ -1510,6 +1717,26 @@ fn exact_variable_column_literal_equality(
         .then_some((column.to_owned(), value))
 }
 
+fn exact_variable_column_literal_gt(
+    expr: &TypedExpr,
+    expected_variable: &str,
+) -> Option<(String, Value)> {
+    let TypedExprKind::BinaryGt { left, right } = &expr.kind else {
+        return None;
+    };
+    let TypedExprKind::ColumnRef { name, .. } = &left.kind else {
+        return None;
+    };
+    let (variable, column) = name.split_once('.')?;
+    if !variable.eq_ignore_ascii_case(expected_variable) {
+        return None;
+    }
+    let TypedExprKind::Literal(value) = &right.kind else {
+        return None;
+    };
+    Some((column.to_owned(), value.clone()))
+}
+
 fn exact_named_column_literal_gt(expr: &TypedExpr, expected_name: &str) -> Option<Value> {
     let TypedExprKind::BinaryGt { left, right } = &expr.kind else {
         return None;
@@ -1524,6 +1751,58 @@ fn exact_named_column_literal_gt(expr: &TypedExpr, expected_name: &str) -> Optio
         return None;
     };
     Some(value.clone())
+}
+
+fn is_column_column_inequality(expr: &TypedExpr, left_name: &str, right_name: &str) -> bool {
+    let TypedExprKind::BinaryNe { left, right } = &expr.kind else {
+        return false;
+    };
+    let (TypedExprKind::ColumnRef { name: left, .. }, TypedExprKind::ColumnRef { name: right, .. }) =
+        (&left.kind, &right.kind)
+    else {
+        return false;
+    };
+    (left.eq_ignore_ascii_case(left_name) && right.eq_ignore_ascii_case(right_name))
+        || (left.eq_ignore_ascii_case(right_name) && right.eq_ignore_ascii_case(left_name))
+}
+
+pub(in crate::executor) fn graph_filter_node_id_inequality_peers(
+    filter_conjuncts: &[GraphFilterConjunct<'_>],
+    next_variable: &str,
+) -> Vec<String> {
+    let mut peers = Vec::new();
+    let expected = format!("{next_variable}.id");
+    for conjunct in filter_conjuncts {
+        let TypedExprKind::BinaryNe { left, right } = &conjunct.expr.kind else {
+            continue;
+        };
+        let (
+            TypedExprKind::ColumnRef { name: left, .. },
+            TypedExprKind::ColumnRef { name: right, .. },
+        ) = (&left.kind, &right.kind)
+        else {
+            continue;
+        };
+        let push_peer = |candidate: &str, peers: &mut Vec<String>| {
+            let Some((variable, property)) = candidate.split_once('.') else {
+                return;
+            };
+            if property.eq_ignore_ascii_case("id")
+                && !variable.eq_ignore_ascii_case(next_variable)
+                && !peers
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(variable))
+            {
+                peers.push(variable.to_owned());
+            }
+        };
+        if left.eq_ignore_ascii_case(&expected) {
+            push_peer(right, &mut peers);
+        } else if right.eq_ignore_ascii_case(&expected) {
+            push_peer(left, &mut peers);
+        }
+    }
+    peers
 }
 
 fn extract_hybrid_deep_graph_vector_filter(
@@ -1750,6 +2029,17 @@ fn count_return_variable(expr: &TypedExpr) -> Option<&str> {
     column_ref_name(expr)
 }
 
+fn is_count_star(expr: &TypedExpr) -> bool {
+    matches!(
+        &expr.kind,
+        TypedExprKind::AggCount {
+            expr: None,
+            distinct: false,
+            filter: None,
+        }
+    )
+}
+
 fn count_distinct_id_return_variable(expr: &TypedExpr) -> Option<&str> {
     let TypedExprKind::AggCount {
         expr: Some(expr),
@@ -1769,7 +2059,43 @@ fn count_distinct_id_return_variable(expr: &TypedExpr) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 impl Executor {
-    fn fast_graph_adjacency_neighbors_cached(
+    fn graph_query_binding_reduction(
+        &self,
+        context: &ExecutionContext,
+        returns: &[ProjectionExpr],
+        distinct: bool,
+        order_by: &[SortExpr],
+        skip: Option<&TypedExpr>,
+        limit: Option<&TypedExpr>,
+    ) -> DbResult<Option<GraphBindingReduction>> {
+        if let Some(reduction) = cypher_query_binding_reduction(returns, distinct, order_by) {
+            return Ok(Some(reduction));
+        }
+        if distinct || order_by.is_empty() || skip.is_some() {
+            return Ok(None);
+        }
+        if returns
+            .iter()
+            .any(|item| expr_contains_aggregate(&item.expr))
+        {
+            return Ok(None);
+        }
+        let Some(limit_expr) = limit else {
+            return Ok(None);
+        };
+        let limit_value = self.evaluate_expr(limit_expr, context)?;
+        let limit = match limit_value {
+            Value::BigInt(n) if n >= 0 => nonneg_i64_to_usize(n),
+            Value::Int(n) if n >= 0 => nonneg_i64_to_usize(i64::from(n)),
+            _ => return Ok(None),
+        };
+        Ok(Some(GraphBindingReduction::TopN {
+            order_by: order_by.to_vec(),
+            limit,
+        }))
+    }
+
+    pub(in crate::executor) fn fast_graph_adjacency_neighbors_cached(
         &self,
         context: &ExecutionContext,
         edge_table_id: RelationId,
@@ -2144,6 +2470,87 @@ impl Executor {
         Ok(count)
     }
 
+    fn fast_graph_count_variable_outgoing_paths_unique_edges(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        start_id: &Value,
+        min_hops: usize,
+        max_hops: usize,
+    ) -> DbResult<u64> {
+        if max_hops == 0 {
+            return Ok(u64::from(min_hops == 0));
+        }
+
+        let mut count = u64::from(min_hops == 0);
+        let mut frontier = vec![(start_id.clone(), Vec::new())];
+        context.track_memory(estimate_value_bytes(start_id).saturating_add(64))?;
+
+        for depth in 1..=max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for (mut node_id, path_edges) in frontier {
+                context.check_deadline()?;
+                if node_id.is_null() {
+                    continue;
+                }
+                normalize_int_key(&mut node_id);
+                let mut edge_cursor = self.storage_dml.adjacency_edge_cursor(
+                    context.txn_id,
+                    &context.snapshot,
+                    edge_table_id,
+                    &node_id,
+                    true,
+                )?;
+                while let Some(edge_tuple_id) = edge_cursor.next_neighbor() {
+                    context.check_deadline()?;
+                    if path_edges.contains(&edge_tuple_id) {
+                        continue;
+                    }
+                    let Some((_, mut target_id)) = self.storage_dml.adjacency_edge_endpoints(
+                        context.txn_id,
+                        &context.snapshot,
+                        edge_table_id,
+                        edge_tuple_id,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if target_id.is_null() {
+                        continue;
+                    }
+                    normalize_int_key(&mut target_id);
+                    if depth >= min_hops {
+                        count = count.saturating_add(1);
+                    }
+                    if depth < max_hops {
+                        let mut next_path_edges = path_edges.clone();
+                        next_path_edges.push(edge_tuple_id);
+                        context.track_memory(
+                            estimate_value_bytes(&target_id)
+                                .saturating_add(64)
+                                .saturating_add(
+                                    usize_to_u64(next_path_edges.len())
+                                        .saturating_mul(size_of_u64::<aiondb_core::TupleId>()),
+                                ),
+                        )?;
+                        ensure_graph_workset_capacity(
+                            context,
+                            next.len(),
+                            "variable-length count frontier",
+                        )?;
+                        next.push((target_id, next_path_edges));
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        Ok(count)
+    }
+
     fn fast_graph_collect_fixed_outgoing_endpoint_ids(
         &self,
         context: &ExecutionContext,
@@ -2414,6 +2821,80 @@ impl Executor {
         )
     }
 
+    fn fast_graph_collect_target_id_values_filter(
+        &self,
+        context: &ExecutionContext,
+        target_table_id: RelationId,
+        filter_column_name: &str,
+        comparison: GraphTargetFilterComparison,
+        filter_value: &Value,
+    ) -> DbResult<Option<Vec<Value>>> {
+        let Some(target_table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, target_table_id)?
+        else {
+            return Ok(None);
+        };
+        let id_ordinal = self
+            .find_column_index(&target_table.columns, "id")
+            .unwrap_or(0);
+        let Some(filter_ordinal) =
+            self.find_column_index(&target_table.columns, filter_column_name)
+        else {
+            return Ok(None);
+        };
+        let mut required_ordinals = vec![id_ordinal];
+        if filter_ordinal != id_ordinal {
+            required_ordinals.push(filter_ordinal);
+        }
+        let filter_projected_ordinal = required_ordinals
+            .iter()
+            .position(|ordinal| *ordinal == filter_ordinal)
+            .ok_or_else(|| DbError::internal("failed to map graph filter ordinal"))?;
+        let Some(projected_columns) =
+            self.table_column_ids_for_ordinals(context, target_table_id, &required_ordinals)?
+        else {
+            return Ok(None);
+        };
+        let mut stream = self.resolve_scan_stream(
+            context,
+            target_table_id,
+            &ScanAccessPath::SeqScan,
+            Some(projected_columns),
+        )?;
+        let mut ids = Vec::new();
+        while let Some(record) = stream.next()? {
+            context.check_deadline()?;
+            let candidate = record
+                .row
+                .values
+                .get(filter_projected_ordinal)
+                .unwrap_or(&Value::Null);
+            let Some(ordering) = compare_runtime_values(candidate, filter_value)? else {
+                continue;
+            };
+            let matched = match comparison {
+                GraphTargetFilterComparison::Eq => ordering == Ordering::Equal,
+                GraphTargetFilterComparison::Gt => ordering == Ordering::Greater,
+            };
+            if !matched {
+                continue;
+            }
+            let Some(id_value) = record.row.values.first() else {
+                continue;
+            };
+            if id_value.is_null() {
+                continue;
+            }
+            let mut normalized_id = id_value.clone();
+            normalize_int_key(&mut normalized_id);
+            ensure_graph_workset_capacity(context, ids.len(), "graph target id filter values")?;
+            context.track_memory(estimate_value_bytes(&normalized_id).saturating_add(32))?;
+            ids.push(normalized_id);
+        }
+        Ok(Some(ids))
+    }
+
     fn hybrid_deep_graph_vector_meta_cached(
         &self,
         context: &ExecutionContext,
@@ -2608,6 +3089,9 @@ impl Executor {
         {
             return Ok(result);
         }
+        if let Some(result) = self.try_execute_fast_anchored_variable_path_count(plan, context)? {
+            return Ok(result);
+        }
         if let Some(result) =
             self.try_execute_fast_anchored_one_hop_edge_property_count(plan, context)?
         {
@@ -2628,6 +3112,14 @@ impl Executor {
         if let Some(result) = self.try_execute_fast_unanchored_one_hop_count(plan, context)? {
             return Ok(result);
         }
+        if let Some(result) =
+            self.try_execute_fast_unanchored_two_hop_end_filter_count(plan, context)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_execute_fast_unanchored_edge_property_count(plan, context)? {
+            return Ok(result);
+        }
         if let Some(result) = self.try_execute_fast_unanchored_one_hop_group_count(plan, context)? {
             return Ok(result);
         }
@@ -2640,6 +3132,9 @@ impl Executor {
         if let Some(result) =
             self.try_execute_fast_unanchored_edge_eq_filter_limit(plan, context)?
         {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_execute_fast_multi_out_filtered_count(plan, context)? {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_multi_out_limit(plan, context)? {
@@ -2658,9 +3153,32 @@ impl Executor {
             return Ok(result);
         }
 
+        let read_only_tail = plan.creates.is_empty()
+            && plan.merges.is_empty()
+            && plan.sets.is_empty()
+            && plan.deletes.is_empty()
+            && plan.union.is_none();
+        let query_output_variables = if read_only_tail {
+            Some(cypher_query_output_variables(&plan.returns, &plan.order_by))
+        } else {
+            None
+        };
+        let query_binding_reduction = if read_only_tail {
+            self.graph_query_binding_reduction(
+                context,
+                &plan.returns,
+                plan.distinct,
+                &plan.order_by,
+                plan.skip.as_ref(),
+                plan.limit.as_ref(),
+            )?
+        } else {
+            None
+        };
+
         // 0. Execute pipeline operations (UNWIND, WITH) to produce initial bindings.
         let mut bindings = vec![BindingRow::new()];
-        for op in &plan.pipeline {
+        for (op_idx, op) in plan.pipeline.iter().enumerate() {
             context.check_deadline()?;
             match op {
                 CypherPipelineOp::Unwind(u) => {
@@ -2670,7 +3188,26 @@ impl Executor {
                     bindings = self.execute_cypher_with(context, w, bindings)?;
                 }
                 CypherPipelineOp::Match(m) => {
-                    bindings = self.execute_cypher_match(context, m, bindings)?;
+                    let required_output_variables = if read_only_tail
+                        && op_idx + 1 == plan.pipeline.len()
+                        && plan.matches.is_empty()
+                    {
+                        query_output_variables.as_ref()
+                    } else {
+                        None
+                    };
+                    let binding_reduction = if required_output_variables.is_some() {
+                        query_binding_reduction.as_ref()
+                    } else {
+                        None
+                    };
+                    bindings = self.execute_cypher_match(
+                        context,
+                        m,
+                        bindings,
+                        required_output_variables,
+                        binding_reduction,
+                    )?;
                 }
                 CypherPipelineOp::ProcedureCall(call) => {
                     bindings = self.execute_cypher_procedure_call(context, call, bindings)?;
@@ -2685,9 +3222,26 @@ impl Executor {
         }
 
         // 1. Execute MATCH / OPTIONAL MATCH clauses -> produce binding rows.
-        for match_clause in &plan.matches {
+        for (match_idx, match_clause) in plan.matches.iter().enumerate() {
             context.check_deadline()?;
-            bindings = self.execute_cypher_match(context, match_clause, bindings)?;
+            let required_output_variables = if read_only_tail && match_idx + 1 == plan.matches.len()
+            {
+                query_output_variables.as_ref()
+            } else {
+                None
+            };
+            let binding_reduction = if required_output_variables.is_some() {
+                query_binding_reduction.as_ref()
+            } else {
+                None
+            };
+            bindings = self.execute_cypher_match(
+                context,
+                match_clause,
+                bindings,
+                required_output_variables,
+                binding_reduction,
+            )?;
         }
 
         // 2. Execute CREATE clauses -> insert nodes/edges.
@@ -2745,6 +3299,7 @@ impl Executor {
                 plan.skip.as_ref(),
                 plan.limit.as_ref(),
                 bindings,
+                query_binding_reduction.as_ref(),
             )?;
             let columns = plan.returns.iter().map(|r| r.field.clone()).collect();
             ExecutionResult::Query { columns, rows }
@@ -3155,6 +3710,106 @@ impl Executor {
             self.fast_graph_count_fixed_outgoing_paths(context, edge_table_id, &start_id, hops)
         };
         let count = match count_result {
+            Ok(count) => count,
+            Err(_) => return Ok(None),
+        };
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
+    }
+
+    fn try_execute_fast_anchored_variable_path_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        if pattern.path_function.is_some()
+            || pattern.path_variable.is_some()
+            || pattern.nodes.len() != 2
+            || pattern.relationships.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let start = &pattern.nodes[0];
+        let end = &pattern.nodes[1];
+        let rel = &pattern.relationships[0];
+        let Some(start_variable) = start.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        if !count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable))
+        {
+            return Ok(None);
+        }
+        let has_variable_length = rel.min_hops.is_some() || rel.max_hops.is_some();
+        if !has_variable_length
+            || start.table_id.is_none()
+            || end.table_id.is_none()
+            || node_has_filter_constraints(end)
+            || rel.table_id.is_none()
+            || rel.direction != CypherRelDirection::Outgoing
+            || rel.variable.is_some()
+            || rel.index_scan.is_some()
+            || !rel.properties.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(mut start_id) =
+            extract_start_id_literal(start, match_clause.filter.as_ref(), start_variable)
+        else {
+            return Ok(None);
+        };
+        normalize_int_key(&mut start_id);
+        let min_hops = usize::try_from(rel.min_hops.unwrap_or(1)).unwrap_or(usize::MAX);
+        let max_hops = usize::try_from(rel.max_hops.unwrap_or(10)).unwrap_or(usize::MAX);
+        if min_hops > max_hops || max_hops > 16 {
+            return Ok(None);
+        }
+        let Some(edge_table_id) = rel.table_id else {
+            return Ok(None);
+        };
+        let count = match self.fast_graph_count_variable_outgoing_paths_unique_edges(
+            context,
+            edge_table_id,
+            &start_id,
+            min_hops,
+            max_hops,
+        ) {
             Ok(count) => count,
             Err(_) => return Ok(None),
         };
@@ -4618,6 +5273,224 @@ impl Executor {
         }))
     }
 
+    fn try_execute_fast_multi_out_filtered_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+            || !is_count_star(&plan.returns[0].expr)
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 2 {
+            return Ok(None);
+        }
+        let first = &match_clause.patterns[0];
+        let second = &match_clause.patterns[1];
+        if first.path_function.is_some()
+            || second.path_function.is_some()
+            || first.nodes.len() != 2
+            || second.nodes.len() != 2
+            || first.relationships.len() != 1
+            || second.relationships.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let first_rel = &first.relationships[0];
+        let second_rel = &second.relationships[0];
+        let (first_src, first_tgt) = match first_rel.direction {
+            CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
+            CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        let (second_src, second_tgt) = match second_rel.direction {
+            CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
+            CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
+            CypherRelDirection::Both => return Ok(None),
+        };
+        let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
+            first_src.variable.as_deref(),
+            first_tgt.variable.as_deref(),
+            second_src.variable.as_deref(),
+            second_tgt.variable.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        if !src_var.eq_ignore_ascii_case(second_src_var) {
+            return Ok(None);
+        }
+        if first_src.table_id.is_none()
+            || first_tgt.table_id.is_none()
+            || second_tgt.table_id.is_none()
+            || node_has_filter_constraints(first_src)
+            || node_has_filter_constraints(first_tgt)
+            || node_has_filter_constraints(second_src)
+            || node_has_filter_constraints(second_tgt)
+            || first_rel.table_id.is_none()
+            || second_rel.table_id.is_none()
+            || first_rel.table_id != second_rel.table_id
+            || first_rel.variable.is_some()
+            || second_rel.variable.is_some()
+            || first_rel.min_hops.is_some()
+            || first_rel.max_hops.is_some()
+            || second_rel.min_hops.is_some()
+            || second_rel.max_hops.is_some()
+            || first_rel.index_scan.is_some()
+            || second_rel.index_scan.is_some()
+            || !first_rel.properties.is_empty()
+            || !second_rel.properties.is_empty()
+        {
+            return Ok(None);
+        }
+        if second_src
+            .table_id
+            .is_some_and(|table_id| Some(table_id) != first_src.table_id)
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = match_clause.filter.as_ref() else {
+            return Ok(None);
+        };
+        let mut number_filter = None;
+        let mut require_distinct_targets = false;
+        let first_number_ref = format!("{first_tgt_var}.number");
+        let first_id_ref = format!("{first_tgt_var}.id");
+        let second_id_ref = format!("{second_tgt_var}.id");
+        let mut conjuncts = Vec::new();
+        collect_graph_filter_conjuncts(filter, &mut conjuncts);
+        for conjunct in conjuncts {
+            if let Some(value) = exact_named_column_literal_gt(conjunct, &first_number_ref) {
+                if number_filter.is_some() {
+                    return Ok(None);
+                }
+                number_filter = Some(value);
+                continue;
+            }
+            if is_column_column_inequality(conjunct, &first_id_ref, &second_id_ref) {
+                require_distinct_targets = true;
+                continue;
+            }
+            return Ok(None);
+        }
+        let Some(number_filter) = number_filter else {
+            return Ok(None);
+        };
+
+        let Some(edge_table_id) = first_rel.table_id else {
+            return Ok(None);
+        };
+        let Some(first_target_table_id) = first_tgt.table_id else {
+            return Ok(None);
+        };
+        let ((src_col_idx, target_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+            context,
+            edge_table_id,
+            first_rel.rel_type.as_deref(),
+        )?;
+        let Some(allowed_left_target_ids) = self.fast_graph_collect_target_ids_filter(
+            context,
+            first_target_table_id,
+            "number",
+            GraphTargetFilterComparison::Gt,
+            &number_filter,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(projected_columns) = self.table_column_ids_for_ordinals(
+            context,
+            edge_table_id,
+            &[src_col_idx, target_col_idx],
+        )?
+        else {
+            return Ok(None);
+        };
+
+        struct SourceCounts {
+            outdegree: u64,
+            target_counts: HashMap<ValueHashKey, u64>,
+            filtered_target_counts: HashMap<ValueHashKey, u64>,
+        }
+
+        let mut sources = HashMap::<ValueHashKey, SourceCounts>::new();
+        let mut stream = self.resolve_scan_stream(
+            context,
+            edge_table_id,
+            &ScanAccessPath::SeqScan,
+            Some(projected_columns),
+        )?;
+        while let Some(record) = stream.next()? {
+            context.check_deadline()?;
+            let mut source_id = record.row.values.first().cloned().unwrap_or(Value::Null);
+            let mut target_id = record.row.values.get(1).cloned().unwrap_or(Value::Null);
+            if source_id.is_null() || target_id.is_null() {
+                continue;
+            }
+            normalize_int_key(&mut source_id);
+            normalize_int_key(&mut target_id);
+            let source_key = build_hash_key(&source_id)?;
+            let target_key = build_hash_key(&target_id)?;
+            let entry = match sources.entry(source_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    context.track_memory(estimate_value_bytes(&source_id).saturating_add(128))?;
+                    entry.insert(SourceCounts {
+                        outdegree: 0,
+                        target_counts: HashMap::new(),
+                        filtered_target_counts: HashMap::new(),
+                    })
+                }
+            };
+            entry.outdegree = entry.outdegree.saturating_add(1);
+            *entry.target_counts.entry(target_key.clone()).or_insert(0) += 1;
+            if allowed_left_target_ids.contains(&target_key) {
+                *entry.filtered_target_counts.entry(target_key).or_insert(0) += 1;
+            }
+        }
+
+        let mut count = 0u64;
+        for source in sources.into_values() {
+            for (target_key, filtered_count) in source.filtered_target_counts {
+                let excluded = if require_distinct_targets {
+                    source.target_counts.get(&target_key).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                count = count.saturating_add(
+                    filtered_count.saturating_mul(source.outdegree.saturating_sub(excluded)),
+                );
+            }
+        }
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
+    }
+
     fn try_execute_fast_multi_out_limit(
         &self,
         plan: &CypherQueryPlan,
@@ -5009,6 +5882,169 @@ impl Executor {
         }))
     }
 
+    fn try_execute_fast_unanchored_edge_property_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pattern = &match_clause.patterns[0];
+        if pattern.path_function.is_some()
+            || pattern.nodes.len() != 2
+            || pattern.relationships.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let start = &pattern.nodes[0];
+        let end = &pattern.nodes[1];
+        let rel = &pattern.relationships[0];
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+        let Some(rel_variable) = rel.variable.as_deref() else {
+            return Ok(None);
+        };
+        if !count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable))
+        {
+            return Ok(None);
+        }
+        if start.table_id.is_none()
+            || end.table_id.is_none()
+            || node_has_filter_constraints(start)
+            || node_has_filter_constraints(end)
+            || rel.table_id.is_none()
+            || rel.direction != CypherRelDirection::Outgoing
+            || rel.min_hops.is_some()
+            || rel.max_hops.is_some()
+            || !rel.properties.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = match_clause.filter.as_ref() else {
+            return Ok(None);
+        };
+        let mut filter_column = None;
+        let mut filter_value = None;
+        let mut conjuncts = Vec::new();
+        collect_graph_filter_conjuncts(filter, &mut conjuncts);
+        for conjunct in conjuncts {
+            if let Some((column, value)) = exact_variable_column_literal_gt(conjunct, rel_variable)
+            {
+                if filter_column
+                    .as_ref()
+                    .is_some_and(|existing: &String| !existing.eq_ignore_ascii_case(&column))
+                {
+                    return Ok(None);
+                }
+                if filter_value.is_some() {
+                    return Ok(None);
+                }
+                filter_column = Some(column);
+                filter_value = Some(value);
+                continue;
+            }
+            return Ok(None);
+        }
+        let Some(filter_column) = filter_column else {
+            return Ok(None);
+        };
+        let Some(filter_value) = filter_value else {
+            return Ok(None);
+        };
+        let Some(edge_table_id) = rel.table_id else {
+            return Ok(None);
+        };
+        let ((_, target_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+            context,
+            edge_table_id,
+            rel.rel_type.as_deref(),
+        )?;
+        let Some(edge_table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, edge_table_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(filter_col_idx) = self.find_column_index(&edge_table.columns, &filter_column)
+        else {
+            return Ok(None);
+        };
+        let mut required_ordinals = vec![target_col_idx];
+        if filter_col_idx != target_col_idx {
+            required_ordinals.push(filter_col_idx);
+        }
+        let filter_projected_idx = required_ordinals
+            .iter()
+            .position(|ordinal| *ordinal == filter_col_idx)
+            .ok_or_else(|| DbError::internal("failed to map graph edge filter ordinal"))?;
+        let Some(projected_columns) =
+            self.table_column_ids_for_ordinals(context, edge_table_id, &required_ordinals)?
+        else {
+            return Ok(None);
+        };
+
+        let mut stream = self.resolve_scan_stream(
+            context,
+            edge_table_id,
+            &ScanAccessPath::SeqScan,
+            Some(projected_columns),
+        )?;
+        let mut count = 0u64;
+        while let Some(record) = stream.next()? {
+            context.check_deadline()?;
+            let target_id = record.row.values.first().unwrap_or(&Value::Null);
+            if target_id.is_null() {
+                continue;
+            }
+            let property_value = record
+                .row
+                .values
+                .get(filter_projected_idx)
+                .unwrap_or(&Value::Null);
+            let Some(ordering) = compare_runtime_values(property_value, &filter_value)? else {
+                continue;
+            };
+            if ordering != Ordering::Greater {
+                continue;
+            }
+            count = count.saturating_add(1);
+        }
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
+        }))
+    }
+
     fn try_execute_fast_unanchored_one_hop_count(
         &self,
         plan: &CypherQueryPlan,
@@ -5295,6 +6331,178 @@ impl Executor {
         Ok(Some(ExecutionResult::Query {
             columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
             rows,
+        }))
+    }
+
+    fn try_execute_fast_unanchored_two_hop_end_filter_count(
+        &self,
+        plan: &CypherQueryPlan,
+        context: &ExecutionContext,
+    ) -> DbResult<Option<ExecutionResult>> {
+        if plan.pipeline.len() + plan.matches.len() != 1
+            || !plan.creates.is_empty()
+            || !plan.merges.is_empty()
+            || !plan.sets.is_empty()
+            || !plan.deletes.is_empty()
+            || plan.distinct
+            || plan.skip.is_some()
+            || plan.limit.is_some()
+            || plan.union.is_some()
+            || !plan.order_by.is_empty()
+            || plan.returns.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let match_clause = match plan.pipeline.as_slice() {
+            [CypherPipelineOp::Match(match_clause)] => match_clause,
+            [] => &plan.matches[0],
+            _ => return Ok(None),
+        };
+        if match_clause.optional || match_clause.patterns.len() != 1 {
+            return Ok(None);
+        }
+
+        let pattern = &match_clause.patterns[0];
+        if pattern.path_function.is_some()
+            || pattern.nodes.len() != 3
+            || pattern.relationships.len() != 2
+        {
+            return Ok(None);
+        }
+
+        let start = &pattern.nodes[0];
+        let middle = &pattern.nodes[1];
+        let end = &pattern.nodes[2];
+        let first_rel = &pattern.relationships[0];
+        let second_rel = &pattern.relationships[1];
+        let Some(end_variable) = end.variable.as_deref() else {
+            return Ok(None);
+        };
+
+        let count_all_end = count_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable));
+        let count_distinct_end_id = count_distinct_id_return_variable(&plan.returns[0].expr)
+            .is_some_and(|name| name.eq_ignore_ascii_case(end_variable));
+        if !count_all_end && !count_distinct_end_id {
+            return Ok(None);
+        }
+        if start.table_id.is_none()
+            || middle.table_id.is_none()
+            || end.table_id.is_none()
+            || node_has_filter_constraints(start)
+            || node_has_filter_constraints(middle)
+            || first_rel.table_id.is_none()
+            || second_rel.table_id.is_none()
+            || first_rel.table_id != second_rel.table_id
+            || first_rel.direction != CypherRelDirection::Outgoing
+            || second_rel.direction != CypherRelDirection::Outgoing
+            || first_rel.variable.is_some()
+            || second_rel.variable.is_some()
+            || first_rel.min_hops.is_some()
+            || first_rel.max_hops.is_some()
+            || second_rel.min_hops.is_some()
+            || second_rel.max_hops.is_some()
+            || !first_rel.properties.is_empty()
+            || !second_rel.properties.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = match_clause.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some(filter_value) =
+            exact_named_column_literal_gt(filter, &format!("{end_variable}.number"))
+        else {
+            return Ok(None);
+        };
+        let Some(edge_table_id) = first_rel.table_id else {
+            return Ok(None);
+        };
+        let Some(end_table_id) = end.table_id else {
+            return Ok(None);
+        };
+        let Some(end_ids) = self.fast_graph_collect_target_id_values_filter(
+            context,
+            end_table_id,
+            "number",
+            GraphTargetFilterComparison::Gt,
+            &filter_value,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut incoming_degree_cache = HashMap::<ValueHashKey, u64>::new();
+        let mut count = 0u64;
+        for end_id in end_ids {
+            context.check_deadline()?;
+            let incoming_middle_ids =
+                self.fast_graph_adjacency_neighbors_cached(context, edge_table_id, &end_id, false)?;
+            if count_distinct_end_id {
+                let mut reachable = false;
+                for mut middle_id in incoming_middle_ids {
+                    context.check_deadline()?;
+                    if middle_id.is_null() {
+                        continue;
+                    }
+                    normalize_int_key(&mut middle_id);
+                    let middle_key = build_hash_key(&middle_id)?;
+                    let incoming_degree =
+                        if let Some(cached) = incoming_degree_cache.get(&middle_key) {
+                            *cached
+                        } else {
+                            let degree = self.fast_graph_adjacency_neighbor_count(
+                                context,
+                                edge_table_id,
+                                &middle_id,
+                                false,
+                            )?;
+                            incoming_degree_cache.insert(middle_key, degree);
+                            degree
+                        };
+                    if incoming_degree > 0 {
+                        reachable = true;
+                        break;
+                    }
+                }
+                if reachable {
+                    count = count.saturating_add(1);
+                }
+                continue;
+            }
+
+            for mut middle_id in incoming_middle_ids {
+                context.check_deadline()?;
+                if middle_id.is_null() {
+                    continue;
+                }
+                normalize_int_key(&mut middle_id);
+                let middle_key = build_hash_key(&middle_id)?;
+                let incoming_degree = if let Some(cached) = incoming_degree_cache.get(&middle_key) {
+                    *cached
+                } else {
+                    let degree = self.fast_graph_adjacency_neighbor_count(
+                        context,
+                        edge_table_id,
+                        &middle_id,
+                        false,
+                    )?;
+                    incoming_degree_cache.insert(middle_key, degree);
+                    degree
+                };
+                count = count.saturating_add(incoming_degree);
+            }
+        }
+
+        let row = Row::new(vec![Value::BigInt(
+            i64::try_from(count).unwrap_or(i64::MAX),
+        )]);
+        ensure_result_bytes_fit_and_track_query_row(context, &row, 0)?;
+        Ok(Some(ExecutionResult::Query {
+            columns: plan.returns.iter().map(|r| r.field.clone()).collect(),
+            rows: vec![row],
         }))
     }
 
@@ -6687,39 +7895,47 @@ impl Executor {
         subquery: &CypherQueryPlan,
         input_bindings: Vec<BindingRow>,
     ) -> DbResult<Vec<BindingRow>> {
-        if subquery.union.is_some() {
-            return Err(DbError::feature_not_supported(
-                "UNION inside Cypher CALL subqueries is not yet supported",
-            ));
-        }
-
-        let return_as_with = if subquery.returns.is_empty() {
-            None
-        } else {
-            Some(aiondb_plan::graph::CypherWithClause {
-                distinct: subquery.distinct,
-                items: subquery.returns.clone(),
-                preserve_binding_sources: vec![None; subquery.returns.len()],
-                filter: None,
-                order_by: subquery.order_by.clone(),
-                skip: subquery.skip.clone(),
-                limit: subquery.limit.clone(),
-            })
-        };
-
         let mut output = Vec::new();
         for outer in input_bindings {
             context.check_deadline()?;
-            let sub_bindings =
-                self.execute_cypher_subquery_body(context, subquery, vec![outer.clone()])?;
+            let mut returned = self.execute_cypher_call_subquery_branch(
+                context,
+                subquery,
+                outer.clone(),
+            )?;
 
-            let Some(return_as_with) = return_as_with.as_ref() else {
+            if let Some(union_plan) = subquery.union.as_ref() {
+                let right_returned = self.execute_cypher_call_subquery_branch(
+                    context,
+                    &union_plan.right,
+                    outer.clone(),
+                )?;
+                returned.extend(right_returned);
+                if !union_plan.all {
+                    let mut seen = HashSet::<Vec<ValueHashKey>>::new();
+                    let mut deduped = Vec::with_capacity(returned.len());
+                    for binding in returned.drain(..) {
+                        context.check_deadline()?;
+                        let key = self
+                            .build_flat_row(&binding)
+                            .values
+                            .iter()
+                            .map(build_hash_key)
+                            .collect::<DbResult<Vec<_>>>()?;
+                        if seen.insert(key) {
+                            push_graph_binding(context, &mut deduped, binding)?;
+                        }
+                    }
+                    returned = deduped;
+                }
+            }
+
+            if subquery.returns.is_empty() {
                 ensure_graph_result_row_capacity(context, output.len())?;
                 output.push(outer);
                 continue;
-            };
+            }
 
-            let returned = self.execute_cypher_with(context, return_as_with, sub_bindings)?;
             for row in returned {
                 let mut merged = outer.clone();
                 for (name, value) in row.entries {
@@ -6733,13 +7949,62 @@ impl Executor {
         Ok(output)
     }
 
+    fn execute_cypher_call_subquery_branch(
+        &self,
+        context: &ExecutionContext,
+        subquery: &CypherQueryPlan,
+        outer: BindingRow,
+    ) -> DbResult<Vec<BindingRow>> {
+        let sub_bindings = self.execute_cypher_subquery_body(context, subquery, vec![outer])?;
+        let Some(return_as_with) = (!subquery.returns.is_empty()).then(|| {
+            aiondb_plan::graph::CypherWithClause {
+                distinct: subquery.distinct,
+                items: subquery.returns.clone(),
+                preserve_binding_sources: vec![None; subquery.returns.len()],
+                filter: None,
+                order_by: subquery.order_by.clone(),
+                skip: subquery.skip.clone(),
+                limit: subquery.limit.clone(),
+            }
+        }) else {
+            return Ok(Vec::new());
+        };
+        self.execute_cypher_with(context, &return_as_with, sub_bindings)
+    }
+
     fn execute_cypher_subquery_body(
         &self,
         context: &ExecutionContext,
         subquery: &CypherQueryPlan,
         mut bindings: Vec<BindingRow>,
     ) -> DbResult<Vec<BindingRow>> {
-        for op in &subquery.pipeline {
+        let read_only_tail = subquery.creates.is_empty()
+            && subquery.merges.is_empty()
+            && subquery.sets.is_empty()
+            && subquery.deletes.is_empty()
+            && subquery.union.is_none();
+        let query_output_variables = if read_only_tail {
+            Some(cypher_query_output_variables(
+                &subquery.returns,
+                &subquery.order_by,
+            ))
+        } else {
+            None
+        };
+        let query_binding_reduction = if read_only_tail {
+            self.graph_query_binding_reduction(
+                context,
+                &subquery.returns,
+                subquery.distinct,
+                &subquery.order_by,
+                subquery.skip.as_ref(),
+                subquery.limit.as_ref(),
+            )?
+        } else {
+            None
+        };
+
+        for (op_idx, op) in subquery.pipeline.iter().enumerate() {
             context.check_deadline()?;
             match op {
                 CypherPipelineOp::Unwind(u) => {
@@ -6749,7 +8014,26 @@ impl Executor {
                     bindings = self.execute_cypher_with(context, w, bindings)?;
                 }
                 CypherPipelineOp::Match(m) => {
-                    bindings = self.execute_cypher_match(context, m, bindings)?;
+                    let required_output_variables = if read_only_tail
+                        && op_idx + 1 == subquery.pipeline.len()
+                        && subquery.matches.is_empty()
+                    {
+                        query_output_variables.as_ref()
+                    } else {
+                        None
+                    };
+                    let binding_reduction = if required_output_variables.is_some() {
+                        query_binding_reduction.as_ref()
+                    } else {
+                        None
+                    };
+                    bindings = self.execute_cypher_match(
+                        context,
+                        m,
+                        bindings,
+                        required_output_variables,
+                        binding_reduction,
+                    )?;
                 }
                 CypherPipelineOp::ProcedureCall(call) => {
                     bindings = self.execute_cypher_procedure_call(context, call, bindings)?;
@@ -6763,9 +8047,26 @@ impl Executor {
             }
         }
 
-        for match_clause in &subquery.matches {
+        for (match_idx, match_clause) in subquery.matches.iter().enumerate() {
             context.check_deadline()?;
-            bindings = self.execute_cypher_match(context, match_clause, bindings)?;
+            let required_output_variables =
+                if read_only_tail && match_idx + 1 == subquery.matches.len() {
+                    query_output_variables.as_ref()
+                } else {
+                    None
+                };
+            let binding_reduction = if required_output_variables.is_some() {
+                query_binding_reduction.as_ref()
+            } else {
+                None
+            };
+            bindings = self.execute_cypher_match(
+                context,
+                match_clause,
+                bindings,
+                required_output_variables,
+                binding_reduction,
+            )?;
         }
 
         for create_clause in &subquery.creates {
@@ -6859,53 +8160,6 @@ impl Executor {
     /// `(:Label {props})` / `[:TYPE {props}]` so RETURN/ORDER BY/printer
     /// downstream see the formatted node/edge instead of falling back to
     /// the raw id column.
-    fn resolve_cypher_variable(&self, binding: &BindingRow, name: &str) -> Option<Value> {
-        match binding.get(name) {
-            Some(BoundValue::Scalar(v)) => Some(v.clone()),
-            Some(BoundValue::Null { .. }) => Some(Value::Null),
-            Some(BoundValue::Node {
-                row,
-                column_names,
-                labels,
-                ..
-            }) => Some(Value::Text(format_cypher_node_literal(
-                column_names,
-                row,
-                labels,
-            ))),
-            Some(BoundValue::Edge {
-                row,
-                column_names,
-                rel_type,
-                ..
-            }) => Some(Value::Text(format_cypher_edge_literal(
-                column_names,
-                row,
-                rel_type,
-            ))),
-            Some(BoundValue::Path {
-                nodes,
-                relationships,
-                directions,
-            }) => Some(Value::Text(format_cypher_path_literal(
-                binding,
-                nodes,
-                relationships,
-                directions,
-            ))),
-            Some(BoundValue::PathValues {
-                nodes,
-                relationships,
-                directions,
-            }) => Some(Value::Text(format_cypher_path_value_literal(
-                nodes,
-                relationships,
-                directions,
-            ))),
-            None => None,
-        }
-    }
-
     /// Evaluate a predicate expression against a binding row.
     pub(super) fn evaluate_graph_predicate(
         &self,
@@ -6961,14 +8215,38 @@ impl Executor {
     ) -> DbResult<bool> {
         match bound {
             BoundValue::Node {
-                row, column_names, ..
-            } => self.check_property_filters(
-                context,
-                &node.properties,
-                column_names.as_ref(),
+                table_id,
+                tuple_id,
                 row,
-                binding,
-            ),
+                column_names,
+                ..
+            } => {
+                if row.values.len() >= column_names.len() || node.properties.is_empty() {
+                    self.check_property_filters(
+                        context,
+                        &node.properties,
+                        column_names.as_ref(),
+                        row,
+                        binding,
+                    )
+                } else {
+                    let fetched = self.storage_dml.fetch(
+                        context.txn_id,
+                        &context.snapshot,
+                        *table_id,
+                        *tuple_id,
+                        None,
+                    )?;
+                    let fetched_row = fetched.as_ref().unwrap_or(row.as_ref());
+                    self.check_property_filters(
+                        context,
+                        &node.properties,
+                        column_names.as_ref(),
+                        fetched_row,
+                        binding,
+                    )
+                }
+            }
             _ => Ok(false),
         }
     }
