@@ -1793,46 +1793,108 @@ impl Optimizer {
     ) -> DbResult<()> {
         for pattern in &match_clause.patterns {
             for node in &pattern.nodes {
-                if let Some(label) = node.label.as_deref() {
-                    if let Some(table_id) = self.node_table_id_for_graph_stats(txn_id, node)? {
-                        if let Some(table_stats) =
-                            self.catalog_reader.get_statistics(txn_id, table_id)?
-                        {
-                            stats
-                                .label_cardinality
-                                .insert(label.to_owned(), table_stats.row_count);
-                        }
-                    }
-                }
+                self.collect_node_label_stats(txn_id, node, stats)?;
             }
             for rel in &pattern.relationships {
                 if let Some(rel_type) = rel.rel_type.as_deref() {
-                    if let Some(table_id) =
-                        self.edge_table_id_for_graph_stats(txn_id, rel_type, rel.table_id)?
-                    {
-                        if let Some(table_stats) =
-                            self.catalog_reader.get_statistics(txn_id, table_id)?
-                        {
-                            stats
-                                .edge_cardinality
-                                .insert(rel_type.to_owned(), table_stats.row_count);
-                        }
-                    }
+                    self.collect_edge_type_stats(txn_id, rel_type, rel.table_id, stats)?;
                 }
                 for rel_type in &rel.rel_type_alternatives {
-                    if let Some(table_id) =
-                        self.edge_table_id_for_graph_stats(txn_id, rel_type, None)?
-                    {
-                        if let Some(table_stats) =
-                            self.catalog_reader.get_statistics(txn_id, table_id)?
-                        {
-                            stats
-                                .edge_cardinality
-                                .insert(rel_type.clone(), table_stats.row_count);
-                        }
-                    }
+                    self.collect_edge_type_stats(txn_id, rel_type, None, stats)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Project a node label's backing table statistics into graph stats:
+    /// label cardinality (row count) plus per-property distinct counts taken
+    /// from the table's persisted per-column `ndistinct`. The cost-based
+    /// planner uses the latter for real equality selectivity instead of a
+    /// generic constant.
+    fn collect_node_label_stats(
+        &self,
+        txn_id: TxnId,
+        node: &aiondb_plan::graph::CypherNodePattern,
+        stats: &mut graph_optimizer::GraphStats,
+    ) -> DbResult<()> {
+        let Some(label) = node.label.as_deref() else {
+            return Ok(());
+        };
+        let Some(table_id) = self.node_table_id_for_graph_stats(txn_id, node)? else {
+            return Ok(());
+        };
+        let Some(table_stats) = self.catalog_reader.get_statistics(txn_id, table_id)? else {
+            return Ok(());
+        };
+        stats
+            .label_cardinality
+            .insert(label.to_owned(), table_stats.row_count);
+        if let Some(table) = self.catalog_reader.get_table_by_id(txn_id, table_id)? {
+            for column in &table.columns {
+                if let Some(ndistinct) = column_ndistinct(&table_stats, column.column_id) {
+                    stats
+                        .distinct
+                        .insert((label.to_owned(), column.name.clone()), ndistinct);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Project an edge type's backing table statistics into graph stats:
+    /// edge cardinality (row count), the declared `(source, target)` endpoint
+    /// labels (for the typed-triple estimate), and average in/out degree
+    /// derived from the persisted distinct counts of the edge table's
+    /// endpoint id columns (`edges / distinct endpoint nodes`).
+    fn collect_edge_type_stats(
+        &self,
+        txn_id: TxnId,
+        rel_type: &str,
+        table_id_hint: Option<RelationId>,
+        stats: &mut graph_optimizer::GraphStats,
+    ) -> DbResult<()> {
+        let descriptor = self.catalog_reader.get_edge_label(txn_id, rel_type)?;
+        if let Some(descriptor) = &descriptor {
+            stats.edge_endpoints.insert(
+                rel_type.to_owned(),
+                (
+                    descriptor.source_label.clone(),
+                    descriptor.target_label.clone(),
+                ),
+            );
+        }
+        let Some(table_id) = table_id_hint.or_else(|| descriptor.as_ref().map(|d| d.table_id))
+        else {
+            return Ok(());
+        };
+        let Some(table_stats) = self.catalog_reader.get_statistics(txn_id, table_id)? else {
+            return Ok(());
+        };
+        stats
+            .edge_cardinality
+            .insert(rel_type.to_owned(), table_stats.row_count);
+
+        let Some(endpoints) = descriptor.as_ref().and_then(|d| d.endpoints.as_ref()) else {
+            return Ok(());
+        };
+        let Some(table) = self.catalog_reader.get_table_by_id(txn_id, table_id)? else {
+            return Ok(());
+        };
+        let row_count = crate::u64_to_f64(table_stats.row_count);
+        if let Some(distinct_src) =
+            column_ndistinct_by_name(&table, &table_stats, &endpoints.source_id_column)
+        {
+            stats
+                .avg_out_degree
+                .insert(rel_type.to_owned(), row_count / distinct_src);
+        }
+        if let Some(distinct_tgt) =
+            column_ndistinct_by_name(&table, &table_stats, &endpoints.target_id_column)
+        {
+            stats
+                .avg_in_degree
+                .insert(rel_type.to_owned(), row_count / distinct_tgt);
         }
         Ok(())
     }
@@ -1853,21 +1915,31 @@ impl Optimizer {
             .get_node_label(txn_id, label)?
             .map(|descriptor| descriptor.table_id))
     }
+}
 
-    fn edge_table_id_for_graph_stats(
-        &self,
-        txn_id: TxnId,
-        rel_type: &str,
-        table_id: Option<RelationId>,
-    ) -> DbResult<Option<RelationId>> {
-        if let Some(table_id) = table_id {
-            return Ok(Some(table_id));
-        }
-        Ok(self
-            .catalog_reader
-            .get_edge_label(txn_id, rel_type)?
-            .map(|descriptor| descriptor.table_id))
-    }
+/// Persisted distinct-value count for a column, or `None` when the column has
+/// no usable statistics (`ndistinct == 0` means "unknown", not "zero").
+fn column_ndistinct(table_stats: &TableStatistics, column_id: ColumnId) -> Option<f64> {
+    let column_stats = table_stats
+        .column_stats
+        .iter()
+        .find(|cs| cs.column_id == column_id)?;
+    (column_stats.ndistinct > 0.0).then_some(column_stats.ndistinct)
+}
+
+/// Same as [`column_ndistinct`] but resolves the column by name first.
+/// Endpoint id columns are matched case-insensitively to mirror SQL
+/// identifier folding.
+fn column_ndistinct_by_name(
+    table: &TableDescriptor,
+    table_stats: &TableStatistics,
+    name: &str,
+) -> Option<f64> {
+    let column = table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))?;
+    column_ndistinct(table_stats, column.column_id)
 }
 
 fn parameterized_index_join_enabled() -> bool {

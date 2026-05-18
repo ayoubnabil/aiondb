@@ -18,12 +18,6 @@ pub(in crate::executor) fn compare_cypher_sort_keys(
     Ok(Ordering::Equal)
 }
 
-fn cypher_return_referenced_variables(
-    returns: &[ProjectionExpr],
-    order_by: &[SortExpr],
-) -> std::collections::HashSet<String> {
-    cypher_query_output_variables(returns, order_by)
-}
 
 impl Executor {
     // -----------------------------------------------------------------------
@@ -396,6 +390,8 @@ impl Executor {
             let mut matched = self.execute_cypher_match(
                 &merge_context,
                 &match_clause,
+                "Match",
+                0,
                 vec![binding.clone()],
                 None,
                 None,
@@ -932,12 +928,14 @@ impl Executor {
         bindings: Vec<BindingRow>,
         binding_reduction: Option<&GraphBindingReduction>,
     ) -> DbResult<Vec<Row>> {
-        let required_variables = cypher_return_referenced_variables(returns, order_by);
         let mut bindings = bindings;
-        if !required_variables.is_empty() {
-            for binding in &mut bindings {
-                retain_graph_binding_variables(binding, &required_variables);
+        match cypher_query_output_variables(returns, order_by) {
+            Some(required_variables) if !required_variables.is_empty() => {
+                for binding in &mut bindings {
+                    retain_graph_binding_variables(binding, &required_variables);
+                }
             }
+            _ => {}
         }
 
         // Check if any RETURN expression contains an aggregate function.

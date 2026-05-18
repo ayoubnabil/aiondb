@@ -115,6 +115,7 @@ impl Engine {
     ) -> DbResult<Option<Vec<StatementResult>>> {
         if let Statement::Explain {
             analyze,
+            format_json,
             statement: inner,
             span,
         } = statement
@@ -127,6 +128,7 @@ impl Engine {
                 let resolved = self.resolve_compat_execute_statement(session, &name, &args)?;
                 let explain = Statement::Explain {
                     analyze: *analyze,
+                    format_json: *format_json,
                     statement: Box::new(resolved),
                     span: *span,
                 };

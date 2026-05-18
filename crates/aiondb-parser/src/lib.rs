@@ -632,14 +632,40 @@ impl Parser {
     fn parse_statement(&mut self) -> DbResult<Statement> {
         if let Some(explain_token) = self.consume_keyword(Keyword::Explain) {
             let mut analyze = self.consume_keyword(Keyword::Analyze).is_some();
+            let mut format_json = false;
             // Handle EXPLAIN (options) form: skip parenthesized options
             if !analyze && self.consume_kind(&TokenKind::LParen) {
                 // Parse options like (ANALYZE, VERBOSE, COSTS OFF, BUFFERS, FORMAT TEXT)
                 loop {
-                    if let TokenKind::Keyword(kw) = &self.current().kind {
-                        if *kw == Keyword::Analyze {
+                    match &self.current().kind {
+                        TokenKind::Keyword(kw) if *kw == Keyword::Analyze => {
                             analyze = true;
                         }
+                        TokenKind::Identifier(value) if value.eq_ignore_ascii_case("format") => {
+                            self.advance();
+                            match &self.current().kind {
+                                TokenKind::Identifier(value)
+                                    if value.eq_ignore_ascii_case("json") =>
+                                {
+                                    format_json = true;
+                                }
+                                TokenKind::Keyword(Keyword::Jsonb) => {
+                                    format_json = true;
+                                }
+                                _ => {}
+                            }
+                            if matches!(
+                                self.current().kind,
+                                TokenKind::Identifier(_) | TokenKind::Keyword(_)
+                            ) {
+                                self.advance();
+                            }
+                            if !self.consume_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                     self.advance();
                     // Skip optional value: ON/OFF/TRUE/FALSE, keyword values (TEXT, JSON, YAML),
@@ -668,6 +694,7 @@ impl Parser {
             let span = explain_token.span.merge(inner.span());
             return Ok(Statement::Explain {
                 analyze,
+                format_json,
                 statement: Box::new(inner),
                 span,
             });

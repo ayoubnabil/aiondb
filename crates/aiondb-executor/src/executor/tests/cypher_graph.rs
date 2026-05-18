@@ -1,11 +1,18 @@
 use super::*;
 use crate::executor::graph_plans::CypherGraphAccessClauseKind;
-use crate::executor::graph_plans::{BindingRow, BoundValue};
+use crate::executor::graph_plans::{
+    explain_graph_drift_suggestion_line, explain_graph_pattern_hint_line,
+    explain_graph_plan_hint_line, graph_access_clause_profile_input_key,
+    graph_access_clause_profile_output_key, graph_access_profile_key,
+    graph_estimate_warning_severity, BindingRow, BoundValue,
+};
+use aiondb_core::IndexId;
 use aiondb_graph::HybridGraphSource;
 use aiondb_plan::graph::{
     CypherCreateClause, CypherForeachOp, CypherForeachPlan, CypherMatchClause, CypherNodePattern,
     CypherPathFunction, CypherPattern, CypherPipelineOp, CypherProcedureCall, CypherPropertyExpr,
     CypherQueryPlan, CypherRelDirection, CypherRelPattern, CypherSetItem, CypherWithClause,
+    IndexScanInfo,
 };
 use aiondb_plan::{
     ColumnPlan, PhysicalPlan, ProjectionExpr, ResultField, ScalarFunction, SortExpr, TypedExpr,
@@ -352,8 +359,12 @@ fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
         union: None,
     };
 
-    let lines = executor.explain_cypher_query_graph_access_lines(default_context().txn_id, &query);
-
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
     assert!(
         lines
             .iter()
@@ -402,6 +413,1161 @@ fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
     );
     assert!(
         lines.iter().any(|line| line.contains("edge_count=unknown")),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_warn_on_large_estimate_drift() {
+    assert_eq!(graph_estimate_warning_severity(Some(100), Some(10)), Some("high"));
+    assert_eq!(graph_estimate_warning_severity(Some(10), Some(100)), Some("high"));
+    assert_eq!(graph_estimate_warning_severity(Some(30), Some(10)), Some("medium"));
+    assert_eq!(graph_estimate_warning_severity(Some(10), Some(10)), None);
+    assert_eq!(graph_estimate_warning_severity(Some(10), Some(0)), None);
+    assert_eq!(graph_estimate_warning_severity(None, Some(10)), None);
+    assert!(
+        explain_graph_drift_suggestion_line(1, 1)
+            .is_some_and(|line| line.contains("high estimate drift detected"))
+    );
+    assert!(
+        explain_graph_drift_suggestion_line(1, 0)
+            .is_some_and(|line| line.contains("moderate estimate drift detected"))
+    );
+    assert_eq!(explain_graph_drift_suggestion_line(0, 0), None);
+    assert!(
+        explain_graph_plan_hint_line(1)
+            .is_some_and(|line| line.contains("seed/pivot choice is likely unstable"))
+    );
+    assert_eq!(explain_graph_plan_hint_line(0), None);
+
+    let mut available_vars = std::collections::HashSet::new();
+    let label_scan_pattern = CypherPattern {
+        path_function: None,
+        path_variable: None,
+        nodes: vec![CypherNodePattern {
+            variable: Some("a".to_owned()),
+            label: Some("Person".to_owned()),
+            table_id: None,
+            properties: vec![],
+            index_scan: None,
+            range_pushdown: Vec::new(),
+        }],
+        relationships: vec![],
+    };
+    assert!(
+        explain_graph_pattern_hint_line("high", &label_scan_pattern, &available_vars)
+            .is_some_and(|line| line.contains("label_scan"))
+    );
+
+    available_vars.insert("a".to_owned());
+    let prebound_pattern = CypherPattern {
+        path_function: None,
+        path_variable: None,
+        nodes: vec![
+            CypherNodePattern {
+                variable: Some("a".to_owned()),
+                label: Some("Person".to_owned()),
+                table_id: None,
+                properties: vec![CypherPropertyExpr {
+                    key: "id".to_owned(),
+                    value: lit_int(1),
+                }],
+                index_scan: None,
+                range_pushdown: Vec::new(),
+            },
+            CypherNodePattern {
+                variable: Some("b".to_owned()),
+                label: Some("Person".to_owned()),
+                table_id: None,
+                properties: vec![],
+                index_scan: None,
+                range_pushdown: Vec::new(),
+            },
+        ],
+        relationships: vec![CypherRelPattern {
+            variable: None,
+            rel_type: Some("KNOWS".to_owned()),
+            rel_type_alternatives: Vec::new(),
+            table_id: None,
+            direction: CypherRelDirection::Outgoing,
+            properties: vec![],
+            min_hops: None,
+            max_hops: None,
+            index_scan: None,
+        }],
+    };
+    assert!(
+        explain_graph_pattern_hint_line("high", &prebound_pattern, &available_vars)
+            .is_some_and(|line| line.contains("prebound"))
+    );
+    assert_eq!(
+        explain_graph_pattern_hint_line("medium", &prebound_pattern, &available_vars),
+        None
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_include_drift_summary() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+    insert_knows(&executor, knows_id, 1, 2, 10);
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                }],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let mut actual_rows = std::collections::HashMap::new();
+    actual_rows.insert(graph_access_profile_key("PipelineMatch", 0, 0), 1);
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        Some(&actual_rows),
+        None,
+    );
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Drift Summary:")
+                && line.contains("compared_patterns=0")
+                && line.contains("warnings=0")
+                && line.contains("high_warnings=0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Suggestion:")),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: true,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: Some("p".to_owned()),
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![CypherRelPattern {
+                    variable: Some("r".to_owned()),
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: Some(1),
+                    max_hops: Some(2),
+                    index_scan: None,
+                }],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: col_ref(0, DataType::Int, false),
+            field: ResultField {
+                name: "x".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None);
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| {
+                line.contains("Graph Query Summary: pipeline_matches=1")
+                    && line.contains("optional_matches=1")
+                    && line.contains("correlated_patterns=0")
+                    && line.contains("prebound_seeds=0")
+                    && line.contains("id_constrained_seeds=0")
+                    && line.contains("label_scan_seeds=1")
+                    && line.contains("pivotable_patterns=0")
+                    && line.contains("fragile_pivots=0")
+                    && line.contains("var_length_patterns=1")
+                    && line.contains("named_paths=1")
+                    && line.contains("both_direction_patterns=0")
+            }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Severity:")
+                && line.contains("severity=ok")
+                && line.contains("no elevated graph planning signals")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Metrics:")
+                && line.contains("severity=ok")
+                && line.contains("fragile_pivots=0")
+                && line.contains("risky_join_clauses=0")
+                && line.contains("max_fanout=unknown")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary JSON:")
+                && line.contains("\"severity\":\"ok\"")
+                && line.contains("\"fragile_pivots\":0")
+                && line.contains("\"risky_join_clauses\":0")
+                && line.contains("\"max_fanout\":null")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Detail JSON:")
+                && line.contains("\"summary\":{\"severity\":\"ok\"")
+                && line.contains("\"clauses\":[{\"kind\":\"PipelineMatch\"")
+                && line.contains("\"pivot_decision\":\"var_length_blocks_pivot\"")
+        }),
+        "lines: {lines:?}"
+    );
+    assert_eq!(summary_json["severity"], "ok");
+    assert_eq!(summary_json["fragile_pivots"], 0);
+    assert_eq!(summary_json["risky_join_clauses"], 0);
+    assert!(summary_json["max_fanout"].is_null());
+    assert_eq!(detail_json["summary"]["severity"], "ok");
+    assert_eq!(detail_json["clauses"].as_array().map(|v| v.len()), Some(1));
+    assert_eq!(detail_json["clauses"][0]["kind"], "PipelineMatch");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"].as_array().map(|v| v.len()), Some(1));
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["shape"], "p = (a:Person)-[r:KNOWS*1..2]->(b:Person)");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"], "var_length_blocks_pivot");
+    assert!(detail_json["clauses"][0]["join_risk"].is_null());
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Pivot Summary:")
+                && line.contains("pivotable_patterns=0")
+                && line.contains("fragile_pivots=0")
+                && line.contains("blocked_pivots=1")
+                && line.contains("selected_non_leftmost=0")
+                && line.contains("fragile_sites=none")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Pivot Hint:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Pivot Note:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("Graph Planner Warning:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Join Summary:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Join Hint:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("return_fields=x")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("call_subqueries=0")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("optional=true")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("seed=(a:Person)")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("seed_binding_state=fresh")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("correlated_vars=none")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("seed_mode=label_scan")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("seed_constraints=label=Person")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_reason=leftmost_walk_required_for_var_length")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_decision=var_length_blocks_pivot")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_margin=blocked")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_competition=blocked")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_scores=0:label_scan:2,1:label_scan:2")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("first_rel=[r:KNOWS*1..2]")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("first_rel_mode=var_length")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("first_rel_constraints=type=KNOWS")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("bound_vars=p,a,b,r")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains(
+            "flags=named_path=true, path_function=false, var_length=true, both_direction=false, rel_alternatives=false"
+        )),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("shape=p = (a:Person)-[r:KNOWS*1..2]->(b:Person)")),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_report_prebound_seed_state() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    }],
+                    relationships: vec![],
+                },
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![
+                        CypherNodePattern {
+                            variable: Some("a".to_owned()),
+                            label: Some("Person".to_owned()),
+                            table_id: Some(person_id),
+                            properties: vec![],
+                            index_scan: None,
+                            range_pushdown: Vec::new(),
+                        },
+                        CypherNodePattern {
+                            variable: Some("b".to_owned()),
+                            label: Some("Person".to_owned()),
+                            table_id: Some(person_id),
+                            properties: vec![],
+                            index_scan: None,
+                            range_pushdown: Vec::new(),
+                        },
+                    ],
+                    relationships: vec![CypherRelPattern {
+                        variable: Some("r".to_owned()),
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    }],
+                },
+            ],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Summary:")
+                && line.contains("correlated_patterns=1")
+                && line.contains("prebound_seeds=1")
+                && line.contains("label_scan_seeds=2")
+                && line.contains("pivotable_patterns=1")
+                && line.contains("fragile_pivots=1")
+                && line.contains("named_paths=0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Severity:")
+                && line.contains("severity=watch")
+                && line.contains("fragile_pivots=1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Metrics:")
+                && line.contains("severity=watch")
+                && line.contains("fragile_pivots=1")
+                && line.contains("correlated_clauses=1")
+                && line.contains("risky_join_clauses=0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary JSON:")
+                && line.contains("\"severity\":\"watch\"")
+                && line.contains("\"fragile_pivots\":1")
+                && line.contains("\"correlated_clauses\":1")
+                && line.contains("\"risky_join_clauses\":0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Pivot Summary:")
+                && line.contains("pivotable_patterns=1")
+                && line.contains("fragile_pivots=1")
+                && line.contains("blocked_pivots=0")
+                && line.contains("selected_non_leftmost=0")
+                && line.contains("fragile_sites=PipelineMatch0.1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Summary:")
+                && line.contains("multi_pattern_clauses=1")
+                && line.contains("correlated_clauses=1")
+                && line.contains("shared_anchor_clauses=1")
+                && line.contains("max_correlated_vars_per_pattern=1")
+                && line.contains("correlated_shared_anchor=1")
+                && line.contains("correlated_non_shared=0")
+                && line.contains("shared_anchor_uncorrelated=0")
+                && line.contains("independent_multi_scan=0")
+                && line.contains("correlated_sites=PipelineMatch0.1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Metrics:")
+                && line.contains("severity=watch")
+                && line.contains("fragile_pivots=1")
+                && line.contains("correlated_clauses=1")
+                && line.contains("risky_join_clauses=0")
+                && line.contains("max_fanout=unknown")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Severity:")
+                && line.contains("severity=watch")
+                && line.contains("fragile_pivots=1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Pivot Hint:")
+                && line.contains("1 of 1 pivotable patterns are fragile")
+                && line.contains("exact_ties=1")
+                && line.contains("near_ties=0")
+                && line.contains("prebound_fragile=1")
+                && line.contains("label_scan_fragile=1")
+                && line.contains("PipelineMatch0.1")
+                && line.contains("selected_non_leftmost=0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Hint:")
+                && line.contains("1 of 1 multi-pattern clauses are correlated")
+                && line.contains("correlated_shared_anchor=1")
+                && line.contains("shared_anchor_clauses=1")
+                && line.contains("max_correlated_vars_per_pattern=1")
+                && line.contains("PipelineMatch0.1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Risk [PipelineMatch 0]:")
+                && line.contains("severity=unknown")
+                && line.contains("fanout=unknown")
+                && line.contains("basis=unavailable")
+                && line.contains("shared_anchor=true")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Pivot Note:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Planner Warning:")
+                && line.contains("pivot stability is weak on 1 of 1 pivotable patterns")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("pattern 1]")
+                && line.contains("seed=(a:Person)")
+                && line.contains("seed_binding_state=prebound")
+                && line.contains("correlated_vars=a")
+                && line.contains("pivot_reason=leftmost_seed_retained")
+                && line.contains("pivot_decision=retained_leftmost")
+                && line.contains("pivot_margin=0")
+                && line.contains("pivot_competition=winner=0:2,runner_up=1:2,delta=0")
+                && line.contains("pivot_scores=0:label_scan:2,1:label_scan:2")
+        }),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_include_join_fanout_summary() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    }],
+                    relationships: vec![],
+                },
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![
+                        CypherNodePattern {
+                            variable: Some("a".to_owned()),
+                            label: Some("Person".to_owned()),
+                            table_id: Some(person_id),
+                            properties: vec![],
+                            index_scan: None,
+                            range_pushdown: Vec::new(),
+                        },
+                        CypherNodePattern {
+                            variable: Some("b".to_owned()),
+                            label: Some("Person".to_owned()),
+                            table_id: Some(person_id),
+                            properties: vec![],
+                            index_scan: None,
+                            range_pushdown: Vec::new(),
+                        },
+                    ],
+                    relationships: vec![CypherRelPattern {
+                        variable: Some("r".to_owned()),
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    }],
+                },
+            ],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let mut actual_rows = std::collections::HashMap::new();
+    actual_rows.insert(graph_access_clause_profile_input_key("PipelineMatch", 0), 2);
+    actual_rows.insert(graph_access_clause_profile_output_key("PipelineMatch", 0), 10);
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        Some(&actual_rows),
+        None,
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Fanout Summary:")
+                && line.contains("compared_clauses=1")
+                && line.contains("risky_clauses=1")
+                && line.contains("high_risk_clauses=1")
+                && line.contains("max_fanout=5.000")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Risk [PipelineMatch 0]:")
+                && line.contains("severity=high")
+                && line.contains("fanout=5.000")
+                && line.contains("basis=actual")
+                && line.contains("correlated=true")
+                && line.contains("shared_anchor=true")
+                && line.contains("join_shape=correlated_shared_anchor")
+                && line.contains("patterns=2")
+        }),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_include_non_correlated_join_risk() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    }],
+                    relationships: vec![],
+                },
+                CypherPattern {
+                    path_function: None,
+                    path_variable: None,
+                    nodes: vec![CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    }],
+                    relationships: vec![],
+                },
+            ],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let mut actual_rows = std::collections::HashMap::new();
+    actual_rows.insert(graph_access_clause_profile_input_key("PipelineMatch", 0), 2);
+    actual_rows.insert(graph_access_clause_profile_output_key("PipelineMatch", 0), 6);
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        Some(&actual_rows),
+        None,
+    );
+    let summary_json = executor.explain_cypher_query_graph_summary_json(
+        default_context().txn_id,
+        &query,
+        Some(&actual_rows),
+    );
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        default_context().txn_id,
+        &query,
+        Some(&actual_rows),
+        None,
+    );
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Summary:")
+                && line.contains("multi_pattern_clauses=1")
+                && line.contains("correlated_clauses=0")
+                && line.contains("shared_anchor_clauses=0")
+                && line.contains("correlated_shared_anchor=0")
+                && line.contains("correlated_non_shared=0")
+                && line.contains("shared_anchor_uncorrelated=0")
+                && line.contains("independent_multi_scan=1")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Hint:")
+                && line.contains("1 of 1 multi-pattern clauses are independent multi-scans")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Risk [PipelineMatch 0]:")
+                && line.contains("severity=medium")
+                && line.contains("fanout=3.000")
+                && line.contains("basis=actual")
+                && line.contains("correlated=false")
+                && line.contains("shared_anchor=false")
+                && line.contains("join_shape=independent_multi_scan")
+                && line.contains("patterns=2")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary JSON:")
+                && line.contains("\"severity\":\"watch\"")
+                && line.contains("\"independent_multi_scan\":1")
+                && line.contains("\"risky_join_clauses\":1")
+                && line.contains("\"max_fanout\":3.0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert_eq!(summary_json["severity"], "watch");
+    assert_eq!(summary_json["independent_multi_scan"], 1);
+    assert_eq!(summary_json["risky_join_clauses"], 1);
+    assert_eq!(summary_json["max_fanout"].as_f64(), Some(3.0));
+    assert_eq!(detail_json["summary"]["severity"], "watch");
+    assert_eq!(detail_json["clauses"].as_array().map(|v| v.len()), Some(1));
+    assert_eq!(detail_json["clauses"][0]["join_risk"]["join_shape"], "independent_multi_scan");
+    assert_eq!(detail_json["clauses"][0]["join_risk"]["severity"], "medium");
+    assert_eq!(detail_json["clauses"][0]["join_risk"]["fanout"].as_f64(), Some(3.0));
+    assert_eq!(detail_json["clauses"][0]["pattern_details"].as_array().map(|v| v.len()), Some(2));
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_mode"], "label_scan");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][1]["seed_mode"], "label_scan");
+}
+
+#[test]
+fn cypher_query_graph_access_lines_report_id_constrained_seed_mode() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![CypherNodePattern {
+                    variable: Some("a".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![CypherPropertyExpr {
+                        key: "id".to_owned(),
+                        value: lit_int(1),
+                    }],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                }],
+                relationships: vec![],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("seed_mode=id_constrained")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_reason=single_node_pattern")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_decision=single_node_pattern")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_margin=none")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_competition=none")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_scores=0:id_constrained:1")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("seed_constraints=label=Person;properties=id")),
+        "lines: {lines:?}"
+    );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_report_non_leftmost_pivot_reason() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: Some(IndexScanInfo {
+                            index_id: IndexId::new(7),
+                            column_index: 1,
+                            scan_value: Value::Text("Bob".to_owned()),
+                        }),
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![CypherRelPattern {
+                    variable: Some("r".to_owned()),
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                }],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+    );
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Summary:")
+                && line.contains("pivotable_patterns=1")
+                && line.contains("fragile_pivots=0")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Pivot Summary:")
+                && line.contains("pivotable_patterns=1")
+                && line.contains("fragile_pivots=0")
+                && line.contains("blocked_pivots=0")
+                && line.contains("selected_non_leftmost=1")
+                && line.contains("fragile_sites=none")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Pivot Hint:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Pivot Note:")
+                && line.contains("non-leftmost seed in 1 of 1 pivotable patterns")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("Graph Planner Warning:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("Graph Join Hint:")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_reason=pivot_to_node_1:indexed")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_decision=selected_node_1")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_margin=2")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_competition=winner=1:0,runner_up=0:2,delta=2")),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("pivot_scores=0:label_scan:2,1:indexed:0")),
         "lines: {lines:?}"
     );
 }
@@ -499,7 +1665,12 @@ fn cypher_query_graph_access_lines_include_real_projection_refresh_time_when_war
     };
 
     let lines =
-        executor.explain_cypher_query_graph_access_lines(default_context().txn_id, &explain_query);
+        executor.explain_cypher_query_graph_access_lines(
+            default_context().txn_id,
+            &explain_query,
+            None,
+            None,
+        );
 
     assert!(
         lines
@@ -3126,7 +4297,15 @@ fn prebound_match_pattern_keeps_current_node_correlation() {
     );
 
     let rows = executor
-        .execute_cypher_match(&default_context(), &clause, vec![input], None, None)
+        .execute_cypher_match(
+            &default_context(),
+            &clause,
+            "Match",
+            0,
+            vec![input],
+            None,
+            None,
+        )
         .expect("prebound correlated match should execute");
 
     assert_eq!(rows.len(), 1, "rows={rows:#?}");

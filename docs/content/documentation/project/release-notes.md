@@ -5,6 +5,8 @@ order: 90
 
 # Release Notes
 
+> New in v0.2: for the product-facing delta instead of the raw alpha release framing, start with [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+
 ## v0.1 alpha
 
 AionDB v0.1 is the first public alpha line. It is intended for evaluation, inspection, local benchmarking, and early feedback.
@@ -26,6 +28,9 @@ The release should be judged as a technical preview. It is useful if a reader ca
 - Offline storage doctor and upgrade command.
 - Canonical SQL dump/restore command path.
 - Observability endpoints: `/livez`, `/healthz`, `/readyz`, `/metrics`, `/info`.
+- Structured query explain output through `EXPLAIN (FORMAT JSON)` and `EXPLAIN (ANALYZE, FORMAT JSON)`, including graph summary and graph detail payloads.
+- Experimental Neo4j Query API compatibility wrapper with grouped `neo4j-http-p1` smoke evidence.
+- Experimental Neo4j-oriented Bolt compatibility listener with grouped `neo4j-p0` review evidence.
 - Security and governance policy documents.
 
 ## Status by surface
@@ -43,6 +48,10 @@ The release should be judged as a technical preview. It is useful if a reader ca
 | Storage compatibility | Storage v1 manifest, doctor, and upgrade tooling are available. |
 | Logical backup | SQL dump/restore path is available for v0.1 evaluation. |
 | Observability | Local HTTP health, readiness, metrics, and product info endpoints are available. |
+| Explain JSON | Available for AionDB-native tooling and evaluation; treat the payload as versioned AionDB-specific contract, not a cross-database format. |
+| Neo4j Query API wrapper | Experimental HTTP compatibility surface with grouped smoke evidence; not a Bolt or official Neo4j driver claim. |
+| Neo4j Bolt compatibility | Experimental read-only compatibility listener with grouped review evidence; the current P0 tool wave can pass end-to-end when the local JavaScript, Java, and `cypher-shell` clients are provisioned, and `make product-smoke` will run that optional wave automatically in that environment. |
+| Neo4j Browser preflight | Browser-oriented Bolt procedure preflight evidence is available as a separate grouped smoke; treat it as server-side readiness evidence, not Browser UI validation. |
 | Packaging | Local archive, checksum, manifest, prebuilt GHCR images, Dockerfile, compose profile, Kubernetes profile, and systemd template are available. |
 | HA/distributed operation | Not a public production contract. |
 
@@ -124,7 +133,14 @@ For a local release candidate:
 make product-smoke
 ```
 
-This checks formatting, workspace compilation, storage compatibility, CLI dump/restore, observability routes, documentation links, package contents, package checksum/manifest, and the static deployment profiles.
+This checks formatting, workspace compilation, storage compatibility, CLI dump/restore, observability routes, the grouped `neo4j-http-p1` Query API compatibility smoke, documentation links, package contents, package checksum/manifest, and the static deployment profiles.
+
+Bolt-oriented Neo4j ecosystem evidence is still reviewed separately through
+`target/compat/neo4j-p0-smoke.json`. At the current maturity level, that report
+should reach `passing` when the local JavaScript driver, Java driver, and
+`cypher-shell` provisioning inputs are present. If some of those local clients
+are intentionally absent, a clearly explained `partial` report is still
+acceptable review evidence.
 
 The local archive manifest records:
 
@@ -156,6 +172,8 @@ Before presenting v0.1 publicly, check:
 - quickstart works from a clean checkout;
 - tutorial runs on the current binary;
 - `make product-smoke` succeeds;
+- `target/compat/neo4j-http-p1-smoke.json` shows `group_status = "passing"` for the current release candidate;
+- `target/compat/neo4j-p0-smoke.json` is reviewed as evidence, with no tool-level overclaim beyond the suites that actually passed;
 - license page matches repository license;
 - security and governance policies are current;
 - benchmark page does not overclaim;

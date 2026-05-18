@@ -49,6 +49,1623 @@ pub(super) use aiondb_core::convert::usize_to_u32_saturating as usize_to_u32;
 pub(super) fn value_to_bfs_key(v: &Value) -> Option<ValueHashKey> {
     graph_mutate::value_to_bfs_key(v)
 }
+
+fn explain_cypher_node_pattern(node: &CypherNodePattern) -> String {
+    let mut rendered = String::from("(");
+    if let Some(variable) = node.variable.as_deref() {
+        rendered.push_str(variable);
+    }
+    if let Some(label) = node.label.as_deref() {
+        rendered.push(':');
+        rendered.push_str(label);
+    }
+    if !node.properties.is_empty() {
+        rendered.push_str(" {");
+        for (index, property) in node.properties.iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(", ");
+            }
+            rendered.push_str(&property.key);
+        }
+        rendered.push('}');
+    }
+    rendered.push(')');
+    rendered
+}
+
+fn explain_cypher_relationship_pattern(rel: &CypherRelPattern) -> String {
+    let mut rendered = String::from("[");
+    if let Some(variable) = rel.variable.as_deref() {
+        rendered.push_str(variable);
+    }
+    if let Some(rel_type) = rel.rel_type.as_deref() {
+        rendered.push(':');
+        rendered.push_str(rel_type);
+    } else if !rel.rel_type_alternatives.is_empty() {
+        rendered.push(':');
+        rendered.push_str(&rel.rel_type_alternatives.join("|"));
+    }
+    if rel.min_hops.is_some() || rel.max_hops.is_some() {
+        rendered.push('*');
+        if let Some(min) = rel.min_hops {
+            rendered.push_str(&min.to_string());
+        }
+        rendered.push_str("..");
+        if let Some(max) = rel.max_hops {
+            rendered.push_str(&max.to_string());
+        }
+    }
+    if !rel.properties.is_empty() {
+        rendered.push_str(" {");
+        for (index, property) in rel.properties.iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(", ");
+            }
+            rendered.push_str(&property.key);
+        }
+        rendered.push('}');
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn explain_cypher_pattern_shape(pattern: &CypherPattern) -> String {
+    let mut rendered = String::new();
+    if let Some(path_variable) = pattern.path_variable.as_deref() {
+        rendered.push_str(path_variable);
+        rendered.push_str(" = ");
+    }
+    for (index, node) in pattern.nodes.iter().enumerate() {
+        if index > 0 {
+            let rel = &pattern.relationships[index - 1];
+            match rel.direction {
+                CypherRelDirection::Outgoing => {
+                    rendered.push('-');
+                    rendered.push_str(&explain_cypher_relationship_pattern(rel));
+                    rendered.push_str("->");
+                }
+                CypherRelDirection::Incoming => {
+                    rendered.push_str("<-");
+                    rendered.push_str(&explain_cypher_relationship_pattern(rel));
+                    rendered.push('-');
+                }
+                CypherRelDirection::Both => {
+                    rendered.push('-');
+                    rendered.push_str(&explain_cypher_relationship_pattern(rel));
+                    rendered.push('-');
+                }
+            }
+        }
+        rendered.push_str(&explain_cypher_node_pattern(node));
+    }
+    rendered
+}
+
+fn explain_cypher_pattern_bound_vars(pattern: &CypherPattern) -> String {
+    let mut vars = Vec::new();
+    if let Some(path_variable) = pattern.path_variable.as_deref() {
+        vars.push(path_variable.to_owned());
+    }
+    for node in &pattern.nodes {
+        if let Some(variable) = node.variable.as_deref() {
+            vars.push(variable.to_owned());
+        }
+    }
+    for rel in &pattern.relationships {
+        if let Some(variable) = rel.variable.as_deref() {
+            vars.push(variable.to_owned());
+        }
+    }
+    if vars.is_empty() {
+        "none".to_owned()
+    } else {
+        vars.join(",")
+    }
+}
+
+fn collect_cypher_pattern_bound_vars(pattern: &CypherPattern) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    if let Some(path_variable) = pattern.path_variable.as_deref() {
+        vars.insert(path_variable.to_owned());
+    }
+    for node in &pattern.nodes {
+        if let Some(variable) = node.variable.as_deref() {
+            vars.insert(variable.to_owned());
+        }
+    }
+    for rel in &pattern.relationships {
+        if let Some(variable) = rel.variable.as_deref() {
+            vars.insert(variable.to_owned());
+        }
+    }
+    vars
+}
+
+fn explain_cypher_pattern_flags(pattern: &CypherPattern) -> String {
+    let has_var_length = pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some());
+    let has_both_direction = pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.direction == CypherRelDirection::Both);
+    let has_relationship_alternatives = pattern
+        .relationships
+        .iter()
+        .any(|rel| !rel.rel_type_alternatives.is_empty());
+    let uses_named_path = pattern.path_variable.is_some();
+    let uses_path_function = pattern.path_function.is_some();
+
+    format!(
+        "named_path={}, path_function={}, var_length={}, both_direction={}, rel_alternatives={}",
+        uses_named_path,
+        uses_path_function,
+        has_var_length,
+        has_both_direction,
+        has_relationship_alternatives,
+    )
+}
+
+fn explain_cypher_pattern_seed(pattern: &CypherPattern) -> String {
+    pattern
+        .nodes
+        .first()
+        .map(explain_cypher_node_pattern)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn explain_cypher_pattern_seed_constraints(pattern: &CypherPattern) -> String {
+    let Some(seed) = pattern.nodes.first() else {
+        return "unknown".to_owned();
+    };
+    let mut parts = Vec::new();
+    if let Some(label) = seed.label.as_deref() {
+        parts.push(format!("label={label}"));
+    }
+    if !seed.properties.is_empty() {
+        parts.push(format!(
+            "properties={}",
+            seed.properties
+                .iter()
+                .map(|property| property.key.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if seed.index_scan.is_some() {
+        parts.push("index_scan=true".to_owned());
+    }
+    if !seed.range_pushdown.is_empty() {
+        parts.push(format!("range_pushdown={}", seed.range_pushdown.len()));
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join(";")
+    }
+}
+
+fn explain_cypher_pattern_seed_binding_mode(pattern: &CypherPattern) -> String {
+    let Some(seed) = pattern.nodes.first() else {
+        return "unknown".to_owned();
+    };
+    let has_id_property = seed
+        .properties
+        .iter()
+        .any(|property| property.key.eq_ignore_ascii_case("id"));
+    let has_index_scan = seed.index_scan.is_some();
+    let has_range_pushdown = !seed.range_pushdown.is_empty();
+
+    if has_id_property {
+        "id_constrained".to_owned()
+    } else if has_index_scan {
+        "indexed".to_owned()
+    } else if has_range_pushdown {
+        "range_constrained".to_owned()
+    } else if seed.variable.is_some() {
+        "label_scan".to_owned()
+    } else {
+        "anonymous_scan".to_owned()
+    }
+}
+
+fn explain_cypher_pattern_pivot_reason(pattern: &CypherPattern) -> String {
+    if pattern.nodes.len() <= 1 {
+        return "single_node_pattern".to_owned();
+    }
+    if pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+    {
+        return "leftmost_walk_required_for_var_length".to_owned();
+    }
+    match pick_match_pivot_index(pattern) {
+        Some(pivot) => {
+            let pivot_mode = explain_cypher_pattern_seed_binding_mode(&CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![pattern.nodes[pivot].clone()],
+                relationships: vec![],
+            });
+            format!("pivot_to_node_{pivot}:{pivot_mode}")
+        }
+        None => "leftmost_seed_retained".to_owned(),
+    }
+}
+
+fn explain_cypher_pattern_pivot_scores(pattern: &CypherPattern) -> String {
+    if pattern.nodes.is_empty() {
+        return "none".to_owned();
+    }
+    pattern
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| {
+            let mode = explain_cypher_pattern_seed_binding_mode(&CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![node.clone()],
+                relationships: vec![],
+            });
+            format!("{idx}:{mode}:{}", pivot_node_score(node))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn explain_cypher_pattern_pivot_decision(pattern: &CypherPattern) -> String {
+    if pattern.nodes.len() <= 1 {
+        return "single_node_pattern".to_owned();
+    }
+    if pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+    {
+        return "var_length_blocks_pivot".to_owned();
+    }
+    match pick_match_pivot_index(pattern) {
+        Some(pivot) => format!("selected_node_{pivot}"),
+        None => "retained_leftmost".to_owned(),
+    }
+}
+
+fn explain_cypher_pattern_pivot_margin(pattern: &CypherPattern) -> String {
+    if pattern.nodes.len() <= 1 {
+        return "none".to_owned();
+    }
+    if pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+    {
+        return "blocked".to_owned();
+    }
+    let Some(leftmost) = pattern.nodes.first() else {
+        return "unknown".to_owned();
+    };
+    let leftmost_score = pivot_node_score(leftmost);
+    let Some(best_score) = pattern.nodes.iter().map(pivot_node_score).min() else {
+        return "unknown".to_owned();
+    };
+    format!("{}", leftmost_score.saturating_sub(best_score))
+}
+
+fn explain_cypher_pattern_pivot_competition(pattern: &CypherPattern) -> String {
+    if pattern.nodes.len() <= 1 {
+        return "none".to_owned();
+    }
+    if pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+    {
+        return "blocked".to_owned();
+    }
+
+    let mut scored = pattern
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (idx, pivot_node_score(node)))
+        .collect::<Vec<_>>();
+    if scored.is_empty() {
+        return "unknown".to_owned();
+    }
+    scored.sort_by_key(|(idx, score)| (*score, *idx));
+    let (winner_idx, winner_score) = scored[0];
+    let (runner_up_idx, runner_up_score) = scored
+        .get(1)
+        .copied()
+        .unwrap_or((winner_idx, winner_score));
+    format!(
+        "winner={winner_idx}:{winner_score},runner_up={runner_up_idx}:{runner_up_score},delta={}",
+        runner_up_score.saturating_sub(winner_score)
+    )
+}
+
+fn cypher_pattern_pivot_delta(pattern: &CypherPattern) -> Option<u8> {
+    if pattern.nodes.len() <= 1 {
+        return None;
+    }
+    if pattern
+        .relationships
+        .iter()
+        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+    {
+        return None;
+    }
+    let mut scored = pattern
+        .nodes
+        .iter()
+        .map(pivot_node_score)
+        .collect::<Vec<_>>();
+    if scored.len() < 2 {
+        return None;
+    }
+    scored.sort_unstable();
+    Some(scored[1].saturating_sub(scored[0]))
+}
+
+fn explain_cypher_pattern_seed_binding_state(
+    pattern: &CypherPattern,
+    available_vars: &HashSet<String>,
+) -> String {
+    let Some(seed) = pattern.nodes.first() else {
+        return "unknown".to_owned();
+    };
+    let Some(variable) = seed.variable.as_deref() else {
+        return "anonymous".to_owned();
+    };
+    if available_vars.contains(variable) {
+        "prebound".to_owned()
+    } else {
+        "fresh".to_owned()
+    }
+}
+
+fn explain_cypher_pattern_correlated_vars(
+    pattern: &CypherPattern,
+    available_vars: &HashSet<String>,
+) -> String {
+    let mut vars = Vec::new();
+    if let Some(path_variable) = pattern.path_variable.as_deref() {
+        if available_vars.contains(path_variable) {
+            vars.push(path_variable.to_owned());
+        }
+    }
+    for node in &pattern.nodes {
+        if let Some(variable) = node.variable.as_deref() {
+            if available_vars.contains(variable) {
+                vars.push(variable.to_owned());
+            }
+        }
+    }
+    for rel in &pattern.relationships {
+        if let Some(variable) = rel.variable.as_deref() {
+            if available_vars.contains(variable) {
+                vars.push(variable.to_owned());
+            }
+        }
+    }
+    if vars.is_empty() {
+        "none".to_owned()
+    } else {
+        vars.join(",")
+    }
+}
+
+fn explain_cypher_pattern_first_relationship(pattern: &CypherPattern) -> String {
+    pattern
+        .relationships
+        .first()
+        .map(explain_cypher_relationship_pattern)
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn explain_cypher_pattern_first_relationship_constraints(pattern: &CypherPattern) -> String {
+    let Some(rel) = pattern.relationships.first() else {
+        return "none".to_owned();
+    };
+    let mut parts = Vec::new();
+    if let Some(rel_type) = rel.rel_type.as_deref() {
+        parts.push(format!("type={rel_type}"));
+    } else if !rel.rel_type_alternatives.is_empty() {
+        parts.push(format!("types={}", rel.rel_type_alternatives.join("|")));
+    }
+    if !rel.properties.is_empty() {
+        parts.push(format!(
+            "properties={}",
+            rel.properties
+                .iter()
+                .map(|property| property.key.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if rel.index_scan.is_some() {
+        parts.push("index_scan=true".to_owned());
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join(";")
+    }
+}
+
+fn explain_cypher_pattern_first_relationship_mode(pattern: &CypherPattern) -> String {
+    let Some(rel) = pattern.relationships.first() else {
+        return "none".to_owned();
+    };
+    if rel.min_hops.is_some() || rel.max_hops.is_some() {
+        "var_length".to_owned()
+    } else if rel.index_scan.is_some() {
+        "indexed".to_owned()
+    } else if !rel.properties.is_empty() {
+        "property_filtered".to_owned()
+    } else if !rel.rel_type_alternatives.is_empty() {
+        "multi_type".to_owned()
+    } else if rel.rel_type.is_some() {
+        "typed_expand".to_owned()
+    } else {
+        "generic_expand".to_owned()
+    }
+}
+
+fn explain_cypher_query_summary_line(query: &CypherQueryPlan) -> String {
+    let pipeline_match_count = query
+        .pipeline
+        .iter()
+        .filter(|op| matches!(op, CypherPipelineOp::Match(_)))
+        .count();
+    let pipeline_call_count = query
+        .pipeline
+        .iter()
+        .filter(|op| matches!(op, CypherPipelineOp::CallSubquery(_)))
+        .count();
+    let pipeline_foreach_count = query
+        .pipeline
+        .iter()
+        .filter(|op| matches!(op, CypherPipelineOp::Foreach(_)))
+        .count();
+    let top_level_pattern_count: usize = query.matches.iter().map(|clause| clause.patterns.len()).sum();
+    let pipeline_pattern_count: usize = query
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            CypherPipelineOp::Match(clause) => Some(clause.patterns.len()),
+            _ => None,
+        })
+        .sum();
+    let optional_match_count = query
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            CypherPipelineOp::Match(clause) => Some(clause.optional),
+            _ => None,
+        })
+        .chain(query.matches.iter().map(|clause| clause.optional))
+        .filter(|optional| *optional)
+        .count();
+    let mut available_vars = HashSet::new();
+    let mut correlated_pattern_count = 0usize;
+    let mut var_length_pattern_count = 0usize;
+    let mut named_path_count = 0usize;
+    let mut both_direction_pattern_count = 0usize;
+    let mut prebound_seed_count = 0usize;
+    let mut id_constrained_seed_count = 0usize;
+    let mut label_scan_seed_count = 0usize;
+    let mut pivotable_pattern_count = 0usize;
+    let mut fragile_pivot_count = 0usize;
+    for op in &query.pipeline {
+        if let CypherPipelineOp::Match(clause) = op {
+            for pattern in &clause.patterns {
+                let seed_binding_state =
+                    explain_cypher_pattern_seed_binding_state(pattern, &available_vars);
+                let seed_mode = explain_cypher_pattern_seed_binding_mode(pattern);
+                if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                    pivotable_pattern_count += 1;
+                    if delta <= 1 {
+                        fragile_pivot_count += 1;
+                    }
+                }
+                if seed_binding_state == "prebound" {
+                    correlated_pattern_count += 1;
+                    prebound_seed_count += 1;
+                }
+                if pattern
+                    .relationships
+                    .iter()
+                    .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+                {
+                    var_length_pattern_count += 1;
+                }
+                if pattern.path_variable.is_some() {
+                    named_path_count += 1;
+                }
+                if pattern
+                    .relationships
+                    .iter()
+                    .any(|rel| rel.direction == CypherRelDirection::Both)
+                {
+                    both_direction_pattern_count += 1;
+                }
+                if seed_mode == "id_constrained" {
+                    id_constrained_seed_count += 1;
+                }
+                if seed_mode == "label_scan" {
+                    label_scan_seed_count += 1;
+                }
+                available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+            }
+        }
+    }
+    for clause in &query.matches {
+        for pattern in &clause.patterns {
+            let seed_binding_state =
+                explain_cypher_pattern_seed_binding_state(pattern, &available_vars);
+            let seed_mode = explain_cypher_pattern_seed_binding_mode(pattern);
+            if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                pivotable_pattern_count += 1;
+                if delta <= 1 {
+                    fragile_pivot_count += 1;
+                }
+            }
+            if seed_binding_state == "prebound" {
+                correlated_pattern_count += 1;
+                prebound_seed_count += 1;
+            }
+            if pattern
+                .relationships
+                .iter()
+                .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+            {
+                var_length_pattern_count += 1;
+            }
+            if pattern.path_variable.is_some() {
+                named_path_count += 1;
+            }
+            if pattern
+                .relationships
+                .iter()
+                .any(|rel| rel.direction == CypherRelDirection::Both)
+            {
+                both_direction_pattern_count += 1;
+            }
+            if seed_mode == "id_constrained" {
+                id_constrained_seed_count += 1;
+            }
+            if seed_mode == "label_scan" {
+                label_scan_seed_count += 1;
+            }
+            available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+        }
+    }
+    let return_fields = if query.returns.is_empty() {
+        "none".to_owned()
+    } else {
+        query
+            .returns
+            .iter()
+            .map(|projection| projection.field.name.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "Graph Query Summary: pipeline_matches={}, top_level_matches={}, pipeline_patterns={}, top_level_patterns={}, optional_matches={}, correlated_patterns={}, prebound_seeds={}, id_constrained_seeds={}, label_scan_seeds={}, pivotable_patterns={}, fragile_pivots={}, var_length_patterns={}, named_paths={}, both_direction_patterns={}, returns={}, return_fields={}, order_by={}, distinct={}, creates={}, merges={}, sets={}, deletes={}, call_subqueries={}, foreachs={}, union={}",
+        pipeline_match_count,
+        query.matches.len(),
+        pipeline_pattern_count,
+        top_level_pattern_count,
+        optional_match_count,
+        correlated_pattern_count,
+        prebound_seed_count,
+        id_constrained_seed_count,
+        label_scan_seed_count,
+        pivotable_pattern_count,
+        fragile_pivot_count,
+        var_length_pattern_count,
+        named_path_count,
+        both_direction_pattern_count,
+        query.returns.len(),
+        return_fields,
+        query.order_by.len(),
+        query.distinct,
+        query.creates.len(),
+        query.merges.len(),
+        query.sets.len(),
+        query.deletes.len(),
+        pipeline_call_count,
+        pipeline_foreach_count,
+        query.union.is_some(),
+    )
+}
+
+fn explain_selectivity_ratio(numerator: Option<u64>, denominator: Option<u64>) -> String {
+    match (numerator, denominator) {
+        (Some(_), Some(0)) => "undefined".to_owned(),
+        (Some(num), Some(den)) => format!("{:.3}", (num as f64) / (den as f64)),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn explain_elapsed_ms(elapsed_nanos: Option<u64>) -> String {
+    elapsed_nanos
+        .map(|nanos| format!("{:.3}", (nanos as f64) / 1_000_000.0))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn explain_estimate_error_ratio(estimated_rows: Option<u64>, actual_rows: Option<u64>) -> String {
+    match (estimated_rows, actual_rows) {
+        (Some(_), Some(0)) => "undefined".to_owned(),
+        (Some(estimated), Some(actual)) => format!("{:.3}", (estimated as f64) / (actual as f64)),
+        _ => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn graph_estimate_warning_severity(
+    estimated_rows: Option<u64>,
+    actual_rows: Option<u64>,
+) -> Option<&'static str> {
+    let (estimated, actual) = match (estimated_rows, actual_rows) {
+        (Some(estimated), Some(actual)) if actual > 0 => (estimated as f64, actual as f64),
+        _ => return None,
+    };
+    let ratio = estimated / actual;
+    if !(0.25..=4.0).contains(&ratio) {
+        Some("high")
+    } else if !(0.5..=2.0).contains(&ratio) {
+        Some("medium")
+    } else {
+        None
+    }
+}
+
+fn explain_graph_drift_summary_line(
+    txn_id: TxnId,
+    executor: &Executor,
+    query: &CypherQueryPlan,
+    actual_rows: &HashMap<String, u64>,
+) -> (String, usize, usize) {
+    let mut warning_count = 0usize;
+    let mut high_warning_count = 0usize;
+    let mut compared_patterns = 0usize;
+
+    for (clause_index, op) in query.pipeline.iter().enumerate() {
+        if let CypherPipelineOp::Match(clause) = op {
+            for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+                let estimated_rows =
+                    executor.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern).estimated_rows;
+                let actual_rows = actual_rows
+                    .get(&graph_access_profile_key("PipelineMatch", clause_index, pattern_index))
+                    .copied();
+                if estimated_rows.is_some() && actual_rows.is_some() {
+                    compared_patterns += 1;
+                }
+                match graph_estimate_warning_severity(estimated_rows, actual_rows) {
+                    Some("high") => {
+                        high_warning_count += 1;
+                        warning_count += 1;
+                    }
+                    Some(_) => {
+                        warning_count += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    for (clause_index, clause) in query.matches.iter().enumerate() {
+        for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+            let estimated_rows =
+                executor.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern).estimated_rows;
+            let actual_rows = actual_rows
+                .get(&graph_access_profile_key("Match", clause_index, pattern_index))
+                .copied();
+            if estimated_rows.is_some() && actual_rows.is_some() {
+                compared_patterns += 1;
+            }
+            match graph_estimate_warning_severity(estimated_rows, actual_rows) {
+                Some("high") => {
+                    high_warning_count += 1;
+                    warning_count += 1;
+                }
+                Some(_) => {
+                    warning_count += 1;
+                }
+                None => {}
+            }
+        }
+    }
+
+    (
+        format!(
+            "Graph Drift Summary: compared_patterns={}, warnings={}, high_warnings={}",
+            compared_patterns, warning_count, high_warning_count
+        ),
+        warning_count,
+        high_warning_count,
+    )
+}
+
+pub(super) fn explain_graph_drift_suggestion_line(
+    warning_count: usize,
+    high_warning_count: usize,
+) -> Option<String> {
+    if high_warning_count > 0 {
+        Some(
+            "Graph Suggestion: high estimate drift detected; inspect graph stats freshness, seed selectivity, and missing property indexes on seed or edge filters"
+                .to_owned(),
+        )
+    } else if warning_count > 0 {
+        Some(
+            "Graph Suggestion: moderate estimate drift detected; compare estimated vs actual rows on flagged patterns and review graph statistics coverage"
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+pub(super) fn explain_graph_plan_hint_line(high_warning_count: usize) -> Option<String> {
+    if high_warning_count > 0 {
+        Some(
+            "Graph Plan Hint: seed/pivot choice is likely unstable; prefer reviewing graph statistics and adding selective property indexes before tuning query shape"
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+fn graph_pivot_summary_metrics(
+    query: &CypherQueryPlan,
+) -> (usize, usize, usize, usize, Vec<String>) {
+    let mut pivotable_patterns = 0usize;
+    let mut fragile_pivots = 0usize;
+    let mut blocked_pivots = 0usize;
+    let mut selected_non_leftmost = 0usize;
+    let mut fragile_sites = Vec::new();
+
+    for (clause_index, op) in query.pipeline.iter().enumerate() {
+        if let CypherPipelineOp::Match(clause) = op {
+            for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+                if pattern.nodes.len() <= 1 {
+                    continue;
+                }
+                if pattern
+                    .relationships
+                    .iter()
+                    .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+                {
+                    blocked_pivots += 1;
+                    continue;
+                }
+                pivotable_patterns += 1;
+                if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                    if delta <= 1 {
+                        fragile_pivots += 1;
+                        fragile_sites.push(format!("PipelineMatch{}.{}", clause_index, pattern_index));
+                    }
+                }
+                if pick_match_pivot_index(pattern).is_some() {
+                    selected_non_leftmost += 1;
+                }
+            }
+        }
+    }
+
+    for (clause_index, clause) in query.matches.iter().enumerate() {
+        for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+            if pattern.nodes.len() <= 1 {
+                continue;
+            }
+            if pattern
+                .relationships
+                .iter()
+                .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+            {
+                blocked_pivots += 1;
+                continue;
+            }
+            pivotable_patterns += 1;
+            if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                if delta <= 1 {
+                    fragile_pivots += 1;
+                    fragile_sites.push(format!("Match{}.{}", clause_index, pattern_index));
+                }
+            }
+            if pick_match_pivot_index(pattern).is_some() {
+                selected_non_leftmost += 1;
+            }
+        }
+    }
+
+    (
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        fragile_sites,
+    )
+}
+
+fn graph_fragile_pivot_breakdown(query: &CypherQueryPlan) -> (usize, usize, usize, usize) {
+    let mut exact_ties = 0usize;
+    let mut near_ties = 0usize;
+    let mut prebound_fragile = 0usize;
+    let mut label_scan_fragile = 0usize;
+    let mut available_vars = HashSet::new();
+
+    for op in &query.pipeline {
+        if let CypherPipelineOp::Match(clause) = op {
+            for pattern in &clause.patterns {
+                if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                    if delta <= 1 {
+                        if delta == 0 {
+                            exact_ties += 1;
+                        } else {
+                            near_ties += 1;
+                        }
+                        if explain_cypher_pattern_seed_binding_state(pattern, &available_vars)
+                            == "prebound"
+                        {
+                            prebound_fragile += 1;
+                        }
+                        if explain_cypher_pattern_seed_binding_mode(pattern) == "label_scan" {
+                            label_scan_fragile += 1;
+                        }
+                    }
+                }
+                available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+            }
+        }
+    }
+
+    for clause in &query.matches {
+        for pattern in &clause.patterns {
+            if let Some(delta) = cypher_pattern_pivot_delta(pattern) {
+                if delta <= 1 {
+                    if delta == 0 {
+                        exact_ties += 1;
+                    } else {
+                        near_ties += 1;
+                    }
+                    if explain_cypher_pattern_seed_binding_state(pattern, &available_vars)
+                        == "prebound"
+                    {
+                        prebound_fragile += 1;
+                    }
+                    if explain_cypher_pattern_seed_binding_mode(pattern) == "label_scan" {
+                        label_scan_fragile += 1;
+                    }
+                }
+            }
+            available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+        }
+    }
+
+    (exact_ties, near_ties, prebound_fragile, label_scan_fragile)
+}
+
+fn graph_join_summary_metrics(
+    query: &CypherQueryPlan,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    Vec<String>,
+) {
+    let mut multi_pattern_clauses = 0usize;
+    let mut correlated_clauses = 0usize;
+    let mut shared_anchor_clauses = 0usize;
+    let mut max_correlated_vars_per_pattern = 0usize;
+    let mut correlated_shared_anchor = 0usize;
+    let mut correlated_non_shared = 0usize;
+    let mut shared_anchor_uncorrelated = 0usize;
+    let mut independent_multi_scan = 0usize;
+    let mut correlated_sites = Vec::new();
+    let mut available_vars = HashSet::new();
+
+    let mut scan_clause = |clause_kind: &str, clause_index: usize, clause: &CypherMatchClause| {
+        if clause.patterns.len() > 1 {
+            multi_pattern_clauses += 1;
+        }
+        let mut clause_is_correlated_flag = false;
+        let mut clause_shared_anchor = clause.patterns.len() > 1;
+        let expected_anchor = clause
+            .patterns
+            .first()
+            .and_then(|pattern| pattern.nodes.first())
+            .and_then(|node| node.variable.as_deref())
+            .map(str::to_owned);
+
+        for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+            let correlated = explain_cypher_pattern_correlated_vars(pattern, &available_vars);
+            let correlated_count = if correlated == "none" {
+                0
+            } else {
+                correlated.split(',').count()
+            };
+            max_correlated_vars_per_pattern =
+                max_correlated_vars_per_pattern.max(correlated_count);
+            if pattern_index > 0 && correlated_count > 0 {
+                clause_is_correlated_flag = true;
+                correlated_sites.push(format!("{clause_kind}{clause_index}.{pattern_index}"));
+            }
+            if clause_shared_anchor {
+                let seed_var = pattern
+                    .nodes
+                    .first()
+                    .and_then(|node| node.variable.as_deref())
+                    .map(str::to_owned);
+                if pattern_index > 0 && (seed_var.is_none() || seed_var != expected_anchor) {
+                    clause_shared_anchor = false;
+                }
+            }
+            available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+        }
+
+        if clause_is_correlated_flag {
+            correlated_clauses += 1;
+        }
+        if clause_shared_anchor {
+            shared_anchor_clauses += 1;
+        }
+        if clause.patterns.len() > 1 {
+            match (clause_is_correlated_flag, clause_shared_anchor) {
+                (true, true) => correlated_shared_anchor += 1,
+                (true, false) => correlated_non_shared += 1,
+                (false, true) => shared_anchor_uncorrelated += 1,
+                (false, false) => independent_multi_scan += 1,
+            }
+        }
+    };
+
+    for (clause_index, op) in query.pipeline.iter().enumerate() {
+        if let CypherPipelineOp::Match(clause) = op {
+            scan_clause("PipelineMatch", clause_index, clause);
+        }
+    }
+    for (clause_index, clause) in query.matches.iter().enumerate() {
+        scan_clause("Match", clause_index, clause);
+    }
+
+    (
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        correlated_sites,
+    )
+}
+
+fn explain_graph_pivot_summary_line(query: &CypherQueryPlan) -> Option<String> {
+    let (
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        fragile_sites,
+    ) = graph_pivot_summary_metrics(query);
+
+    if pivotable_patterns == 0 && blocked_pivots == 0 {
+        return None;
+    }
+
+    Some(format!(
+        "Graph Pivot Summary: pivotable_patterns={}, fragile_pivots={}, blocked_pivots={}, selected_non_leftmost={}, fragile_sites={}",
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        if fragile_sites.is_empty() {
+            "none".to_owned()
+        } else {
+            fragile_sites.join(",")
+        }
+    ))
+}
+
+fn explain_graph_pivot_hint_line(query: &CypherQueryPlan) -> Option<String> {
+    let (pivotable_patterns, fragile_pivots, _blocked_pivots, selected_non_leftmost, fragile_sites) =
+        graph_pivot_summary_metrics(query);
+    if pivotable_patterns == 0 || fragile_pivots == 0 {
+        return None;
+    }
+    let (exact_ties, near_ties, prebound_fragile, label_scan_fragile) =
+        graph_fragile_pivot_breakdown(query);
+    Some(format!(
+        "Graph Pivot Hint: {} of {} pivotable patterns are fragile; exact_ties={}, near_ties={}, prebound_fragile={}, label_scan_fragile={}; review seed selectivity and early filters around {} before trusting the current left-to-right shape (selected_non_leftmost={})",
+        fragile_pivots,
+        pivotable_patterns,
+        exact_ties,
+        near_ties,
+        prebound_fragile,
+        label_scan_fragile,
+        fragile_sites.join(","),
+        selected_non_leftmost
+    ))
+}
+
+fn explain_graph_pivot_note_line(query: &CypherQueryPlan) -> Option<String> {
+    let (pivotable_patterns, fragile_pivots, _blocked_pivots, selected_non_leftmost, _fragile_sites) =
+        graph_pivot_summary_metrics(query);
+    if pivotable_patterns == 0 || selected_non_leftmost == 0 || fragile_pivots > 0 {
+        return None;
+    }
+    Some(format!(
+        "Graph Pivot Note: planner selected a non-leftmost seed in {} of {} pivotable patterns; current query shape already depends on local selectivity reordering",
+        selected_non_leftmost,
+        pivotable_patterns
+    ))
+}
+
+fn explain_graph_planner_warning_line(query: &CypherQueryPlan) -> Option<String> {
+    let (pivotable_patterns, fragile_pivots, blocked_pivots, selected_non_leftmost, _fragile_sites) =
+        graph_pivot_summary_metrics(query);
+    if fragile_pivots > 0 {
+        return Some(format!(
+            "Graph Planner Warning: pivot stability is weak on {} of {} pivotable patterns; seed choice may change materially as data distribution shifts",
+            fragile_pivots, pivotable_patterns
+        ));
+    }
+    if blocked_pivots > 0 && selected_non_leftmost > 0 {
+        return Some(format!(
+            "Graph Planner Warning: plan mixes blocked var-length pivots ({}) with selective non-leftmost seeds ({}); inspect whether path-heavy clauses dominate the overall shape",
+            blocked_pivots, selected_non_leftmost
+        ));
+    }
+    None
+}
+
+fn explain_graph_join_summary_line(query: &CypherQueryPlan) -> Option<String> {
+    let (
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        correlated_sites,
+    ) = graph_join_summary_metrics(query);
+    if multi_pattern_clauses == 0 {
+        return None;
+    }
+    Some(format!(
+        "Graph Join Summary: multi_pattern_clauses={}, correlated_clauses={}, shared_anchor_clauses={}, max_correlated_vars_per_pattern={}, correlated_shared_anchor={}, correlated_non_shared={}, shared_anchor_uncorrelated={}, independent_multi_scan={}, correlated_sites={}",
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        if correlated_sites.is_empty() {
+            "none".to_owned()
+        } else {
+            correlated_sites.join(",")
+        }
+    ))
+}
+
+fn explain_graph_join_hint_line(query: &CypherQueryPlan) -> Option<String> {
+    let (
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        correlated_sites,
+    ) = graph_join_summary_metrics(query);
+    if correlated_clauses > 0 {
+        if correlated_non_shared > 0 {
+            return Some(format!(
+                "Graph Join Hint: {} of {} multi-pattern clauses are correlated; correlated_non_shared={}, shared_anchor_clauses={}, max_correlated_vars_per_pattern={}; inspect fanout and variable reuse around {} before changing clause order",
+                correlated_clauses,
+                multi_pattern_clauses,
+                correlated_non_shared,
+                shared_anchor_clauses,
+                max_correlated_vars_per_pattern,
+                correlated_sites.join(",")
+            ));
+        }
+        return Some(format!(
+            "Graph Join Hint: {} of {} multi-pattern clauses are correlated; correlated_shared_anchor={}, shared_anchor_clauses={}, max_correlated_vars_per_pattern={}; inspect fanout around {} before changing clause order",
+            correlated_clauses,
+            multi_pattern_clauses,
+            correlated_shared_anchor,
+            shared_anchor_clauses,
+            max_correlated_vars_per_pattern,
+            correlated_sites.join(",")
+        ));
+    }
+    if shared_anchor_uncorrelated > 0 {
+        return Some(format!(
+            "Graph Join Hint: {} of {} multi-pattern clauses share an anchor without correlation; shared_anchor_uncorrelated={}; watch star fanout before widening projections",
+            shared_anchor_uncorrelated,
+            multi_pattern_clauses,
+            shared_anchor_uncorrelated
+        ));
+    }
+    if independent_multi_scan > 0 {
+        return Some(format!(
+            "Graph Join Hint: {} of {} multi-pattern clauses are independent multi-scans; confirm this is intentional and not a missed join predicate",
+            independent_multi_scan,
+            multi_pattern_clauses
+        ));
+    }
+    None
+}
+
+fn clause_is_correlated(
+    clause: &CypherMatchClause,
+    available_vars: &HashSet<String>,
+) -> bool {
+    let mut clause_available_vars = available_vars.clone();
+    for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+        if pattern_index > 0
+            && explain_cypher_pattern_correlated_vars(pattern, &clause_available_vars) != "none"
+        {
+            return true;
+        }
+        clause_available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+    }
+    false
+}
+
+fn clause_is_shared_anchor(clause: &CypherMatchClause) -> bool {
+    if clause.patterns.len() <= 1 {
+        return false;
+    }
+    let expected_anchor = clause
+        .patterns
+        .first()
+        .and_then(|pattern| pattern.nodes.first())
+        .and_then(|node| node.variable.as_deref())
+        .map(str::to_owned);
+    clause.patterns.iter().enumerate().all(|(pattern_index, pattern)| {
+        if pattern_index == 0 {
+            true
+        } else {
+            pattern
+                .nodes
+                .first()
+                .and_then(|node| node.variable.as_deref())
+                .map(str::to_owned)
+                == expected_anchor
+        }
+    })
+}
+
+fn graph_join_fanout_severity(input_rows: Option<u64>, output_rows: Option<u64>) -> Option<&'static str> {
+    let (input_rows, output_rows) = match (input_rows, output_rows) {
+        (Some(input_rows), Some(output_rows)) if input_rows > 0 => {
+            (input_rows as f64, output_rows as f64)
+        }
+        _ => return None,
+    };
+    let ratio = output_rows / input_rows;
+    if ratio > 4.0 {
+        Some("high")
+    } else if ratio > 2.0 {
+        Some("medium")
+    } else {
+        None
+    }
+}
+
+fn explain_graph_join_fanout_summary_line(
+    query: &CypherQueryPlan,
+    actual_rows: &HashMap<String, u64>,
+) -> Option<String> {
+    let (compared_clauses, risky_clauses, high_risk_clauses, max_fanout) =
+        graph_join_fanout_metrics(query, actual_rows);
+    if compared_clauses == 0 {
+        return None;
+    }
+    Some(format!(
+        "Graph Join Fanout Summary: compared_clauses={}, risky_clauses={}, high_risk_clauses={}, max_fanout={:.3}",
+        compared_clauses, risky_clauses, high_risk_clauses, max_fanout
+    ))
+}
+
+fn graph_join_fanout_metrics(
+    query: &CypherQueryPlan,
+    actual_rows: &HashMap<String, u64>,
+) -> (usize, usize, usize, f64) {
+    let mut compared_clauses = 0usize;
+    let mut risky_clauses = 0usize;
+    let mut high_risk_clauses = 0usize;
+    let mut max_fanout = 0.0f64;
+    let mut available_vars = HashSet::new();
+
+    let mut scan_clause =
+        |clause_kind: &str, clause_index: usize, clause: &CypherMatchClause| {
+            let multi_pattern = clause.patterns.len() > 1;
+            let input_key = graph_access_clause_profile_input_key(clause_kind, clause_index);
+            let output_key = graph_access_clause_profile_output_key(clause_kind, clause_index);
+            let input_rows = actual_rows.get(&input_key).copied();
+            let output_rows = actual_rows.get(&output_key).copied();
+            if let (true, Some(input_raw), Some(output_raw)) =
+                (multi_pattern, input_rows, output_rows)
+            {
+                compared_clauses += 1;
+                let input = input_raw as f64;
+                let output = output_raw as f64;
+                if input > 0.0 {
+                    max_fanout = max_fanout.max(output / input);
+                }
+                match graph_join_fanout_severity(input_rows, output_rows) {
+                    Some("high") => {
+                        risky_clauses += 1;
+                        high_risk_clauses += 1;
+                    }
+                    Some(_) => risky_clauses += 1,
+                    None => {}
+                }
+            }
+            for pattern in &clause.patterns {
+                available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+            }
+        };
+
+    for (clause_index, op) in query.pipeline.iter().enumerate() {
+        if let CypherPipelineOp::Match(clause) = op {
+            scan_clause("PipelineMatch", clause_index, clause);
+        }
+    }
+    for (clause_index, clause) in query.matches.iter().enumerate() {
+        scan_clause("Match", clause_index, clause);
+    }
+
+    (compared_clauses, risky_clauses, high_risk_clauses, max_fanout)
+}
+
+fn estimated_clause_fanout(clause: &CypherMatchClause, txn_id: TxnId, executor: &Executor) -> Option<f64> {
+    let input_rows = clause
+        .patterns
+        .first()
+        .and_then(|pattern| executor.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern).estimated_rows)?;
+    let output_rows = clause
+        .patterns
+        .last()
+        .and_then(|pattern| executor.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern).estimated_rows)?;
+    if input_rows == 0 {
+        return None;
+    }
+    Some((output_rows as f64) / (input_rows as f64))
+}
+
+fn clause_join_shape(clause: &CypherMatchClause, available_vars: &HashSet<String>) -> &'static str {
+    let correlated = clause_is_correlated(clause, available_vars);
+    let shared_anchor = clause_is_shared_anchor(clause);
+    match (correlated, shared_anchor) {
+        (true, true) => "correlated_shared_anchor",
+        (true, false) => "correlated_non_shared",
+        (false, true) => "shared_anchor_uncorrelated",
+        (false, false) => "independent_multi_scan",
+    }
+}
+
+fn explain_graph_summary_severity_line(
+    query: &CypherQueryPlan,
+    actual_rows: Option<&HashMap<String, u64>>,
+    txn_id: TxnId,
+    executor: &Executor,
+) -> String {
+    let (severity, reason) =
+        graph_summary_severity_and_reason(query, actual_rows, txn_id, executor);
+    format!("Graph Summary Severity: severity={}, reason={}", severity, reason)
+}
+
+fn graph_summary_severity_and_reason(
+    query: &CypherQueryPlan,
+    actual_rows: Option<&HashMap<String, u64>>,
+    txn_id: TxnId,
+    executor: &Executor,
+) -> (&'static str, String) {
+    let (
+        _pivotable_patterns,
+        fragile_pivots,
+        _blocked_pivots,
+        selected_non_leftmost,
+        _fragile_sites,
+    ) = graph_pivot_summary_metrics(query);
+    let (
+        _multi_pattern_clauses,
+        _correlated_clauses,
+        _shared_anchor_clauses,
+        _max_correlated_vars_per_pattern,
+        _correlated_shared_anchor,
+        correlated_non_shared,
+        _shared_anchor_uncorrelated,
+        independent_multi_scan,
+        _correlated_sites,
+    ) = graph_join_summary_metrics(query);
+
+    let (warning_count, high_warning_count, risky_clauses, high_risk_clauses) =
+        if let Some(actual_rows) = actual_rows {
+            let (_, warning_count, high_warning_count) =
+                explain_graph_drift_summary_line(txn_id, executor, query, actual_rows);
+            let (_, risky_clauses, high_risk_clauses, _) =
+                graph_join_fanout_metrics(query, actual_rows);
+            (
+                warning_count,
+                high_warning_count,
+                risky_clauses,
+                high_risk_clauses,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+
+    if high_warning_count > 0
+        || high_risk_clauses > 0
+        || (fragile_pivots > 0
+            && (warning_count > 0 || risky_clauses > 0 || correlated_non_shared > 0))
+    {
+        return (
+            "risk",
+            format!(
+                "fragile_pivots={}, high_drift_patterns={}, high_risk_join_clauses={}",
+                fragile_pivots, high_warning_count, high_risk_clauses
+            ),
+        );
+    }
+    if fragile_pivots > 0
+        || warning_count > 0
+        || risky_clauses > 0
+        || selected_non_leftmost > 0
+        || correlated_non_shared > 0
+        || independent_multi_scan > 0
+    {
+        return (
+            "watch",
+            format!(
+                "fragile_pivots={}, selected_non_leftmost={}, drift_patterns={}, risky_join_clauses={}, correlated_non_shared={}, independent_multi_scan={}",
+                fragile_pivots,
+                selected_non_leftmost,
+                warning_count,
+                risky_clauses,
+                correlated_non_shared,
+                independent_multi_scan
+            ),
+        );
+    }
+
+    ("ok", "no elevated graph planning signals".to_owned())
+}
+
+fn build_graph_summary_json_payload(
+    query: &CypherQueryPlan,
+    actual_rows: Option<&HashMap<String, u64>>,
+    txn_id: TxnId,
+    executor: &Executor,
+) -> serde_json::Value {
+    let (
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        _fragile_sites,
+    ) = graph_pivot_summary_metrics(query);
+    let (
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        _correlated_sites,
+    ) = graph_join_summary_metrics(query);
+
+    let (drift_patterns, high_drift_patterns, risky_join_clauses, high_risk_join_clauses, max_fanout) =
+        if let Some(actual_rows) = actual_rows {
+            let (_, warning_count, high_warning_count) =
+                explain_graph_drift_summary_line(txn_id, executor, query, actual_rows);
+            let (_, risky_clauses, high_risk_clauses, max_fanout) =
+                graph_join_fanout_metrics(query, actual_rows);
+            (
+                warning_count,
+                high_warning_count,
+                risky_clauses,
+                high_risk_clauses,
+                Some(max_fanout),
+            )
+        } else {
+            (0, 0, 0, 0, None)
+        };
+
+    let (severity, _reason) =
+        graph_summary_severity_and_reason(query, actual_rows, txn_id, executor);
+
+    serde_json::json!({
+        "severity": severity,
+        "pivotable_patterns": pivotable_patterns,
+        "fragile_pivots": fragile_pivots,
+        "blocked_pivots": blocked_pivots,
+        "selected_non_leftmost": selected_non_leftmost,
+        "multi_pattern_clauses": multi_pattern_clauses,
+        "correlated_clauses": correlated_clauses,
+        "shared_anchor_clauses": shared_anchor_clauses,
+        "max_correlated_vars_per_pattern": max_correlated_vars_per_pattern,
+        "correlated_shared_anchor": correlated_shared_anchor,
+        "correlated_non_shared": correlated_non_shared,
+        "shared_anchor_uncorrelated": shared_anchor_uncorrelated,
+        "independent_multi_scan": independent_multi_scan,
+        "drift_patterns": drift_patterns,
+        "high_drift_patterns": high_drift_patterns,
+        "risky_join_clauses": risky_join_clauses,
+        "high_risk_join_clauses": high_risk_join_clauses,
+        "max_fanout": max_fanout,
+    })
+}
+
+fn explain_graph_summary_metrics_line(
+    query: &CypherQueryPlan,
+    actual_rows: Option<&HashMap<String, u64>>,
+    txn_id: TxnId,
+    executor: &Executor,
+) -> String {
+    let (
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        _fragile_sites,
+    ) = graph_pivot_summary_metrics(query);
+    let (
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        _correlated_sites,
+    ) = graph_join_summary_metrics(query);
+
+    let (warning_count, high_warning_count, risky_clauses, high_risk_clauses, max_fanout) =
+        if let Some(actual_rows) = actual_rows {
+            let (_, warning_count, high_warning_count) =
+                explain_graph_drift_summary_line(txn_id, executor, query, actual_rows);
+            let (_, risky_clauses, high_risk_clauses, max_fanout) =
+                graph_join_fanout_metrics(query, actual_rows);
+            (
+                warning_count,
+                high_warning_count,
+                risky_clauses,
+                high_risk_clauses,
+                max_fanout,
+            )
+        } else {
+            (0, 0, 0, 0, 0.0)
+        };
+
+    let severity_line = explain_graph_summary_severity_line(query, actual_rows, txn_id, executor);
+    let severity = severity_line
+        .split("severity=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or("unknown");
+
+    let max_fanout = if actual_rows.is_some() {
+        format!("{max_fanout:.3}")
+    } else {
+        "unknown".to_owned()
+    };
+
+    format!(
+        "Graph Summary Metrics: severity={}, pivotable_patterns={}, fragile_pivots={}, blocked_pivots={}, selected_non_leftmost={}, multi_pattern_clauses={}, correlated_clauses={}, shared_anchor_clauses={}, max_correlated_vars_per_pattern={}, correlated_shared_anchor={}, correlated_non_shared={}, shared_anchor_uncorrelated={}, independent_multi_scan={}, drift_patterns={}, high_drift_patterns={}, risky_join_clauses={}, high_risk_join_clauses={}, max_fanout={}",
+        severity,
+        pivotable_patterns,
+        fragile_pivots,
+        blocked_pivots,
+        selected_non_leftmost,
+        multi_pattern_clauses,
+        correlated_clauses,
+        shared_anchor_clauses,
+        max_correlated_vars_per_pattern,
+        correlated_shared_anchor,
+        correlated_non_shared,
+        shared_anchor_uncorrelated,
+        independent_multi_scan,
+        warning_count,
+        high_warning_count,
+        risky_clauses,
+        high_risk_clauses,
+        max_fanout
+    )
+}
+
+fn explain_graph_summary_json_line(
+    query: &CypherQueryPlan,
+    actual_rows: Option<&HashMap<String, u64>>,
+    txn_id: TxnId,
+    executor: &Executor,
+) -> String {
+    let payload = build_graph_summary_json_payload(query, actual_rows, txn_id, executor);
+    format!("Graph Summary JSON: {}", payload)
+}
+
+fn ratio_value(numerator: Option<u64>, denominator: Option<u64>) -> Option<f64> {
+    let numerator = numerator? as f64;
+    let denominator = denominator? as f64;
+    if denominator <= 0.0 {
+        return None;
+    }
+    Some(numerator / denominator)
+}
+
+fn elapsed_ms_value(nanos: Option<u64>) -> Option<f64> {
+    nanos.map(|value| (value as f64) / 1_000_000.0)
+}
+
+fn estimate_error_ratio_value(estimated_rows: Option<u64>, actual_rows: Option<u64>) -> Option<f64> {
+    let estimated_rows = estimated_rows? as f64;
+    let actual_rows = actual_rows? as f64;
+    if actual_rows <= 0.0 {
+        return None;
+    }
+    Some(estimated_rows / actual_rows)
+}
+
+fn option_debug_string<T: std::fmt::Debug>(value: Option<T>) -> Option<String> {
+    value.map(|value| format!("{value:?}"))
+}
+
+pub(super) fn explain_graph_pattern_hint_line(
+    severity: &str,
+    pattern: &CypherPattern,
+    available_vars: &HashSet<String>,
+) -> Option<String> {
+    if severity != "high" {
+        return None;
+    }
+
+    let seed_mode = explain_cypher_pattern_seed_binding_mode(pattern);
+    let seed_binding_state = explain_cypher_pattern_seed_binding_state(pattern, available_vars);
+
+    if seed_mode == "label_scan" {
+        Some(
+            "seed is using label_scan under high drift; check selective property indexes and graph statistics on the starting node"
+                .to_owned(),
+        )
+    } else if seed_binding_state == "prebound" {
+        Some(
+            "seed is prebound under high drift; inspect correlated expansion fanout and whether an earlier pattern should narrow bindings sooner"
+                .to_owned(),
+        )
+    } else {
+        Some(
+            "pattern shows high drift; review seed selectivity, edge-property filters, and stale graph statistics"
+                .to_owned(),
+        )
+    }
+}
 #[inline]
 pub(super) fn nonneg_i64_to_usize(value: i64) -> usize {
     if value <= 0 {
@@ -88,6 +1705,43 @@ pub(in crate::executor) struct GraphMatchRuntimeCache {
 pub(super) enum CypherGraphAccessClauseKind {
     Match,
     PipelineMatch,
+}
+
+pub(in crate::executor) fn graph_access_profile_key(
+    clause_label: &str,
+    clause_index: usize,
+    pattern_index: usize,
+) -> String {
+    format!("{clause_label}:{clause_index}:{pattern_index}")
+}
+
+pub(in crate::executor) fn graph_access_clause_profile_input_key(
+    clause_label: &str,
+    clause_index: usize,
+) -> String {
+    format!("clause_in:{clause_label}:{clause_index}")
+}
+
+pub(in crate::executor) fn graph_access_clause_profile_output_key(
+    clause_label: &str,
+    clause_index: usize,
+) -> String {
+    format!("clause_out:{clause_label}:{clause_index}")
+}
+
+pub(in crate::executor) fn graph_access_clause_profile_time_key(
+    clause_label: &str,
+    clause_index: usize,
+) -> String {
+    format!("clause_time:{clause_label}:{clause_index}")
+}
+
+pub(in crate::executor) fn graph_access_pattern_profile_time_key(
+    clause_label: &str,
+    clause_index: usize,
+    pattern_index: usize,
+) -> String {
+    format!("pattern_time:{clause_label}:{clause_index}:{pattern_index}")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1002,8 +2656,74 @@ impl Executor {
         &self,
         txn_id: TxnId,
         query: &CypherQueryPlan,
+        actual_rows: Option<&HashMap<String, u64>>,
+        elapsed_nanos: Option<&HashMap<String, u64>>,
     ) -> Vec<String> {
         let mut lines = Vec::new();
+        let mut available_vars = HashSet::new();
+        lines.push(explain_cypher_query_summary_line(query));
+        lines.push(explain_graph_summary_severity_line(
+            query,
+            actual_rows,
+            txn_id,
+            self,
+        ));
+        lines.push(explain_graph_summary_metrics_line(
+            query,
+            actual_rows,
+            txn_id,
+            self,
+        ));
+        lines.push(explain_graph_summary_json_line(
+            query,
+            actual_rows,
+            txn_id,
+            self,
+        ));
+        lines.push(format!(
+            "Graph Detail JSON: {}",
+            self.explain_cypher_query_graph_detail_json(txn_id, query, actual_rows, elapsed_nanos)
+        ));
+        if let Some(pivot_summary) = explain_graph_pivot_summary_line(query) {
+            lines.push(pivot_summary);
+        }
+        if let Some(pivot_hint) = explain_graph_pivot_hint_line(query) {
+            lines.push(pivot_hint);
+        }
+        if let Some(pivot_note) = explain_graph_pivot_note_line(query) {
+            lines.push(pivot_note);
+        }
+        if let Some(planner_warning) = explain_graph_planner_warning_line(query) {
+            lines.push(planner_warning);
+        }
+        if let Some(join_summary) = explain_graph_join_summary_line(query) {
+            lines.push(join_summary);
+        }
+        if let Some(join_hint) = explain_graph_join_hint_line(query) {
+            lines.push(join_hint);
+        }
+        if let Some(actual_rows) = actual_rows {
+            if let Some(join_fanout_summary) =
+                explain_graph_join_fanout_summary_line(query, actual_rows)
+            {
+                lines.push(join_fanout_summary);
+            }
+            let (summary, warning_count, high_warning_count) = explain_graph_drift_summary_line(
+                txn_id,
+                self,
+                query,
+                actual_rows,
+            );
+            lines.push(summary);
+            if let Some(suggestion) =
+                explain_graph_drift_suggestion_line(warning_count, high_warning_count)
+            {
+                lines.push(suggestion);
+            }
+            if let Some(hint) = explain_graph_plan_hint_line(high_warning_count) {
+                lines.push(hint);
+            }
+        }
         for hint in self.describe_cypher_query_graph_procedure_plans(txn_id, query) {
             lines.push(format!(
                 "Graph Projection [ProcedureCall {}]: procedure={}, source={:?}, fallback={:?}, projection={}, snapshot_generation={}, refresh_policy={:?}, refreshed_at_epoch_millis={}, weighted={}, estimated_rows={}, node_count={}, edge_count={}, reason={}",
@@ -1034,10 +2754,106 @@ impl Executor {
         }
         for (clause_index, op) in query.pipeline.iter().enumerate() {
             if let CypherPipelineOp::Match(clause) = op {
+                let actual_input_rows_value = actual_rows.and_then(|rows| {
+                    rows.get(&graph_access_clause_profile_input_key("PipelineMatch", clause_index))
+                        .copied()
+                });
+                let actual_output_rows_value = actual_rows.and_then(|rows| {
+                    rows.get(&graph_access_clause_profile_output_key(
+                        "PipelineMatch",
+                        clause_index,
+                    ))
+                    .copied()
+                });
+                let actual_input_rows = actual_input_rows_value
+                    .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+                let actual_output_rows = actual_output_rows_value
+                    .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+                let actual_selectivity =
+                    explain_selectivity_ratio(actual_output_rows_value, actual_input_rows_value);
+                let actual_time_ms = explain_elapsed_ms(elapsed_nanos.and_then(|times| {
+                    times.get(&graph_access_clause_profile_time_key("PipelineMatch", clause_index))
+                        .copied()
+                }));
+                lines.push(format!(
+                    "Graph Clause [{} {}]: actual_input_rows={}, actual_output_rows={}, actual_selectivity={}, actual_time_ms={}, optional={}, patterns={}",
+                    "PipelineMatch",
+                    clause_index,
+                    actual_input_rows,
+                    actual_output_rows,
+                    actual_selectivity,
+                    actual_time_ms,
+                    clause.optional,
+                    clause.patterns.len(),
+                ));
+                if clause.patterns.len() > 1 {
+                    let correlated = clause_is_correlated(clause, &available_vars);
+                    let join_shape = clause_join_shape(clause, &available_vars);
+                    let (severity, fanout, basis) = if let Some(severity) =
+                        graph_join_fanout_severity(actual_input_rows_value, actual_output_rows_value)
+                    {
+                        (severity, actual_selectivity.clone(), "actual")
+                    } else if actual_input_rows_value.is_some() && actual_output_rows_value.is_some() {
+                        ("low", actual_selectivity.clone(), "actual")
+                    } else if let Some(estimated_fanout) =
+                        estimated_clause_fanout(clause, txn_id, self)
+                    {
+                        let severity = if estimated_fanout > 4.0 {
+                            "high"
+                        } else if estimated_fanout > 2.0 {
+                            "medium"
+                        } else {
+                            "low"
+                        };
+                        (severity, format!("{estimated_fanout:.3}"), "estimated")
+                    } else {
+                        ("unknown", "unknown".to_owned(), "unavailable")
+                    };
+                    lines.push(format!(
+                        "Graph Join Risk [{} {}]: severity={}, fanout={}, basis={}, correlated={}, shared_anchor={}, join_shape={}, patterns={}",
+                        "PipelineMatch",
+                        clause_index,
+                        severity,
+                        fanout,
+                        basis,
+                        correlated,
+                        clause_is_shared_anchor(clause),
+                        join_shape,
+                        clause.patterns.len(),
+                    ));
+                }
                 for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
                     let plan = self.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern);
+                    let actual_rows_value = actual_rows
+                        .and_then(|rows| {
+                            rows.get(&graph_access_profile_key(
+                                "PipelineMatch",
+                                clause_index,
+                                pattern_index,
+                            ))
+                        })
+                        .copied();
+                    let actual_rows = actual_rows_value
+                        .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+                    let estimated_rows_value = plan.estimated_rows;
+                    let actual_selectivity =
+                        explain_selectivity_ratio(actual_rows_value, actual_input_rows_value);
+                    let estimated_selectivity = explain_selectivity_ratio(
+                        estimated_rows_value,
+                        actual_input_rows_value,
+                    );
+                    let estimate_error =
+                        explain_estimate_error_ratio(estimated_rows_value, actual_rows_value);
+                    let actual_time_ms = explain_elapsed_ms(elapsed_nanos.and_then(|times| {
+                        times.get(&graph_access_pattern_profile_time_key(
+                            "PipelineMatch",
+                            clause_index,
+                            pattern_index,
+                        ))
+                        .copied()
+                    }));
                     lines.push(format!(
-                        "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, reason={}",
+                        "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, actual_rows={}, estimate_error_ratio={}, estimated_selectivity={}, actual_selectivity={}, actual_time_ms={}, optional={}, nodes={}, rels={}, seed={}, seed_binding_state={}, correlated_vars={}, seed_mode={}, seed_constraints={}, pivot_reason={}, pivot_decision={}, pivot_margin={}, pivot_competition={}, pivot_scores={}, first_rel={}, first_rel_mode={}, first_rel_constraints={}, bound_vars={}, flags={}, shape={}, reason={}",
                         "PipelineMatch",
                         clause_index,
                         pattern_index,
@@ -1045,16 +2861,149 @@ impl Executor {
                         plan.fallback_source,
                         plan.estimated_rows
                             .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                        actual_rows,
+                        estimate_error,
+                        estimated_selectivity,
+                        actual_selectivity,
+                        actual_time_ms,
+                        clause.optional,
+                        pattern.nodes.len(),
+                        pattern.relationships.len(),
+                        explain_cypher_pattern_seed(pattern),
+                        explain_cypher_pattern_seed_binding_state(pattern, &available_vars),
+                        explain_cypher_pattern_correlated_vars(pattern, &available_vars),
+                        explain_cypher_pattern_seed_binding_mode(pattern),
+                        explain_cypher_pattern_seed_constraints(pattern),
+                        explain_cypher_pattern_pivot_reason(pattern),
+                        explain_cypher_pattern_pivot_decision(pattern),
+                        explain_cypher_pattern_pivot_margin(pattern),
+                        explain_cypher_pattern_pivot_competition(pattern),
+                        explain_cypher_pattern_pivot_scores(pattern),
+                        explain_cypher_pattern_first_relationship(pattern),
+                        explain_cypher_pattern_first_relationship_mode(pattern),
+                        explain_cypher_pattern_first_relationship_constraints(pattern),
+                        explain_cypher_pattern_bound_vars(pattern),
+                        explain_cypher_pattern_flags(pattern),
+                        explain_cypher_pattern_shape(pattern),
                         plan.reason.unwrap_or_default()
                     ));
+                    if let Some(severity) =
+                        graph_estimate_warning_severity(estimated_rows_value, actual_rows_value)
+                    {
+                        lines.push(format!(
+                            "Graph Warning [{} {} pattern {}]: severity={}, issue=estimate_drift, estimated_rows={}, actual_rows={}, estimate_error_ratio={}",
+                            "PipelineMatch",
+                            clause_index,
+                            pattern_index,
+                            severity,
+                            estimated_rows_value
+                                .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                            actual_rows,
+                            estimate_error,
+                        ));
+                        if let Some(hint) =
+                            explain_graph_pattern_hint_line(severity, pattern, &available_vars)
+                        {
+                            lines.push(format!(
+                                "Graph Pattern Hint [{} {} pattern {}]: {}",
+                                "PipelineMatch", clause_index, pattern_index, hint
+                            ));
+                        }
+                    }
+                    available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
                 }
             }
         }
         for (clause_index, clause) in query.matches.iter().enumerate() {
+            let actual_input_rows_value = actual_rows
+                .and_then(|rows| rows.get(&graph_access_clause_profile_input_key("Match", clause_index)))
+                .copied();
+            let actual_output_rows_value = actual_rows
+                .and_then(|rows| rows.get(&graph_access_clause_profile_output_key("Match", clause_index)))
+                .copied();
+            let actual_input_rows = actual_input_rows_value
+                .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+            let actual_output_rows = actual_output_rows_value
+                .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+            let actual_selectivity =
+                explain_selectivity_ratio(actual_output_rows_value, actual_input_rows_value);
+            let actual_time_ms = explain_elapsed_ms(elapsed_nanos.and_then(|times| {
+                times.get(&graph_access_clause_profile_time_key("Match", clause_index))
+                    .copied()
+            }));
+            lines.push(format!(
+                "Graph Clause [{} {}]: actual_input_rows={}, actual_output_rows={}, actual_selectivity={}, actual_time_ms={}, optional={}, patterns={}",
+                "Match",
+                clause_index,
+                actual_input_rows,
+                actual_output_rows,
+                actual_selectivity,
+                actual_time_ms,
+                clause.optional,
+                clause.patterns.len(),
+            ));
+            if clause.patterns.len() > 1 {
+                let correlated = clause_is_correlated(clause, &available_vars);
+                let join_shape = clause_join_shape(clause, &available_vars);
+                let (severity, fanout, basis) = if let Some(severity) =
+                    graph_join_fanout_severity(actual_input_rows_value, actual_output_rows_value)
+                {
+                    (severity, actual_selectivity.clone(), "actual")
+                } else if actual_input_rows_value.is_some() && actual_output_rows_value.is_some() {
+                    ("low", actual_selectivity.clone(), "actual")
+                } else if let Some(estimated_fanout) =
+                    estimated_clause_fanout(clause, txn_id, self)
+                {
+                    let severity = if estimated_fanout > 4.0 {
+                        "high"
+                    } else if estimated_fanout > 2.0 {
+                        "medium"
+                    } else {
+                        "low"
+                    };
+                    (severity, format!("{estimated_fanout:.3}"), "estimated")
+                } else {
+                    ("unknown", "unknown".to_owned(), "unavailable")
+                };
+                lines.push(format!(
+                    "Graph Join Risk [{} {}]: severity={}, fanout={}, basis={}, correlated={}, shared_anchor={}, join_shape={}, patterns={}",
+                    "Match",
+                    clause_index,
+                    severity,
+                    fanout,
+                    basis,
+                    correlated,
+                    clause_is_shared_anchor(clause),
+                    join_shape,
+                    clause.patterns.len(),
+                ));
+            }
             for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
                 let plan = self.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern);
+                let actual_rows_value = actual_rows
+                    .and_then(|rows| {
+                        rows.get(&graph_access_profile_key("Match", clause_index, pattern_index))
+                    })
+                    .copied();
+                let actual_rows = actual_rows_value
+                    .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string());
+                let estimated_rows_value = plan.estimated_rows;
+                let actual_selectivity =
+                    explain_selectivity_ratio(actual_rows_value, actual_input_rows_value);
+                let estimated_selectivity =
+                    explain_selectivity_ratio(estimated_rows_value, actual_input_rows_value);
+                let estimate_error =
+                    explain_estimate_error_ratio(estimated_rows_value, actual_rows_value);
+                let actual_time_ms = explain_elapsed_ms(elapsed_nanos.and_then(|times| {
+                    times.get(&graph_access_pattern_profile_time_key(
+                        "Match",
+                        clause_index,
+                        pattern_index,
+                    ))
+                    .copied()
+                }));
                 lines.push(format!(
-                    "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, reason={}",
+                    "Graph Access [{} {} pattern {}]: source={:?}, fallback={:?}, estimated_rows={}, actual_rows={}, estimate_error_ratio={}, estimated_selectivity={}, actual_selectivity={}, actual_time_ms={}, optional={}, nodes={}, rels={}, seed={}, seed_binding_state={}, correlated_vars={}, seed_mode={}, seed_constraints={}, pivot_reason={}, pivot_decision={}, pivot_margin={}, pivot_competition={}, pivot_scores={}, first_rel={}, first_rel_mode={}, first_rel_constraints={}, bound_vars={}, flags={}, shape={}, reason={}",
                     "Match",
                     clause_index,
                     pattern_index,
@@ -1062,28 +3011,244 @@ impl Executor {
                     plan.fallback_source,
                     plan.estimated_rows
                         .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                    actual_rows,
+                    estimate_error,
+                    estimated_selectivity,
+                    actual_selectivity,
+                    actual_time_ms,
+                    clause.optional,
+                    pattern.nodes.len(),
+                    pattern.relationships.len(),
+                    explain_cypher_pattern_seed(pattern),
+                    explain_cypher_pattern_seed_binding_state(pattern, &available_vars),
+                    explain_cypher_pattern_correlated_vars(pattern, &available_vars),
+                    explain_cypher_pattern_seed_binding_mode(pattern),
+                    explain_cypher_pattern_seed_constraints(pattern),
+                    explain_cypher_pattern_pivot_reason(pattern),
+                    explain_cypher_pattern_pivot_decision(pattern),
+                    explain_cypher_pattern_pivot_margin(pattern),
+                    explain_cypher_pattern_pivot_competition(pattern),
+                    explain_cypher_pattern_pivot_scores(pattern),
+                    explain_cypher_pattern_first_relationship(pattern),
+                    explain_cypher_pattern_first_relationship_mode(pattern),
+                    explain_cypher_pattern_first_relationship_constraints(pattern),
+                    explain_cypher_pattern_bound_vars(pattern),
+                    explain_cypher_pattern_flags(pattern),
+                    explain_cypher_pattern_shape(pattern),
                     plan.reason.unwrap_or_default()
                 ));
+                if let Some(severity) =
+                    graph_estimate_warning_severity(estimated_rows_value, actual_rows_value)
+                {
+                    lines.push(format!(
+                        "Graph Warning [{} {} pattern {}]: severity={}, issue=estimate_drift, estimated_rows={}, actual_rows={}, estimate_error_ratio={}",
+                        "Match",
+                        clause_index,
+                        pattern_index,
+                        severity,
+                        estimated_rows_value
+                            .map_or_else(|| "unknown".to_owned(), |rows| rows.to_string()),
+                        actual_rows,
+                        estimate_error,
+                    ));
+                    if let Some(hint) =
+                        explain_graph_pattern_hint_line(severity, pattern, &available_vars)
+                    {
+                        lines.push(format!(
+                            "Graph Pattern Hint [{} {} pattern {}]: {}",
+                            "Match", clause_index, pattern_index, hint
+                        ));
+                    }
+                }
+                available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
             }
         }
         lines
+    }
+
+    pub fn explain_cypher_query_graph_summary_json(
+        &self,
+        txn_id: TxnId,
+        query: &CypherQueryPlan,
+        actual_rows: Option<&HashMap<String, u64>>,
+    ) -> serde_json::Value {
+        build_graph_summary_json_payload(query, actual_rows, txn_id, self)
+    }
+
+    pub fn explain_cypher_query_graph_detail_json(
+        &self,
+        txn_id: TxnId,
+        query: &CypherQueryPlan,
+        actual_rows: Option<&HashMap<String, u64>>,
+        elapsed_nanos: Option<&HashMap<String, u64>>,
+    ) -> serde_json::Value {
+        let mut available_vars = HashSet::new();
+        let mut clauses = Vec::new();
+
+        let mut push_clause = |kind: &str,
+                               clause_index: usize,
+                               clause: &CypherMatchClause,
+                               available_vars: &mut HashSet<String>| {
+            let actual_input_rows = actual_rows
+                .and_then(|rows| rows.get(&graph_access_clause_profile_input_key(kind, clause_index)))
+                .copied();
+            let actual_output_rows = actual_rows
+                .and_then(|rows| rows.get(&graph_access_clause_profile_output_key(kind, clause_index)))
+                .copied();
+            let actual_selectivity = ratio_value(actual_output_rows, actual_input_rows);
+            let actual_time_ms = elapsed_ms_value(elapsed_nanos.and_then(|times| {
+                times
+                    .get(&graph_access_clause_profile_time_key(kind, clause_index))
+                    .copied()
+            }));
+
+            let join_risk = if clause.patterns.len() > 1 {
+                let correlated = clause_is_correlated(clause, available_vars);
+                let shared_anchor = clause_is_shared_anchor(clause);
+                let join_shape = clause_join_shape(clause, available_vars);
+                let (severity, fanout, basis) = if let Some(severity) =
+                    graph_join_fanout_severity(actual_input_rows, actual_output_rows)
+                {
+                    (
+                        severity,
+                        ratio_value(actual_output_rows, actual_input_rows),
+                        "actual",
+                    )
+                } else if actual_input_rows.is_some() && actual_output_rows.is_some() {
+                    ("low", ratio_value(actual_output_rows, actual_input_rows), "actual")
+                } else if let Some(estimated_fanout) = estimated_clause_fanout(clause, txn_id, self) {
+                    let severity = if estimated_fanout > 4.0 {
+                        "high"
+                    } else if estimated_fanout > 2.0 {
+                        "medium"
+                    } else {
+                        "low"
+                    };
+                    (severity, Some(estimated_fanout), "estimated")
+                } else {
+                    ("unknown", None, "unavailable")
+                };
+                Some(serde_json::json!({
+                    "severity": severity,
+                    "fanout": fanout,
+                    "basis": basis,
+                    "correlated": correlated,
+                    "shared_anchor": shared_anchor,
+                    "join_shape": join_shape,
+                    "patterns": clause.patterns.len(),
+                }))
+            } else {
+                None
+            };
+
+            let mut pattern_values = Vec::new();
+            for (pattern_index, pattern) in clause.patterns.iter().enumerate() {
+                let plan = self.describe_cypher_pattern_graph_plan_for_txn(txn_id, pattern);
+                let actual_pattern_rows = actual_rows
+                    .and_then(|rows| rows.get(&graph_access_profile_key(kind, clause_index, pattern_index)))
+                    .copied();
+                let estimated_rows = plan.estimated_rows;
+                let actual_pattern_selectivity = ratio_value(actual_pattern_rows, actual_input_rows);
+                let estimated_pattern_selectivity = ratio_value(estimated_rows, actual_input_rows);
+                let estimate_error_ratio =
+                    estimate_error_ratio_value(estimated_rows, actual_pattern_rows);
+                let actual_pattern_time_ms = elapsed_ms_value(elapsed_nanos.and_then(|times| {
+                    times
+                        .get(&graph_access_pattern_profile_time_key(kind, clause_index, pattern_index))
+                        .copied()
+                }));
+                let warning_severity =
+                    graph_estimate_warning_severity(estimated_rows, actual_pattern_rows);
+                pattern_values.push(serde_json::json!({
+                    "kind": kind,
+                    "clause_index": clause_index,
+                    "pattern_index": pattern_index,
+                    "source": option_debug_string(plan.source),
+                    "fallback": option_debug_string(plan.fallback_source),
+                    "estimated_rows": estimated_rows,
+                    "actual_rows": actual_pattern_rows,
+                    "estimate_error_ratio": estimate_error_ratio,
+                    "estimated_selectivity": estimated_pattern_selectivity,
+                    "actual_selectivity": actual_pattern_selectivity,
+                    "actual_time_ms": actual_pattern_time_ms,
+                    "optional": clause.optional,
+                    "nodes": pattern.nodes.len(),
+                    "rels": pattern.relationships.len(),
+                    "seed": explain_cypher_pattern_seed(pattern),
+                    "seed_binding_state": explain_cypher_pattern_seed_binding_state(pattern, available_vars),
+                    "correlated_vars": explain_cypher_pattern_correlated_vars(pattern, available_vars),
+                    "seed_mode": explain_cypher_pattern_seed_binding_mode(pattern),
+                    "seed_constraints": explain_cypher_pattern_seed_constraints(pattern),
+                    "pivot_reason": explain_cypher_pattern_pivot_reason(pattern),
+                    "pivot_decision": explain_cypher_pattern_pivot_decision(pattern),
+                    "pivot_margin": explain_cypher_pattern_pivot_margin(pattern),
+                    "pivot_competition": explain_cypher_pattern_pivot_competition(pattern),
+                    "pivot_scores": explain_cypher_pattern_pivot_scores(pattern),
+                    "first_rel": explain_cypher_pattern_first_relationship(pattern),
+                    "first_rel_mode": explain_cypher_pattern_first_relationship_mode(pattern),
+                    "first_rel_constraints": explain_cypher_pattern_first_relationship_constraints(pattern),
+                    "bound_vars": explain_cypher_pattern_bound_vars(pattern),
+                    "flags": explain_cypher_pattern_flags(pattern),
+                    "shape": explain_cypher_pattern_shape(pattern),
+                    "reason": plan.reason.unwrap_or_default(),
+                    "warning_severity": warning_severity,
+                }));
+                available_vars.extend(collect_cypher_pattern_bound_vars(pattern));
+            }
+
+            clauses.push(serde_json::json!({
+                "kind": kind,
+                "clause_index": clause_index,
+                "optional": clause.optional,
+                "patterns": clause.patterns.len(),
+                "actual_input_rows": actual_input_rows,
+                "actual_output_rows": actual_output_rows,
+                "actual_selectivity": actual_selectivity,
+                "actual_time_ms": actual_time_ms,
+                "join_risk": join_risk,
+                "pattern_details": pattern_values,
+            }));
+        };
+
+        for (clause_index, op) in query.pipeline.iter().enumerate() {
+            if let CypherPipelineOp::Match(clause) = op {
+                push_clause("PipelineMatch", clause_index, clause, &mut available_vars);
+            }
+        }
+        for (clause_index, clause) in query.matches.iter().enumerate() {
+            push_clause("Match", clause_index, clause, &mut available_vars);
+        }
+
+        serde_json::json!({
+            "summary": build_graph_summary_json_payload(query, actual_rows, txn_id, self),
+            "clauses": clauses,
+        })
     }
 
     pub fn explain_physical_plan_graph_access_lines(
         &self,
         txn_id: TxnId,
         plan: &aiondb_plan::PhysicalPlan,
+        actual_rows: Option<&HashMap<String, u64>>,
+        elapsed_nanos: Option<&HashMap<String, u64>>,
     ) -> Vec<String> {
         fn collect(
             executor: &Executor,
             txn_id: TxnId,
             plan: &aiondb_plan::PhysicalPlan,
+            actual_rows: Option<&HashMap<String, u64>>,
+            elapsed_nanos: Option<&HashMap<String, u64>>,
             lines: &mut Vec<String>,
         ) {
             match plan {
                 aiondb_plan::PhysicalPlan::CypherQuery(query) => {
                     lines.extend(
-                        executor.explain_cypher_query_graph_access_lines(txn_id, query.as_ref()),
+                        executor.explain_cypher_query_graph_access_lines(
+                            txn_id,
+                            query.as_ref(),
+                            actual_rows,
+                            elapsed_nanos,
+                        ),
                     );
                 }
                 aiondb_plan::PhysicalPlan::ProjectSource { source, .. }
@@ -1091,7 +3256,7 @@ impl Executor {
                 | aiondb_plan::PhysicalPlan::PartialAggregate { source, .. }
                 | aiondb_plan::PhysicalPlan::CreateTableAs { source, .. }
                 | aiondb_plan::PhysicalPlan::InsertSelect { source, .. } => {
-                    collect(executor, txn_id, source, lines);
+                    collect(executor, txn_id, source, actual_rows, elapsed_nanos, lines);
                 }
                 aiondb_plan::PhysicalPlan::NestedLoopJoin { left, right, .. }
                 | aiondb_plan::PhysicalPlan::HashJoin { left, right, .. }
@@ -1102,26 +3267,26 @@ impl Executor {
                     local: right,
                     ..
                 } => {
-                    collect(executor, txn_id, left, lines);
-                    collect(executor, txn_id, right, lines);
+                    collect(executor, txn_id, left, actual_rows, elapsed_nanos, lines);
+                    collect(executor, txn_id, right, actual_rows, elapsed_nanos, lines);
                 }
                 aiondb_plan::PhysicalPlan::NestedLoopIndexJoin { left, .. } => {
-                    collect(executor, txn_id, left, lines);
+                    collect(executor, txn_id, left, actual_rows, elapsed_nanos, lines);
                 }
                 aiondb_plan::PhysicalPlan::DistributedAppend { fragments, .. } => {
                     for fragment in fragments {
-                        collect(executor, txn_id, fragment, lines);
+                        collect(executor, txn_id, fragment, actual_rows, elapsed_nanos, lines);
                     }
                 }
                 aiondb_plan::PhysicalPlan::RecursiveCte {
                     base, recursive, ..
                 } => {
-                    collect(executor, txn_id, base, lines);
-                    collect(executor, txn_id, recursive, lines);
+                    collect(executor, txn_id, base, actual_rows, elapsed_nanos, lines);
+                    collect(executor, txn_id, recursive, actual_rows, elapsed_nanos, lines);
                 }
                 aiondb_plan::PhysicalPlan::FinalAggregate { partials, .. } => {
                     for partial in partials {
-                        collect(executor, txn_id, partial, lines);
+                        collect(executor, txn_id, partial, actual_rows, elapsed_nanos, lines);
                     }
                 }
                 _ => {}
@@ -1129,7 +3294,7 @@ impl Executor {
         }
 
         let mut lines = Vec::new();
-        collect(self, txn_id, plan, &mut lines);
+        collect(self, txn_id, plan, actual_rows, elapsed_nanos, &mut lines);
         lines
     }
 }
@@ -1428,22 +3593,27 @@ pub(in crate::executor) fn referenced_graph_variables_set(
     referenced_graph_variables(expr)
 }
 
+/// Graph variables a read-only RETURN / ORDER BY tail will read — but only
+/// when the projection is *fully determinable*: every expression must reach
+/// its graph data through an explicit `variable.property` path.
+///
+/// Returns `None` if any expression resolves positionally against the
+/// flattened binding row (a bare / aliased column ref, a graph function, …).
+/// Callers treat `None` as "every binding variable may be needed" and skip
+/// binding pruning entirely; pruning on a partial set would strip the
+/// columns positional access depends on and surface spurious NULLs.
 pub(in crate::executor) fn cypher_query_output_variables(
     returns: &[ProjectionExpr],
     order_by: &[SortExpr],
-) -> HashSet<String> {
+) -> Option<HashSet<String>> {
     let mut keep = HashSet::new();
     for item in returns {
-        if let Some(vars) = referenced_graph_variables_set(&item.expr) {
-            keep.extend(vars);
-        }
+        keep.extend(referenced_graph_variables_set(&item.expr)?);
     }
     for sort in order_by {
-        if let Some(vars) = referenced_graph_variables_set(&sort.expr) {
-            keep.extend(vars);
-        }
+        keep.extend(referenced_graph_variables_set(&sort.expr)?);
     }
-    keep
+    Some(keep)
 }
 
 pub(in crate::executor) fn cypher_query_binding_reduction(
@@ -1468,9 +3638,22 @@ fn collect_referenced_graph_variables(expr: &TypedExpr, vars: &mut HashSet<Strin
     match &expr.kind {
         TypedExprKind::Literal(_) | TypedExprKind::NextValue { .. } => true,
         TypedExprKind::ColumnRef { name, .. } | TypedExprKind::OuterColumnRef { name, .. } => {
-            let variable = name.split_once('.').map_or(name.as_str(), |(head, _)| head);
-            vars.insert(variable.to_owned());
-            true
+            // Only an explicit `variable.property` reference pins down a
+            // specific graph binding variable. A bare or positional column
+            // ref (e.g. `col1`) is resolved positionally against the
+            // *flattened* binding row in `evaluate_cypher_expr_with_binding`,
+            // so it can read columns contributed by any variable. Reporting
+            // it as a single named variable would let binding pruning drop
+            // the rows positional access needs and surface spurious NULLs,
+            // so treat it as indeterminate and let callers keep every
+            // binding.
+            match name.split_once('.') {
+                Some((head, _)) if !head.is_empty() => {
+                    vars.insert(head.to_owned());
+                    true
+                }
+                _ => false,
+            }
         }
         TypedExprKind::BinaryEq { left, right }
         | TypedExprKind::BinaryNe { left, right }
@@ -3159,7 +5342,7 @@ impl Executor {
             && plan.deletes.is_empty()
             && plan.union.is_none();
         let query_output_variables = if read_only_tail {
-            Some(cypher_query_output_variables(&plan.returns, &plan.order_by))
+            cypher_query_output_variables(&plan.returns, &plan.order_by)
         } else {
             None
         };
@@ -3204,6 +5387,8 @@ impl Executor {
                     bindings = self.execute_cypher_match(
                         context,
                         m,
+                        "PipelineMatch",
+                        op_idx,
                         bindings,
                         required_output_variables,
                         binding_reduction,
@@ -3238,6 +5423,8 @@ impl Executor {
             bindings = self.execute_cypher_match(
                 context,
                 match_clause,
+                "Match",
+                match_idx,
                 bindings,
                 required_output_variables,
                 binding_reduction,
@@ -7984,10 +10171,7 @@ impl Executor {
             && subquery.deletes.is_empty()
             && subquery.union.is_none();
         let query_output_variables = if read_only_tail {
-            Some(cypher_query_output_variables(
-                &subquery.returns,
-                &subquery.order_by,
-            ))
+            cypher_query_output_variables(&subquery.returns, &subquery.order_by)
         } else {
             None
         };
@@ -8030,6 +10214,8 @@ impl Executor {
                     bindings = self.execute_cypher_match(
                         context,
                         m,
+                        "PipelineMatch",
+                        op_idx,
                         bindings,
                         required_output_variables,
                         binding_reduction,
@@ -8063,6 +10249,8 @@ impl Executor {
             bindings = self.execute_cypher_match(
                 context,
                 match_clause,
+                "Match",
+                match_idx,
                 bindings,
                 required_output_variables,
                 binding_reduction,

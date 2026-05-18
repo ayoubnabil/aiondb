@@ -50,6 +50,7 @@ const BOLT_LOGOFF_SIGNATURE: u8 = 0x6B;
 const BOLT_TELEMETRY_SIGNATURE: u8 = 0x54;
 const BOLT_DEFAULT_DATABASE: &str = "default";
 const BOLT_APPLICATION_NAME: &str = "aiondb-bolt-compat";
+const BOLT_SERVER_AGENT: &str = "Neo4j/5.26.0";
 const BOLT_CONNECTION_RECV_TIMEOUT_SECONDS: i64 = 120;
 const BOLT_AUTH_FAILURE_CODE: &str = "Neo.ClientError.Security.Unauthorized";
 const BOLT_REQUEST_FAILURE_CODE: &str = "Neo.ClientError.Request.Invalid";
@@ -101,6 +102,20 @@ struct BoltRunMessage {
     statement: String,
     params: JsonMap<String, JsonValue>,
     database: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompatProcedure {
+    DbPing,
+    DbmsComponents,
+    DbLabels,
+    DbRelationshipTypes,
+    DbPropertyKeys,
+}
+
+struct CompatProcedureQuery {
+    procedure: CompatProcedure,
+    projection: Vec<(String, String)>,
 }
 
 struct BoltStreamControl {
@@ -586,7 +601,7 @@ async fn handle_bolt_message(
                 .await?;
                 return Ok(false);
             }
-            if let Err(err) = ensure_no_unsupported_transaction_metadata(&route_metadata) {
+            if let Err(err) = ensure_supported_transaction_metadata(&route_metadata) {
                 state.failed = true;
                 write_chunked_message(
                     stream,
@@ -697,7 +712,7 @@ async fn handle_bolt_message(
                 .await?;
                 return Ok(false);
             }
-            if let Err(err) = ensure_no_unsupported_transaction_metadata(&begin_metadata) {
+            if let Err(err) = ensure_supported_transaction_metadata(&begin_metadata) {
                 state.failed = true;
                 write_chunked_message(
                     stream,
@@ -1422,6 +1437,7 @@ fn authenticate_hello(
     ensure_no_unsupported_session_auth_metadata(&hello.extra_metadata)?;
     ensure_no_impersonation(&hello.extra_metadata)?;
     ensure_notification_filtering_metadata_types(&hello.extra_metadata)?;
+    ensure_string_map_metadata(&hello.extra_metadata, "bolt_agent")?;
     if has_any_auth_field && hello.scheme.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1602,7 +1618,7 @@ fn encode_hello_success_message(connection_id: &str) -> Vec<u8> {
     let mut payload = vec![0xB1, BOLT_SUCCESS_SIGNATURE];
     encode_map_header_into(&mut payload, 3);
     encode_string_into(&mut payload, "server");
-    encode_string_into(&mut payload, "AionDB/bolt-compat");
+    encode_string_into(&mut payload, BOLT_SERVER_AGENT);
     encode_string_into(&mut payload, "connection_id");
     encode_string_into(&mut payload, connection_id);
     encode_string_into(&mut payload, "hints");
@@ -1837,7 +1853,7 @@ fn execute_run_message(
     ensure_only_supported_operation_metadata(&extra_metadata)?;
     ensure_no_impersonation(&extra_metadata)?;
     ensure_supported_bookmarks(&extra_metadata)?;
-    ensure_no_unsupported_transaction_metadata(&extra_metadata)?;
+    ensure_supported_transaction_metadata(&extra_metadata)?;
     ensure_no_unsupported_session_auth_metadata(&extra_metadata)?;
     ensure_string_metadata(&extra_metadata, "db")?;
     ensure_notification_filtering_metadata_types(&extra_metadata)?;
@@ -1845,6 +1861,9 @@ fn execute_run_message(
     ensure_supported_database(database.as_deref())?;
     let (statement, params) = rewrite_named_parameters(statement, &params)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    if let Some(procedure) = compat_procedure_for_sql(&statement) {
+        return compat_procedure_pending_query(procedure);
+    }
     ensure_read_only_statement(&statement)?;
     let results = if params.is_empty() {
         engine
@@ -1986,21 +2005,11 @@ fn ensure_supported_bookmarks(metadata: &JsonMap<String, JsonValue>) -> Result<(
     }
 }
 
-fn ensure_no_unsupported_transaction_metadata(
+fn ensure_supported_transaction_metadata(
     metadata: &JsonMap<String, JsonValue>,
 ) -> Result<(), io::Error> {
-    if metadata.contains_key("tx_timeout") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Bolt compatibility does not support tx_timeout metadata",
-        ));
-    }
-    if metadata.contains_key("tx_metadata") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Bolt compatibility does not support tx_metadata metadata",
-        ));
-    }
+    ensure_integer_metadata(metadata, "tx_timeout")?;
+    ensure_json_object_metadata(metadata, "tx_metadata")?;
     Ok(())
 }
 
@@ -2044,6 +2053,7 @@ fn ensure_only_supported_handshake_metadata(
         "session_auth",
         "imp_user",
         "impersonated_user",
+        "bolt_agent",
         "db",
         "mode",
         "bookmarks",
@@ -2098,6 +2108,48 @@ fn ensure_notification_filtering_metadata_types(
     ensure_string_list_metadata(metadata, "notifications_disabled_classifications")?;
     ensure_string_list_metadata(metadata, "notifications_disabled_categories")?;
     Ok(())
+}
+
+fn ensure_string_map_metadata(
+    metadata: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> Result<(), io::Error> {
+    match metadata.get(key) {
+        None => Ok(()),
+        Some(JsonValue::Object(values)) if values.values().all(JsonValue::is_string) => Ok(()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Bolt {key} metadata must be a map of strings"),
+        )),
+    }
+}
+
+fn ensure_integer_metadata(
+    metadata: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> Result<(), io::Error> {
+    match metadata.get(key) {
+        None => Ok(()),
+        Some(JsonValue::Number(value)) if value.as_i64().is_some() => Ok(()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Bolt {key} metadata must be an integer"),
+        )),
+    }
+}
+
+fn ensure_json_object_metadata(
+    metadata: &JsonMap<String, JsonValue>,
+    key: &str,
+) -> Result<(), io::Error> {
+    match metadata.get(key) {
+        None => Ok(()),
+        Some(JsonValue::Object(_)) => Ok(()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Bolt {key} metadata must be a map"),
+        )),
+    }
 }
 
 fn ensure_supported_access_mode(metadata: &JsonMap<String, JsonValue>) -> Result<(), io::Error> {
@@ -2163,6 +2215,9 @@ fn ensure_supported_qid(qid: Option<i64>) -> Result<(), io::Error> {
 }
 
 fn ensure_read_only_statement(sql: &str) -> Result<(), io::Error> {
+    if compat_procedure_for_sql(sql).is_some() {
+        return Ok(());
+    }
     let statements = parse_sql(sql)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     if statements.len() != 1 {
@@ -2172,12 +2227,219 @@ fn ensure_read_only_statement(sql: &str) -> Result<(), io::Error> {
         ));
     }
     if !statement_is_read_only(&statements[0]) {
+        let statement_kind = preview_debug(&statements[0]);
+        let statement_preview = preview_statement(sql);
+        tracing::warn!(
+            statement_kind = %statement_kind,
+            statement_sql = %statement_preview,
+            "bolt compatibility rejected non-read-only statement",
+        );
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Bolt compatibility only supports read-only statements",
+            format!(
+                "Bolt compatibility only supports read-only statements (kind={statement_kind}, sql={statement_preview:?})"
+            ),
         ));
     }
     Ok(())
+}
+
+fn compat_ping_pending_query() -> BoltPendingQuery {
+    BoltPendingQuery {
+        fields: Vec::new(),
+        records: Vec::new(),
+        next_record: 0,
+        qid: 0,
+        bookmark: None,
+        result_available_after_ms: 0,
+        status: BoltStatusKind::NoData,
+        summary: vec![("type", "r".to_owned())],
+    }
+}
+
+fn compat_procedure_pending_query(query: CompatProcedureQuery) -> Result<BoltPendingQuery, io::Error> {
+    match query.procedure {
+        CompatProcedure::DbPing => Ok(compat_ping_pending_query()),
+        procedure => build_projected_compat_query(
+            &query.projection,
+            compat_procedure_rows(procedure),
+        ),
+    }
+}
+
+fn build_projected_compat_query(
+    projection: &[(String, String)],
+    rows: Vec<Vec<(String, aiondb_engine::Value)>>,
+) -> Result<BoltPendingQuery, io::Error> {
+    let fields = projection
+        .iter()
+        .map(|(_, output)| output.clone())
+        .collect::<Vec<_>>();
+    let records = rows
+        .into_iter()
+        .map(|row| {
+            let values = projection
+                .iter()
+                .map(|(source, _)| {
+                    row.iter()
+                        .find(|(name, _)| name == source)
+                        .map(|(_, value)| value.clone())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("compat procedure is missing projected field {source:?}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            encode_record_message(&values)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let status = if records.is_empty() {
+        BoltStatusKind::NoData
+    } else {
+        BoltStatusKind::Success
+    };
+    Ok(BoltPendingQuery {
+        fields,
+        records,
+        next_record: 0,
+        qid: 0,
+        bookmark: None,
+        result_available_after_ms: 0,
+        status,
+        summary: vec![("type", "r".to_owned())],
+    })
+}
+
+fn compat_procedure_rows(procedure: CompatProcedure) -> Vec<Vec<(String, aiondb_engine::Value)>> {
+    match procedure {
+        CompatProcedure::DbPing => Vec::new(),
+        CompatProcedure::DbmsComponents => vec![vec![
+            ("name".to_owned(), aiondb_engine::Value::Text("Neo4j Kernel".to_owned())),
+            (
+                "versions".to_owned(),
+                aiondb_engine::Value::Array(vec![aiondb_engine::Value::Text("5.26.0".to_owned())]),
+            ),
+            (
+                "edition".to_owned(),
+                aiondb_engine::Value::Text("community".to_owned()),
+            ),
+        ]],
+        CompatProcedure::DbLabels => Vec::new(),
+        CompatProcedure::DbRelationshipTypes => Vec::new(),
+        CompatProcedure::DbPropertyKeys => Vec::new(),
+    }
+}
+
+fn compat_procedure_default_projection(procedure: CompatProcedure) -> Vec<(String, String)> {
+    match procedure {
+        CompatProcedure::DbPing => Vec::new(),
+        CompatProcedure::DbmsComponents => vec![
+            ("name".to_owned(), "name".to_owned()),
+            ("versions".to_owned(), "versions".to_owned()),
+            ("edition".to_owned(), "edition".to_owned()),
+        ],
+        CompatProcedure::DbLabels => vec![("label".to_owned(), "label".to_owned())],
+        CompatProcedure::DbRelationshipTypes => {
+            vec![("relationshiptype".to_owned(), "relationshipType".to_owned())]
+        }
+        CompatProcedure::DbPropertyKeys => {
+            vec![("propertykey".to_owned(), "propertyKey".to_owned())]
+        }
+    }
+}
+
+fn compat_procedure_for_sql(sql: &str) -> Option<CompatProcedureQuery> {
+    let Ok(statements) = parse_sql(sql) else {
+        return None;
+    };
+    let [statement] = statements.as_slice() else {
+        return None;
+    };
+    compat_procedure_for_statement(statement)
+}
+
+fn compat_procedure_for_statement(statement: &Statement) -> Option<CompatProcedureQuery> {
+    let Statement::Cypher(statement) = statement else {
+        return None;
+    };
+    if statement.union.is_some() {
+        return None;
+    }
+    let first_clause = statement.clauses.first()?;
+    let aiondb_parser::cypher_ast::CypherClause::Call(call) = first_clause else {
+        return None;
+    };
+    if !call.args.is_empty() || call.subquery.is_some() {
+        return None;
+    }
+    let procedure = match call.procedure.to_ascii_lowercase().as_str() {
+        "db.ping" => CompatProcedure::DbPing,
+        "dbms.components" => CompatProcedure::DbmsComponents,
+        "db.labels" => CompatProcedure::DbLabels,
+        "db.relationshiptypes" => CompatProcedure::DbRelationshipTypes,
+        "db.propertykeys" => CompatProcedure::DbPropertyKeys,
+        _ => return None,
+    };
+    let projection = if let Some(return_clause) = statement.clauses.get(1) {
+        let aiondb_parser::cypher_ast::CypherClause::Return(ret) = return_clause else {
+            return None;
+        };
+        if statement.clauses.len() != 2 {
+            return None;
+        }
+        ret.items
+            .iter()
+            .map(|item| {
+                let aiondb_parser::ast::Expr::Identifier(name) = &item.expr else {
+                    return None;
+                };
+                let [source] = name.parts.as_slice() else {
+                    return None;
+                };
+                let output = item.alias.clone().unwrap_or_else(|| source.clone());
+                Some((source.clone(), output))
+            })
+            .collect::<Option<Vec<_>>>()?
+    } else if call.yields.is_empty() {
+        if statement.clauses.len() != 1 {
+            return None;
+        }
+        compat_procedure_default_projection(procedure)
+    } else {
+        if statement.clauses.len() != 1 {
+            return None;
+        }
+        call.yields
+            .iter()
+            .map(|field| (field.clone(), field.clone()))
+            .collect()
+    };
+    Some(CompatProcedureQuery {
+        procedure,
+        projection,
+    })
+}
+
+fn preview_statement(sql: &str) -> String {
+    let mut preview = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_LEN: usize = 160;
+    if preview.len() > MAX_LEN {
+        preview.truncate(MAX_LEN - 3);
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn preview_debug<T: std::fmt::Debug>(value: &T) -> String {
+    let mut preview = format!("{value:?}");
+    const MAX_LEN: usize = 120;
+    if preview.len() > MAX_LEN {
+        preview.truncate(MAX_LEN - 3);
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn statement_is_read_only(statement: &Statement) -> bool {
@@ -2855,7 +3117,7 @@ mod tests {
         }
 
         assert!(remaining.is_empty());
-        assert_eq!(server.as_deref(), Some("AionDB/bolt-compat"));
+        assert_eq!(server.as_deref(), Some(BOLT_SERVER_AGENT));
         let connection_id = connection_id.expect("connection_id");
         assert!(connection_id.starts_with(BOLT_APPLICATION_NAME));
         assert!(connection_id.contains(':'));
@@ -5631,7 +5893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bolt_run_rejects_tx_timeout_metadata() {
+    async fn bolt_run_accepts_tx_timeout_metadata() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -5644,7 +5906,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept");
             handle_bolt_connection(stream, engine)
                 .await
-                .expect("bolt run reject tx_timeout");
+                .expect("bolt run accept tx_timeout");
         });
 
         let mut client = tokio::net::TcpStream::connect(addr)
@@ -5689,13 +5951,151 @@ mod tests {
         let response = read_chunked_message(&mut client)
             .await
             .expect("read run response");
-        assert_eq!(
-            response,
-            encode_failure_message(
-                BOLT_REQUEST_FAILURE_CODE,
-                "Bolt compatibility does not support tx_timeout metadata",
-            )
-        );
+        assert_eq!(response[1], BOLT_SUCCESS_SIGNATURE);
+
+        drop(client);
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn bolt_run_accepts_tx_metadata() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let engine = test_engine();
+        engine
+            .bootstrap_role("admin", "StrongPass123!", true)
+            .expect("bootstrap admin");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_bolt_connection(stream, engine)
+                .await
+                .expect("bolt run accept tx_metadata");
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let mut request = Vec::from(BOLT_MAGIC);
+        request.extend_from_slice(&0x0000_0404u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        client.write_all(&request).await.expect("write handshake");
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.expect("read reply");
+        assert_eq!(u32::from_be_bytes(reply), 0x0000_0404);
+
+        let mut hello = vec![0xB1, BOLT_HELLO_SIGNATURE];
+        encode_map_header_into(&mut hello, 4);
+        encode_string_into(&mut hello, "scheme");
+        encode_string_into(&mut hello, "basic");
+        encode_string_into(&mut hello, "principal");
+        encode_string_into(&mut hello, "admin");
+        encode_string_into(&mut hello, "credentials");
+        encode_string_into(&mut hello, "StrongPass123!");
+        encode_string_into(&mut hello, "user_agent");
+        encode_string_into(&mut hello, "neo4j/test");
+        write_chunked_message(&mut client, &hello)
+            .await
+            .expect("write hello");
+        let _ = read_chunked_message(&mut client)
+            .await
+            .expect("read hello response");
+
+        let mut run = vec![0xB3, BOLT_RUN_SIGNATURE];
+        encode_string_into(&mut run, "SELECT 1 AS n");
+        encode_map_header_into(&mut run, 0);
+        encode_map_header_into(&mut run, 1);
+        encode_string_into(&mut run, "tx_metadata");
+        encode_map_header_into(&mut run, 1);
+        encode_string_into(&mut run, "app");
+        encode_string_into(&mut run, "cypher-shell");
+        write_chunked_message(&mut client, &run)
+            .await
+            .expect("write run");
+        let response = read_chunked_message(&mut client)
+            .await
+            .expect("read run response");
+        assert_eq!(response[1], BOLT_SUCCESS_SIGNATURE);
+
+        drop(client);
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn bolt_run_accepts_db_ping_compat_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let engine = test_engine();
+        engine
+            .bootstrap_role("admin", "StrongPass123!", true)
+            .expect("bootstrap admin");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_bolt_connection(stream, engine)
+                .await
+                .expect("bolt run accept db.ping");
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let mut request = Vec::from(BOLT_MAGIC);
+        request.extend_from_slice(&0x0000_0404u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        client.write_all(&request).await.expect("write handshake");
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.expect("read reply");
+        assert_eq!(u32::from_be_bytes(reply), 0x0000_0404);
+
+        let mut hello = vec![0xB1, BOLT_HELLO_SIGNATURE];
+        encode_map_header_into(&mut hello, 4);
+        encode_string_into(&mut hello, "scheme");
+        encode_string_into(&mut hello, "basic");
+        encode_string_into(&mut hello, "principal");
+        encode_string_into(&mut hello, "admin");
+        encode_string_into(&mut hello, "credentials");
+        encode_string_into(&mut hello, "StrongPass123!");
+        encode_string_into(&mut hello, "user_agent");
+        encode_string_into(&mut hello, "neo4j/test");
+        write_chunked_message(&mut client, &hello)
+            .await
+            .expect("write hello");
+        let _ = read_chunked_message(&mut client)
+            .await
+            .expect("read hello response");
+
+        let mut run = vec![0xB3, BOLT_RUN_SIGNATURE];
+        encode_string_into(&mut run, "CALL db.ping()");
+        encode_map_header_into(&mut run, 0);
+        encode_map_header_into(&mut run, 0);
+        write_chunked_message(&mut client, &run)
+            .await
+            .expect("write run");
+        let run_response = read_chunked_message(&mut client)
+            .await
+            .expect("read run response");
+        assert_eq!(run_response[1], BOLT_SUCCESS_SIGNATURE);
+
+        let mut pull = vec![0xB2, BOLT_PULL_SIGNATURE];
+        encode_map_header_into(&mut pull, 2);
+        encode_string_into(&mut pull, "n");
+        encode_i64_into(&mut pull, -1);
+        encode_string_into(&mut pull, "qid");
+        encode_i64_into(&mut pull, 0);
+        write_chunked_message(&mut client, &pull)
+            .await
+            .expect("write pull");
+        let pull_response = read_chunked_message(&mut client)
+            .await
+            .expect("read pull response");
+        assert_eq!(pull_response[1], BOLT_SUCCESS_SIGNATURE);
 
         drop(client);
         server.await.expect("server join");

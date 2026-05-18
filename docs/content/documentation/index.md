@@ -7,6 +7,8 @@ order: 3
 
 AionDB is a PostgreSQL-wire database engine that keeps relational tables, graph labels, and vector search in one local system. These pages focus on using and evaluating the product. Implementation notes live separately.
 
+> New in v0.2: graph observability is now much stronger, `EXPLAIN (FORMAT JSON)` is a supported versioned surface, and Neo4j-oriented compatibility now has real grouped smoke evidence. Start with [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+
 Crate-by-crate implementation notes live in [Advanced Specification](/specification-avancee/). They are useful for contributors, but they are not the recommended starting point for users evaluating the database.
 
 ## Choose a path
@@ -19,6 +21,7 @@ Crate-by-crate implementation notes live in [Advanced Specification](/specificat
 | Test graph/vector features | [Graph and Vector](/documentation/query/graph-and-vector.html), [Graph Reference](/documentation/query/graph-reference.html), [Vector Reference](/documentation/query/vector-reference.html) |
 | Connect an app | [Interfaces](/documentation/connect/interfaces.html), [Client Drivers](/documentation/connect/client-drivers.html), [PostgreSQL Compatibility](/documentation/connect/postgresql-compatibility.html), [Ecosystem Integrations](/documentation/connect/ecosystem-integrations.html) |
 | Evaluate seriously | [Evaluation Checklist](/documentation/evaluate/evaluation-checklist.html), [Product Hardening Plan](/documentation/evaluate/product-hardening-plan.html), [Limitations](/documentation/evaluate/limitations.html), [Benchmarks](/documentation/evaluate/benchmarks.html) |
+| Review the v0.2 delta | [What's New in v0.2](/documentation/project/whats-new-v0-2.html), then [v0.2 Evidence](/documentation/evaluate/v0-2-evidence.html) |
 
 ## Status model
 
@@ -58,7 +61,7 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 
 - [Configuration](/documentation/manage/configuration.html): command-line flags, environment variables, and local data directories.
 - [Administration](/documentation/manage/administration.html), [Control Plane](/documentation/manage/control-plane.html), [Operations](/documentation/manage/operations.html), and [Security](/documentation/manage/security.html): operating the server during evaluation.
-- [Observability](/documentation/manage/observability.html), [Storage Compatibility](/documentation/manage/storage-compatibility.html), [Backup and Recovery](/documentation/manage/backup-and-recovery.html), and [Troubleshooting](/documentation/manage/troubleshooting.html): diagnosing and recovering local deployments.
+- [Observability](/documentation/manage/observability.html), [Explain JSON](/documentation/manage/explain-json.html), [Storage Compatibility](/documentation/manage/storage-compatibility.html), [Backup and Recovery](/documentation/manage/backup-and-recovery.html), and [Troubleshooting](/documentation/manage/troubleshooting.html): diagnosing and recovering local deployments.
 
 ## Evaluate
 
@@ -69,7 +72,7 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 
 ## Project
 
-- [Roadmap](/documentation/project/roadmap.html), [Roadmap to v1](/documentation/project/roadmap-v1.html), [Governance](/documentation/project/governance.html), [GTM Evidence](/documentation/project/gtm-evidence.html), [Release Notes](/documentation/project/release-notes.html), and [Release Process](/documentation/project/release-process.html): where the project is going, how decisions are made, what evidence supports claims, and how releases are described.
+- [What's New in v0.2](/documentation/project/whats-new-v0-2.html), [Roadmap](/documentation/project/roadmap.html), [Roadmap to v1](/documentation/project/roadmap-v1.html), [Governance](/documentation/project/governance.html), [GTM Evidence](/documentation/project/gtm-evidence.html), [Release Notes](/documentation/project/release-notes.html), and [Release Process](/documentation/project/release-process.html): where the project is going, how decisions are made, what evidence supports claims, and how releases are described.
 - [Contributing](/documentation/project/contributing.html): how to work on the codebase without starting from crate-level internals.
 
 ## Reading order for reviewers

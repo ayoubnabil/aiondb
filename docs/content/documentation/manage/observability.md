@@ -7,6 +7,8 @@ order: 61
 
 AionDB starts an HTTP observability server for local health and metrics.
 
+> New in v0.2: graph observability is materially richer, including graph summaries, clause and pattern detail, drift signals, and versioned `EXPLAIN JSON` payloads. See [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+
 ## Defaults
 
 ```bash
@@ -100,6 +102,263 @@ curl -s http://127.0.0.1:9187/info
 ```
 
 If the database accepts client connections but observability does not respond, check the bind address, port, and whether another process already owns the port.
+
+## Graph `EXPLAIN` JSON
+
+AionDB also exposes a structured graph observability payload through SQL `EXPLAIN`.
+
+For the full JSON contract, field list, examples, and engine helper API, use [Explain JSON](/documentation/manage/explain-json.html).
+
+Supported forms:
+
+```sql
+EXPLAIN (FORMAT JSON)
+MATCH (a)-[:KNOWS]->(b)
+RETURN b.id;
+
+EXPLAIN (ANALYZE, FORMAT JSON)
+MATCH (a)-[:KNOWS]->(b)
+RETURN b.id;
+```
+
+`FORMAT JSON` returns a single-row JSON payload instead of the usual multi-line text plan. `ANALYZE` keeps the same JSON shape and adds runtime fields such as actual rows, actual selectivity, clause input/output rows, and lightweight timings.
+
+### Contract
+
+The payload is versioned:
+
+- `schema_version = 1`
+- `format_kind = "aiondb.explain_json"`
+
+Top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `query_plan_lines` | Full text `EXPLAIN` output preserved as an array of lines. |
+| `plan_lines` | Non-graph `EXPLAIN` lines. |
+| `structural_plan_lines` | `plan_lines` without runtime summary lines such as `Execution:` or `Rows Returned:`. |
+| `graph_lines` | Human-readable graph observability lines. |
+| `plan_overview` | Stable summary of the non-graph plan root and primary operator. |
+| `graph_summary` | Stable machine-readable summary of graph risk, pivots, joins, and drift. |
+| `graph_detail` | Clause-level and pattern-level graph details. |
+| `execution_summary` | Runtime summary when `ANALYZE` is used. |
+
+### `plan_overview`
+
+`plan_overview` is meant to be a small stable entry point for UI and automation.
+
+Fields:
+
+- `root_line`
+- `root_kind`
+- `primary_operator_line`
+- `primary_operator_kind`
+- `plan_category`
+- `plan_subcategory`
+- `line_count`
+- `structural_line_count`
+- `graph_line_count`
+
+Current `plan_category` values include:
+
+- `join`
+- `scan`
+- `sort`
+- `aggregate`
+- `limit`
+- `project`
+- `other`
+
+Current `plan_subcategory` values include:
+
+- `nested_loop`
+- `hash_join`
+- `merge_join`
+- `index_scan`
+- `seq_scan`
+- `sort`
+- `aggregate`
+- `limit`
+- `project`
+- `query_wrapper`
+- `other`
+
+### `graph_summary`
+
+`graph_summary` is the compact machine-readable graph health block.
+
+Important fields include:
+
+- `severity`
+- `pivotable_patterns`
+- `fragile_pivots`
+- `blocked_pivots`
+- `selected_non_leftmost`
+- `multi_pattern_clauses`
+- `correlated_clauses`
+- `shared_anchor_clauses`
+- `correlated_shared_anchor`
+- `correlated_non_shared`
+- `shared_anchor_uncorrelated`
+- `independent_multi_scan`
+- `drift_patterns`
+- `high_drift_patterns`
+- `risky_join_clauses`
+- `high_risk_join_clauses`
+- `max_fanout`
+
+Current `severity` values are:
+
+- `ok`
+- `watch`
+- `risk`
+
+### `graph_detail`
+
+`graph_detail` contains:
+
+- `summary`
+- `clauses[]`
+
+Each clause can expose:
+
+- `kind`
+- `clause_index`
+- `optional`
+- `patterns`
+- `actual_input_rows`
+- `actual_output_rows`
+- `actual_selectivity`
+- `actual_time_ms`
+- `join_risk`
+- `pattern_details[]`
+
+Each pattern detail can expose:
+
+- `estimated_rows`
+- `actual_rows`
+- `estimate_error_ratio`
+- `estimated_selectivity`
+- `actual_selectivity`
+- `actual_time_ms`
+- `seed`
+- `seed_mode`
+- `seed_binding_state`
+- `correlated_vars`
+- `pivot_reason`
+- `pivot_decision`
+- `pivot_margin`
+- `pivot_competition`
+- `pivot_scores`
+- `shape`
+- `flags`
+- `warning_severity`
+
+### `execution_summary`
+
+`execution_summary` is present in both modes, but runtime values are only populated under `ANALYZE`.
+
+Fields:
+
+- `kind`
+- `rows_returned`
+- `memory_used_bytes`
+
+Under plain `EXPLAIN (FORMAT JSON)`, these runtime fields can be `null`.
+
+### Example
+
+Abbreviated payload:
+
+```json
+{
+  "schema_version": 1,
+  "format_kind": "aiondb.explain_json",
+  "plan_overview": {
+    "root_kind": "Cypher Query",
+    "primary_operator_kind": "Nested Loop",
+    "plan_category": "join",
+    "plan_subcategory": "nested_loop"
+  },
+  "graph_summary": {
+    "severity": "watch",
+    "fragile_pivots": 1,
+    "risky_join_clauses": 0,
+    "max_fanout": null
+  },
+  "graph_detail": {
+    "summary": {
+      "severity": "watch"
+    },
+    "clauses": [
+      {
+        "kind": "PipelineMatch",
+        "pattern_details": [
+          {
+            "seed_mode": "label_scan",
+            "pivot_decision": "retained_leftmost"
+          }
+        ]
+      }
+    ]
+  },
+  "execution_summary": {
+    "kind": "Query",
+    "rows_returned": 1,
+    "memory_used_bytes": 5283
+  }
+}
+```
+
+The contract is intended for local tooling, UI work, and future planner feedback loops. Keep clients tolerant to additive fields and reject only on incompatible `schema_version` or `format_kind`.
+
+### Consuming the payload
+
+From a SQL client such as `psql`, `FORMAT JSON` returns a single text cell that contains the JSON document:
+
+```sql
+EXPLAIN (FORMAT JSON)
+MATCH (a)-[:KNOWS]->(b)
+RETURN b.id;
+```
+
+That is the right path for ad hoc inspection, shell tooling, and compatibility with existing SQL clients.
+
+Inside the engine, prefer the structured helpers instead of reparsing text output:
+
+- `QueryEngine::execute_explain_graph_summary_json(session, sql, analyze)`
+- `QueryEngine::execute_explain_graph_detail_json(session, sql, analyze)`
+
+Those helpers:
+
+- prepend `EXPLAIN` or `EXPLAIN ANALYZE`;
+- execute the statement;
+- extract the structured graph payload;
+- return `serde_json::Value`.
+
+Minimal Rust sketch:
+
+```rust
+use aiondb_engine::engine::api::QueryEngine;
+
+fn load_graph_summary(
+    engine: &dyn QueryEngine,
+    session: &aiondb_engine::session::SessionHandle,
+) -> aiondb_core::error::DbResult<serde_json::Value> {
+    engine.execute_explain_graph_summary_json(
+        session,
+        "MATCH (a)-[:KNOWS]->(b) RETURN b.id",
+        true,
+    )
+}
+```
+
+For UI or telemetry work:
+
+- use `graph_summary` for badges, coarse severity, and top-level warnings;
+- use `graph_detail` for clause and pattern drill-down;
+- use `plan_overview` for quick SQL plan labeling;
+- keep `query_plan_lines` only for raw rendering or debugging.
 
 ## Production-style guidance
 

@@ -21,7 +21,7 @@ This plan converts broad evaluation concerns into repository-level work. It is i
 | Linux service template | `packaging/systemd/aiondb.service` |
 | Benchmark policy | benchmark reproducibility docs and `benchmarks/run.sh` |
 | Product-surface CI | GitHub Actions job for static docs and verified local archive |
-| Local product smoke | `make product-smoke` for docs, release bundle, storage, observability, CLI dump/restore, deployment profiles, format, and check |
+| Local product smoke | `make product-smoke` for docs, release bundle, storage, observability, `EXPLAIN (FORMAT JSON)` surface checks, grouped `neo4j-http-p1` Query API smoke, optional grouped `neo4j-p0` Bolt smoke when local clients are provisioned, optional grouped `neo4j-browser-p0` Browser preflight smoke when `AIONDB_CYPHER_SHELL` is provisioned, CLI dump/restore, deployment profiles, format, and check |
 
 ## Remaining Hardening Axes
 

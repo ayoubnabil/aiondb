@@ -7,6 +7,8 @@ order: 56
 
 AionDB should feel like a PostgreSQL-facing database before it asks users to learn AionDB-specific features. The integration strategy is therefore pgwire first, then AionDB extensions for graph and vector workflows.
 
+> New in v0.2: Neo4j-oriented compatibility is now backed by grouped smoke evidence for Bolt (`neo4j-p0`), Query API HTTP (`neo4j-http-p1`), and Browser preflight (`neo4j-browser-p0`). See [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+
 ## Current Public Integrations
 
 | Surface | Status | Validation path |
@@ -42,6 +44,349 @@ For every driver or ORM, record:
 ## Native Extension Surfaces
 
 AionDB-specific graph and vector features should remain visible, but they should not block basic PostgreSQL tooling. The dashboard and docs can provide snippets, graph previews, and capability metadata while generic SQL clients keep working through pgwire.
+
+## Neo4j Ecosystem Target
+
+AionDB also has a separate graph-compatibility goal: be credible against a small, explicit subset of the Neo4j ecosystem.
+
+That goal should stay narrow and evidence-based:
+
+- validate real tools, not only protocol fragments;
+- keep Bolt and Query API claims separate;
+- prefer a few tested integrations over a broad unverified ecosystem claim.
+
+### Priority matrix
+
+| Tool / surface | Priority | Why it matters | Surface required | Current AionDB posture |
+| --- | --- | --- | --- | --- |
+| Neo4j Python driver | P0 | Common application entry point and benchmark client | Bolt, Cypher subset, session/auth correctness | partly credible through Bolt work and in-repo bench usage; still experimental and read-only |
+| Neo4j JavaScript driver | P0 | Common app/runtime path for services and tooling | Bolt, Cypher subset, session/auth correctness | experimental surface with reproducible smoke evidence |
+| Neo4j Java driver | P0 | Enterprise application path and strongest driver expectation | Bolt, Cypher subset, session/auth correctness | experimental surface with reproducible smoke evidence |
+| `cypher-shell` | P0 | Best thin-client smoke for real Cypher/Bolt interoperability | Bolt, auth, session, result metadata | experimental surface with reproducible smoke evidence |
+| Neo4j Browser | P0 | Strong product-perception tool; exposes result/metadata gaps quickly | Bolt, graph result metadata, stable read workflows | target surface, not yet documented as validated |
+| Neo4j Query API-style HTTP clients | P1 | Useful fallback and HTTP interoperability story | HTTP Query API subset, auth, transaction endpoints | explicit wrapper exists, but official Neo4j drivers still require Bolt |
+| LangChain / LlamaIndex graph connectors | P1 | Important graph-RAG adoption path | Usually Bolt or HTTP plus stable Cypher/result shapes | future target after driver stability |
+| APOC-sensitive workflows | P1 | Many Neo4j users rely on APOC-adjacent patterns | Procedures, naming, result conventions | future target; should be documented as subset-only if attempted |
+| Neo4j Bloom | P2 | High-visibility visual workflow, but metadata-heavy | Bolt, graph metadata, visual graph semantics | future target after Browser-level confidence |
+| Neo4j GDS-style workflows | P2 | Migration pressure from analytical graph users | Procedure surface, projection/modeling conventions | partly relevant through graph procedures, but not an interoperability claim yet |
+
+### What to prove first
+
+Minimum credible ecosystem target:
+
+1. Neo4j Python driver
+2. Neo4j JavaScript driver
+3. Neo4j Java driver
+4. `cypher-shell`
+5. Neo4j Browser
+
+If those five are not passing a narrow reproducible smoke path, do not claim broad Neo4j ecosystem compatibility.
+
+### How to phrase the claim
+
+Good claim:
+
+- "AionDB exposes experimental Neo4j-oriented Bolt and Query API compatibility surfaces, with named tool-by-tool validation."
+
+Bad claim:
+
+- "AionDB is compatible with the Neo4j ecosystem."
+
+The second claim is too broad unless the repository can point to reproducible tool-level smoke results and known limitations for each named tool.
+
+### Evidence rule
+
+Mark one of these states per tool:
+
+- `validated`
+- `experimental`
+- `target`
+- `unsupported`
+
+Do not collapse them into one ecosystem-wide status. A read-only Bolt path that works for one driver smoke is not the same thing as Browser, Bloom, or write-capable application compatibility.
+
+### Current validation ledger
+
+Use this table as the real compatibility ledger. It is intentionally stricter than the target matrix above.
+
+| Tool / surface | Target priority | Current state | Current evidence in repo | Next gate before `validated` |
+| --- | --- | --- | --- | --- |
+| Neo4j Python driver | P0 | `experimental` | reproducible `xtask` smoke exists for the official Python driver over the read-only Bolt compatibility listener, covering `RETURN`, parameters, `UNWIND`, result keys and a Cypher error probe | known limitations note, release/CI placement, broader read corpus and explicit write-policy note |
+| Neo4j JavaScript driver | P0 | `experimental` | reproducible `xtask` smoke now passes against the official JavaScript driver over the read-only Bolt compatibility listener when `AIONDB_NEO4J_JS_DRIVER_BASE` points at a provisioned package base; the report records `driver_version` and the resolved base | broaden the read corpus beyond a single `RETURN` probe, keep a limitations note, and place the smoke in release/CI evidence |
+| Neo4j Java driver | P0 | `experimental` | reproducible `xtask` smoke now passes against the official Java driver over the read-only Bolt compatibility listener when `AIONDB_NEO4J_JAVA_DRIVER_JAR` points at a provisioned local driver jar, with sibling classpath jars resolved from the same directory | broaden the read corpus beyond a single `RETURN` probe, keep a limitations note, and place the smoke in release/CI evidence |
+| `cypher-shell` | P0 | `experimental` | reproducible `xtask` smoke now passes against a provisioned `cypher-shell` client over the read-only Bolt compatibility listener, including the `CALL db.ping()` compatibility preflight used by the client | broaden the corpus beyond a single SQL probe, keep a limitations note, and place the smoke in release/CI evidence |
+| Neo4j Browser | P0 | `target` | reproducible Browser-oriented Bolt preflight smoke now exists for the core procedure calls Browser commonly expects, executed via a provisioned `cypher-shell` transport; this is server-side preflight evidence, not Browser UI validation | pinned Browser version, visual graph result smoke, metadata limitations note |
+| Neo4j Query API compatibility wrapper | P1 | `experimental` | reproducible `xtask` smoke exists for discovery, query, parameter, Cypher error and transaction probes over the HTTP wrapper | versioned response contract, release/CI placement, explicit HTTP limitations note |
+| Bolt compatibility listener | foundation | `experimental` | explicit loopback-only listener exists; repo tests cover read-only protocol semantics | named external tool smokes, auth/session/read workflow smoke, limitations page |
+| LangChain / LlamaIndex graph connectors | P1 | `target` | no published connector smoke yet | pinned connector versions, one reduced graph-RAG smoke, known limitations note |
+| APOC-sensitive workflows | P1 | `target` | no published interoperability smoke yet | reduced procedure/workflow matrix, subset documentation, known limitations note |
+| Neo4j Bloom | P2 | `target` | no published AionDB tool smoke yet | pinned Bloom version, visual graph exploration smoke, metadata limitations note |
+| Neo4j GDS-style workflows | P2 | `target` | graph procedures exist, but not as a Neo4j interoperability claim | pinned workflow subset, result-shape checks, migration limitations note |
+
+### What counts as evidence
+
+For a tool to move from `target` or `experimental` to `validated`, the repository should be able to point to all of these:
+
+1. a pinned client or tool version, or a report artifact that records the observed `driver_version` / `tool_version`;
+2. a reproducible smoke command or script;
+3. expected result or artifact;
+4. a known limitations note;
+5. a place in CI, release smoke, or evidence docs.
+
+Without that chain, keep the tool in `target` or `experimental`.
+
+### Suggested first wave
+
+The smallest serious first wave is:
+
+1. Neo4j Python driver
+2. Neo4j JavaScript driver
+3. `cypher-shell`
+
+That wave is enough to test:
+
+- official driver behavior across two language stacks;
+- Bolt auth and session behavior;
+- real Cypher/Bolt CLI interoperability.
+
+Browser should come immediately after, because it exposes metadata and graph-result gaps that driver-only smokes can miss.
+
+The current repo now has one intermediate step before full Browser validation:
+
+- a Browser-oriented Bolt preflight smoke for the compatibility procedures Browser typically expects;
+- this proves the server-side preflight contract;
+- it does **not** yet prove Browser UI rendering, graph visualization, or Browser-specific session UX.
+
+### Current reproducible commands
+
+Grouped P0 Neo4j ecosystem smoke:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --group neo4j-p0 --no-history --report target/compat/neo4j-p0-smoke.json
+```
+
+That grouped `xtask` run executes the current first-wave suites in one process and writes one aggregated report.
+
+Grouped P1 Neo4j HTTP compatibility smoke:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --group neo4j-http-p1 --no-history --report target/compat/neo4j-http-p1-smoke.json
+```
+
+That grouped run currently focuses on the Query API wrapper surface and produces one aggregated report for the HTTP compatibility wave.
+
+Grouped Neo4j Browser preflight smoke:
+
+```bash
+AIONDB_CYPHER_SHELL=/abs/path/to/cypher-shell \
+  cargo run -q -p xtask -- ecosystem-compat --group neo4j-browser-p0 --no-history --report target/compat/neo4j-browser-p0-smoke.json
+```
+
+That grouped run is intentionally narrow:
+
+- it only proves Browser-oriented Bolt preflight procedures;
+- it does not claim Browser UI interoperability;
+- it is still useful as release evidence for server-side Browser readiness work.
+
+Each Neo4j-oriented suite payload now carries, when applicable:
+
+- `tool`
+- `driver_version` or `tool_version`
+- `validation_state`
+- `surface`
+- `limitations_ref`
+
+Official Python driver smoke:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --suite neo4j-python-bolt --no-history --report target/compat/neo4j-python-bolt-smoke.json
+```
+
+That smoke currently proves:
+
+- official Neo4j Python driver import path works in the local environment;
+- the experimental Bolt compatibility listener accepts authentication;
+- the driver can open a session and complete:
+  - a read-only `RETURN` probe;
+  - a parameterized `RETURN` probe;
+  - an `UNWIND` aggregation probe;
+  - a simple result-key shape check;
+  - a Cypher syntax error probe;
+- the JSON report records the observed driver version.
+
+That is enough for `experimental`. It is not yet enough for a broad `validated` claim.
+
+Official JavaScript driver smoke harness:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --suite neo4j-javascript-bolt --no-history --report target/compat/neo4j-javascript-bolt-smoke.json
+```
+
+That harness now proves the current experimental contract when a local package base is provisioned:
+
+- launch the official Neo4j JavaScript driver against the experimental Bolt listener;
+- authenticate and open a session;
+- complete a read-only `RETURN` probe;
+- normalize the official Neo4j integer result shape returned by the JavaScript driver.
+
+When the smoke passes, the JSON report records:
+
+- `tool`
+- `driver_version`
+- `node_resolve_base`
+
+Even when the smoke skips, the JSON report still records:
+
+- the expected tool name;
+- the provision base used for resolution;
+- the provisioning override environment variable.
+
+At the current maturity level this is enough for `experimental`, but not yet enough for `validated`.
+
+If the JavaScript driver lives outside the default compat tree, point the smoke to it with:
+
+```bash
+AIONDB_NEO4J_JS_DRIVER_BASE=/abs/path/to/node-tools \
+  cargo run -q -p xtask -- ecosystem-compat --suite neo4j-javascript-bolt --no-history --report target/compat/neo4j-javascript-bolt-smoke.json
+```
+
+Official Java driver smoke harness:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --suite neo4j-java-bolt --no-history --report target/compat/neo4j-java-bolt-smoke.json
+```
+
+That harness now proves the current experimental contract when a local driver classpath is provisioned:
+
+- compile a minimal Java smoke client with `javac`;
+- run the official Neo4j Java driver against the experimental Bolt listener;
+- authenticate and complete a read-only `RETURN` probe.
+
+When provisioned, the JSON report records both:
+
+- `driver_version`
+- `driver_jar`
+- `classpath_jars`
+
+At the current maturity level this is enough for `experimental`, but not yet enough for `validated`.
+
+If the jar lives elsewhere, point the smoke to it explicitly:
+
+```bash
+AIONDB_NEO4J_JAVA_DRIVER_JAR=/abs/path/to/neo4j-java-driver-<version>.jar \
+  cargo run -q -p xtask -- ecosystem-compat --suite neo4j-java-bolt --no-history --report target/compat/neo4j-java-bolt-smoke.json
+```
+
+The Java smoke accepts a provisioned jar plus sibling runtime jars from the same directory. The current local passing setup uses:
+
+- `neo4j-java-driver-all-6.0.1.jar`
+- `reactive-streams-1.0.4.jar`
+
+`cypher-shell` Bolt smoke harness:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --suite cypher-shell-bolt --no-history --report target/compat/cypher-shell-bolt-smoke.json
+```
+
+That harness now proves the current experimental contract when a local client binary is provisioned:
+
+- launch `cypher-shell` against the experimental Bolt listener;
+- authenticate with the temporary smoke user;
+- complete the `CALL db.ping()` compatibility preflight used by `cypher-shell`;
+- complete a read-only SQL probe over Bolt.
+
+When provisioned, the JSON report records:
+
+- `tool_version`
+- `validation_state`
+- the probe checks completed by the client smoke
+
+When skipped, it still records the provisioning override key.
+
+At the current maturity level this is enough for `experimental`, but not yet enough for `validated`.
+
+If `cypher-shell` is not in `PATH`, point the smoke to the binary directly:
+
+```bash
+AIONDB_CYPHER_SHELL=/abs/path/to/cypher-shell \
+  cargo run -q -p xtask -- ecosystem-compat --suite cypher-shell-bolt --no-history --report target/compat/cypher-shell-bolt-smoke.json
+```
+
+Neo4j Query API HTTP smoke:
+
+```bash
+cargo run -q -p xtask -- ecosystem-compat --suite neo4j-query-api-http --no-history --report target/compat/neo4j-query-api-http-smoke.json
+```
+
+That smoke currently proves:
+
+- discovery metadata on `/`;
+- Basic auth on the HTTP wrapper;
+- single-statement `/query/v2`;
+- named parameter rewriting;
+- a controlled Cypher/SQL error payload over `/query/v2`;
+- `/tx/commit` with multiple statements;
+- `/tx/{id}` lifecycle with explicit commit.
+
+The JSON report also captures the discovery contract currently exposed by the wrapper:
+
+- `name`
+- `compatibility`
+- `auth`
+- `notes`
+
+Neo4j Browser-oriented Bolt preflight smoke:
+
+```bash
+AIONDB_CYPHER_SHELL=/abs/path/to/cypher-shell \
+  cargo run -q -p xtask -- ecosystem-compat --suite neo4j-browser-preflight-bolt --no-history --report target/compat/neo4j-browser-preflight-bolt-smoke.json
+```
+
+That smoke currently proves the server-side compatibility preflight Browser is likely to need:
+
+- `CALL dbms.components()`
+- `CALL dbms.components() YIELD ... RETURN ...`
+- `CALL db.labels()`
+- `CALL db.labels() YIELD ... RETURN ...`
+- `CALL db.relationshipTypes()`
+- `CALL db.relationshipTypes() YIELD ... RETURN ...`
+- `CALL db.propertyKeys()`
+- `CALL db.propertyKeys() YIELD ... RETURN ...`
+
+The report is intentionally marked as Browser `target`, not `experimental`, because it is still:
+
+- procedure-level evidence only;
+- transported through `cypher-shell`, not the Browser UI itself;
+- not yet a visual or metadata-complete Browser validation.
+
+### Current Bolt compatibility limitations
+
+The current Neo4j-oriented Bolt surface should still be described as **experimental** and **read-only**.
+
+Known limitations in the current compatibility layer:
+
+- read-only statements only;
+- read access mode only;
+- default database only;
+- `basic` auth only;
+- no impersonation support;
+- no `session_auth` or per-query auth metadata;
+- `tx_timeout` and `tx_metadata` are accepted for compatibility but ignored semantically;
+- one query result at a time per `RUN`.
+
+That is why the current Python driver smoke is strong enough for `experimental`, but still not enough for a broad Neo4j interoperability claim.
+
+### Current Query API compatibility limitations
+
+The current Neo4j-oriented Query API wrapper should also still be described as **experimental**.
+
+Known limitations in the current HTTP wrapper:
+
+- subset only, not a full Neo4j Query API implementation;
+- Basic auth only;
+- `/query/v2` supports one primary statement result per request;
+- official Neo4j drivers still require Bolt and do not target this wrapper;
+- compatibility is aimed at HTTP interoperability and tooling, not driver parity.
 
 ## Claiming Support
 

@@ -1513,6 +1513,7 @@ pub enum Statement {
     Update(UpdateStatement),
     Explain {
         analyze: bool,
+        format_json: bool,
         statement: Box<Statement>,
         span: Span,
     },

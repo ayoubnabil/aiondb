@@ -30,16 +30,33 @@ use crate::u64_to_f64;
 // ---------------------------------------------------------------------------
 
 /// Statistics about the graph topology used for cost-based optimization.
+///
+/// Every field is sourced from statistics that are already persisted by
+/// `ANALYZE` on the backing SQL tables (see `aiondb-catalog`'s
+/// `TableStatistics` / `ColumnStatistics`, recovered from the catalog WAL).
+/// Nothing here is a separate, unreliable side-channel: the graph adapter
+/// just re-projects table/column facts into graph terms so the cost-based
+/// planner gets real numbers instead of constants.
 #[derive(Clone, Debug, Default)]
 pub struct GraphStats {
     /// Number of nodes per label.
     pub label_cardinality: HashMap<String, u64>,
     /// Number of edges per relationship type.
     pub edge_cardinality: HashMap<String, u64>,
-    /// Average outgoing degree per edge type (edges / unique source nodes).
+    /// Average outgoing degree per edge type (edges / distinct source nodes).
     pub avg_out_degree: HashMap<String, f64>,
-    /// Average incoming degree per edge type (edges / unique target nodes).
+    /// Average incoming degree per edge type (edges / distinct target nodes).
     pub avg_in_degree: HashMap<String, f64>,
+    /// Distinct value count per `(label, property)`, taken from the backing
+    /// node table's persisted per-column `ndistinct`. Drives equality
+    /// selectivity in the cost model instead of a generic constant.
+    pub distinct: HashMap<(String, String), f64>,
+    /// Declared `(source_label, target_label)` endpoint labels per edge type,
+    /// from the edge label descriptor. In this label-backed model an edge
+    /// type connects exactly one label pair, so the typed-triple count
+    /// `count((:A)-[:T]->(:B))` is the full edge-table row count when the
+    /// queried labels match the declared endpoints, and zero otherwise.
+    pub edge_endpoints: HashMap<String, (String, String)>,
 }
 
 impl GraphStats {
@@ -106,8 +123,30 @@ impl GraphStatistics for GraphStats {
         )
     }
 
-    fn distinct_values(&self, _label: Option<&str>, _property: &str) -> Option<f64> {
-        None
+    fn distinct_values(&self, label: Option<&str>, property: &str) -> Option<f64> {
+        let label = label?;
+        self.distinct
+            .get(&(label.to_owned(), property.to_owned()))
+            .copied()
+    }
+
+    fn triple_cardinality(
+        &self,
+        from: Option<&str>,
+        rel_type: Option<&str>,
+        to: Option<&str>,
+    ) -> Option<f64> {
+        let (from, rel_type, to) = (from?, rel_type?, to?);
+        let (src, tgt) = self.edge_endpoints.get(rel_type)?;
+        let count = u64_to_f64(*self.edge_cardinality.get(rel_type)?);
+        if src.eq_ignore_ascii_case(from) && tgt.eq_ignore_ascii_case(to) {
+            Some(count)
+        } else {
+            // Label-backed model: an edge type links exactly one label pair,
+            // so a query that pairs it with a different label genuinely
+            // matches no edges.
+            Some(0.0)
+        }
     }
 }
 
@@ -586,14 +625,13 @@ impl GraphOptimizer {
         {
             return;
         }
-        if allow_cbo_start {
-            if self
+        if allow_cbo_start
+            && self
                 .cbo_seed_node_for_pattern(pattern, filters)
                 .is_some_and(|seed_node| seed_node + 1 == pattern.nodes.len())
-            {
-                self.reverse_pattern(pattern);
-                return;
-            }
+        {
+            self.reverse_pattern(pattern);
+            return;
         }
 
         let first_card = self.node_est_cardinality(&pattern.nodes[0], filters);
@@ -1546,6 +1584,99 @@ mod tests {
         assert_eq!(stats.edge_count("Unknown"), DEFAULT_EDGE_COUNT);
         assert!((stats.out_degree("Unknown") - DEFAULT_DEGREE).abs() < f64::EPSILON);
         assert!((stats.in_degree("Unknown") - DEFAULT_DEGREE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn distinct_values_from_persisted_column_stats() {
+        let mut stats = GraphStats::empty();
+        stats
+            .distinct
+            .insert(("Person".to_owned(), "name".to_owned()), 950.0);
+
+        assert_eq!(stats.distinct_values(Some("Person"), "name"), Some(950.0));
+        // A property without collected stats falls back (None) so the cost
+        // model uses its generic equality selectivity.
+        assert_eq!(stats.distinct_values(Some("Person"), "missing"), None);
+        // No label => cannot key into per-label stats.
+        assert_eq!(stats.distinct_values(None, "name"), None);
+    }
+
+    #[test]
+    fn triple_cardinality_uses_declared_endpoints() {
+        let mut stats = GraphStats::empty();
+        stats.edge_cardinality.insert("ACTED_IN".to_owned(), 5000);
+        stats.edge_endpoints.insert(
+            "ACTED_IN".to_owned(),
+            ("Person".to_owned(), "Movie".to_owned()),
+        );
+
+        // Declared pair (matched case-insensitively) => full edge-table count.
+        assert_eq!(
+            stats.triple_cardinality(Some("person"), Some("ACTED_IN"), Some("movie")),
+            Some(5000.0)
+        );
+        // Reversed/!declared pair => a label-backed edge type links exactly
+        // one label pair, so this genuinely matches no edges.
+        assert_eq!(
+            stats.triple_cardinality(Some("Movie"), Some("ACTED_IN"), Some("Person")),
+            Some(0.0)
+        );
+        // An unlabelled endpoint is not a typed triple => fall back so the
+        // cost model uses the per-type total instead of assuming zero.
+        assert_eq!(
+            stats.triple_cardinality(None, Some("ACTED_IN"), Some("Movie")),
+            None
+        );
+        // Unknown / un-analyzed edge type => fall back.
+        assert_eq!(
+            stats.triple_cardinality(Some("Person"), Some("KNOWS"), Some("Person")),
+            None
+        );
+    }
+
+    #[test]
+    fn analyzed_distinct_count_makes_cbo_seed_the_selective_node() {
+        // Two equally-sized labelled endpoints joined by one relationship,
+        // with an equality predicate on the *second* node. Without real
+        // distinct stats the planner has no reason to seed from `b`; with a
+        // high distinct count the predicate becomes very selective, so the
+        // cost-based planner must seed from `b` (forcing a reversal).
+        let mut stats = GraphStats::empty();
+        stats.label_cardinality.insert("Person".to_owned(), 100_000);
+        stats.edge_cardinality.insert("KNOWS".to_owned(), 500_000);
+        stats.edge_endpoints.insert(
+            "KNOWS".to_owned(),
+            ("Person".to_owned(), "Person".to_owned()),
+        );
+        stats
+            .distinct
+            .insert(("Person".to_owned(), "email".to_owned()), 100_000.0);
+        let optimizer = GraphOptimizer::new(stats);
+
+        let pattern = make_pattern(
+            vec![
+                make_node(Some("a"), Some("Person")),
+                make_node(Some("b"), Some("Person")),
+            ],
+            vec![make_rel(None, Some("KNOWS"), CypherRelDirection::Outgoing)],
+        );
+        let mut match_clause = make_match(vec![pattern]);
+        match_clause.filter = Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("b.email", 0, DataType::Text, false),
+            TypedExpr::literal(Value::Text("x@example.com".into()), DataType::Text, false),
+        ));
+
+        optimizer.optimize_match_clause(&mut match_clause);
+
+        // Seed flipped to the highly-selective `b`.
+        assert_eq!(
+            match_clause.patterns[0].nodes[0].variable.as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            match_clause.patterns[0].relationships[0].direction,
+            CypherRelDirection::Incoming
+        );
     }
 
     #[test]

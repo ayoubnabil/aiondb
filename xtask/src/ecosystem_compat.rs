@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,13 +24,24 @@ const DEFAULT_HISTORY_PATH: &str = "tmp/clean_prod/ecosystem_compat_history.json
 const DEFAULT_DATABASE: &str = "default";
 const DEFAULT_USER: &str = "xtask";
 const DEFAULT_PASSWORD: &str = "xtask";
+const BOLT_SMOKE_PASSWORD: &str = "Xtask-bolt-smoke1";
 const DEFAULT_HOST: &str = "127.0.0.1";
+const NEO4J_JS_DRIVER_BASE_ENV: &str = "AIONDB_NEO4J_JS_DRIVER_BASE";
+const NEO4J_JAVA_DRIVER_JAR_ENV: &str = "AIONDB_NEO4J_JAVA_DRIVER_JAR";
+const CYPHER_SHELL_PATH_ENV: &str = "AIONDB_CYPHER_SHELL";
+const NEO4J_BOLT_LIMITATIONS_REF: &str =
+    "docs/content/documentation/connect/ecosystem-integrations.md#current-bolt-compatibility-limitations";
+const NEO4J_BOLT_SURFACE: &str = "bolt_compat";
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const EXTERNAL_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_PORT_RESERVE_ATTEMPTS: usize = 8;
+const TCP_PORT_RESERVE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub(crate) struct EcosystemCompatOptions {
     suite_filter: Option<String>,
+    group_filter: Option<String>,
     report_path: PathBuf,
     history_path: Option<PathBuf>,
     strict: bool,
@@ -48,6 +59,7 @@ struct SuiteContext {
     workspace_root: PathBuf,
     database_url: String,
     sqlalchemy_database_url: String,
+    pgwire_port: u16,
     engine: Arc<Engine>,
     scratch_dir: PathBuf,
 }
@@ -58,6 +70,16 @@ struct ServerHarness {
     shutdown_tx: watch::Sender<bool>,
     thread_handle: Option<thread::JoinHandle<()>>,
     error_slot: Arc<Mutex<Option<String>>>,
+}
+
+struct ExternalBoltHarness {
+    child: std::process::Child,
+    bolt_port: u16,
+}
+
+struct ExternalQueryApiHarness {
+    child: std::process::Child,
+    http_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -90,6 +112,8 @@ struct EcosystemCompatReport {
     git_commit_short: Option<String>,
     git_dirty: Option<bool>,
     listen_addr: String,
+    group_filter: Option<String>,
+    group_summary: Option<GroupSummary>,
     strict: bool,
     report_path: String,
     history_path: Option<String>,
@@ -102,6 +126,28 @@ struct Summary {
     passed: usize,
     failed: usize,
     skipped: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupSummary {
+    name: String,
+    group_status: &'static str,
+    suites_total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    experimental_passed: usize,
+    target_pending_provisioning: usize,
+    blocked_suites: Vec<String>,
+    fully_validated: bool,
+    provisioning_hints: Vec<ProvisioningHint>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProvisioningHint {
+    suite: String,
+    tool: Option<String>,
+    env: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +174,7 @@ struct JsonScriptResult {
 
 pub(crate) fn parse_args(args: &[String]) -> Result<EcosystemCompatOptions, String> {
     let mut suite_filter = None;
+    let mut group_filter = None;
     let mut report_path = PathBuf::from(DEFAULT_REPORT_PATH);
     let mut history_override: Option<PathBuf> = None;
     let mut history_disabled = false;
@@ -142,6 +189,14 @@ pub(crate) fn parse_args(args: &[String]) -> Result<EcosystemCompatOptions, Stri
                 suite_filter = Some(
                     args.get(i)
                         .ok_or_else(|| "--suite requires a value".to_owned())?
+                        .clone(),
+                );
+            }
+            "--group" => {
+                i += 1;
+                group_filter = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--group requires a value".to_owned())?
                         .clone(),
                 );
             }
@@ -183,6 +238,10 @@ pub(crate) fn parse_args(args: &[String]) -> Result<EcosystemCompatOptions, Stri
         i += 1;
     }
 
+    if suite_filter.is_some() && group_filter.is_some() {
+        return Err("use either --suite or --group, not both".to_owned());
+    }
+
     if let Some(name) = &suite_filter {
         if !suite_definitions()
             .iter()
@@ -197,6 +256,17 @@ pub(crate) fn parse_args(args: &[String]) -> Result<EcosystemCompatOptions, Stri
         }
     }
 
+    if let Some(name) = &group_filter {
+        if !matches!(
+            name.as_str(),
+            "neo4j-p0" | "neo4j-http-p1" | "neo4j-browser-p0"
+        ) {
+            return Err(format!(
+                "unknown group '{name}'. Valid groups: neo4j-p0, neo4j-http-p1, neo4j-browser-p0"
+            ));
+        }
+    }
+
     let history_path = if history_disabled {
         None
     } else {
@@ -205,6 +275,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<EcosystemCompatOptions, Stri
 
     Ok(EcosystemCompatOptions {
         suite_filter,
+        group_filter,
         report_path,
         history_path,
         strict,
@@ -217,6 +288,21 @@ pub(crate) fn run(opts: EcosystemCompatOptions) -> ExitCode {
         for suite in suite_definitions() {
             println!("{:<22} {}", suite.name, suite.description);
         }
+        println!(
+            "{:<22} {}",
+            "group:neo4j-p0",
+            "Neo4j P0 wave: python driver, javascript driver, java driver, cypher-shell"
+        );
+        println!(
+            "{:<22} {}",
+            "group:neo4j-http-p1",
+            "Neo4j HTTP P1 wave: query API discovery, query, parameters, transactions"
+        );
+        println!(
+            "{:<22} {}",
+            "group:neo4j-browser-p0",
+            "Neo4j Browser P0 wave: Bolt procedure preflight compatibility"
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -267,6 +353,7 @@ pub(crate) fn run(opts: EcosystemCompatOptions) -> ExitCode {
             "postgresql+psycopg://{DEFAULT_USER}:{DEFAULT_PASSWORD}@{DEFAULT_HOST}:{port}/{DEFAULT_DATABASE}?sslmode=disable",
             port = harness.port
         ),
+        pgwire_port: harness.port,
         engine: Arc::clone(&harness.engine),
         scratch_dir: scratch.path().to_path_buf(),
     };
@@ -274,9 +361,23 @@ pub(crate) fn run(opts: EcosystemCompatOptions) -> ExitCode {
     let suites: Vec<SuiteDefinition> = suite_definitions()
         .iter()
         .copied()
-        .filter(|suite| match opts.suite_filter.as_ref() {
-            Some(name) => suite.name == name.as_str(),
-            None => true,
+        .filter(|suite| match (opts.suite_filter.as_ref(), opts.group_filter.as_ref()) {
+            (Some(name), _) => suite.name == name.as_str(),
+            (None, Some(group)) if group == "neo4j-p0" => matches!(
+                suite.name,
+                "neo4j-python-bolt"
+                    | "neo4j-javascript-bolt"
+                    | "neo4j-java-bolt"
+                    | "cypher-shell-bolt"
+            ),
+            (None, Some(group)) if group == "neo4j-http-p1" => {
+                matches!(suite.name, "neo4j-query-api-http")
+            }
+            (None, Some(group)) if group == "neo4j-browser-p0" => {
+                matches!(suite.name, "neo4j-browser-preflight-bolt")
+            }
+            (None, Some(_)) => false,
+            (None, None) => true,
         })
         .collect();
 
@@ -296,6 +397,7 @@ pub(crate) fn run(opts: EcosystemCompatOptions) -> ExitCode {
             .filter(|record| matches!(record.status, SuiteStatus::Skipped))
             .count(),
     };
+    let group_summary = build_group_summary(opts.group_filter.as_deref(), &records);
 
     let generated_at_unix_ms = unix_time_millis();
     let commit_info = capture_commit_info(&workspace_root);
@@ -307,6 +409,8 @@ pub(crate) fn run(opts: EcosystemCompatOptions) -> ExitCode {
         git_commit_short: commit_info.short.clone(),
         git_dirty: commit_info.dirty,
         listen_addr: format!("{DEFAULT_HOST}:{}", harness.port),
+        group_filter: opts.group_filter.clone(),
+        group_summary,
         strict: opts.strict,
         report_path: opts.report_path.display().to_string(),
         history_path: opts
@@ -356,6 +460,7 @@ ephemeral in-process AionDB pgwire server.
 
 Options:
   --suite <NAME>    Run only a single suite
+  --group <NAME>    Run a named suite group (currently: neo4j-p0, neo4j-http-p1, neo4j-browser-p0)
   --report <PATH>   Override the JSON report path (default: tmp/clean_prod/ecosystem_compat.json)
   --history <PATH>  Override the JSONL history path (default: tmp/clean_prod/ecosystem_compat_history.jsonl)
   --no-history      Do not append a per-run history record
@@ -401,6 +506,36 @@ fn suite_definitions() -> &'static [SuiteDefinition] {
             name: "diesel",
             description: "Diesel PgConnection SQL query, bind parameters, rollback, introspection and error class",
             run: run_diesel_suite,
+        },
+        SuiteDefinition {
+            name: "neo4j-python-bolt",
+            description: "Neo4j Python driver read-only Bolt smoke against the experimental compatibility listener",
+            run: run_neo4j_python_bolt_suite,
+        },
+        SuiteDefinition {
+            name: "neo4j-javascript-bolt",
+            description: "Neo4j JavaScript driver read-only Bolt smoke against the experimental compatibility listener",
+            run: run_neo4j_javascript_bolt_suite,
+        },
+        SuiteDefinition {
+            name: "neo4j-query-api-http",
+            description: "Neo4j Query API HTTP wrapper smoke against the experimental compatibility surface",
+            run: run_neo4j_query_api_http_suite,
+        },
+        SuiteDefinition {
+            name: "neo4j-java-bolt",
+            description: "Neo4j Java driver read-only Bolt smoke against the experimental compatibility listener",
+            run: run_neo4j_java_bolt_suite,
+        },
+        SuiteDefinition {
+            name: "cypher-shell-bolt",
+            description: "cypher-shell read-only Bolt smoke against the experimental compatibility listener",
+            run: run_cypher_shell_bolt_suite,
+        },
+        SuiteDefinition {
+            name: "neo4j-browser-preflight-bolt",
+            description: "Browser-oriented Bolt procedure preflight smoke over cypher-shell against the experimental compatibility listener",
+            run: run_neo4j_browser_preflight_bolt_suite,
         },
     ]
 }
@@ -896,6 +1031,1022 @@ fn run_diesel_suite(ctx: &SuiteContext) -> SuiteRecord {
     .unwrap_or_else(|record| *record)
 }
 
+fn run_neo4j_python_bolt_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(python) = find_in_path("python3") else {
+        return skipped_record(
+            "neo4j-python-bolt",
+            suite_description("neo4j-python-bolt"),
+            start.elapsed(),
+            "python3 was not found in PATH",
+        );
+    };
+    if let Err(reason) = ensure_python_modules(&python, &["neo4j"], &ctx.workspace_root) {
+        return skipped_record(
+            "neo4j-python-bolt",
+            suite_description("neo4j-python-bolt"),
+            start.elapsed(),
+            reason,
+        );
+    }
+    let driver_version = capture_python_module_version(&python, "neo4j", &ctx.workspace_root);
+
+    let mut harness = match start_external_bolt_harness(ctx, "neo4j-python-bolt", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let script = ctx
+        .workspace_root
+        .join("testing/ecosystem/python/neo4j_bolt_smoke.py");
+    let args = vec![script.display().to_string()];
+    let envs = vec![
+        (
+            "NEO4J_URI",
+            format!("bolt://{DEFAULT_HOST}:{}", harness.bolt_port),
+        ),
+        ("NEO4J_USER", DEFAULT_USER.to_owned()),
+        ("NEO4J_PASSWORD", BOLT_SMOKE_PASSWORD.to_owned()),
+    ];
+
+    let result = run_json_script_command(
+        "neo4j-python-bolt",
+        suite_description("neo4j-python-bolt"),
+        &python,
+        &args,
+        &envs,
+        &ctx.workspace_root,
+        start,
+    );
+    let _ = stop_child_process(&mut harness.child);
+    let mut record = result.unwrap_or_else(|record| *record);
+    attach_payload_metadata(
+        &mut record,
+        json!({
+            "tool": "neo4j-python-driver",
+            "driver_version": driver_version,
+            "validation_state": "experimental",
+            "surface": NEO4J_BOLT_SURFACE,
+            "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+        }),
+    );
+    record
+}
+
+fn run_neo4j_javascript_bolt_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(node) = find_in_path("node") else {
+        return skipped_record(
+            "neo4j-javascript-bolt",
+            suite_description("neo4j-javascript-bolt"),
+            start.elapsed(),
+            "node was not found in PATH",
+        );
+    };
+    let node_resolve_base = resolve_node_package_base(&ctx.workspace_root);
+    if let Err(reason) = ensure_node_packages(&node, &node_resolve_base, &["neo4j-driver"]) {
+        let mut record = skipped_record(
+            "neo4j-javascript-bolt",
+            suite_description("neo4j-javascript-bolt"),
+            start.elapsed(),
+            reason,
+        );
+        attach_payload_metadata(
+            &mut record,
+            json!({
+                "tool": "neo4j-javascript-driver",
+                "driver_version": Value::Null,
+                "node_resolve_base": node_resolve_base.display().to_string(),
+                "provisioning_env": NEO4J_JS_DRIVER_BASE_ENV,
+                "validation_state": "target",
+                "surface": NEO4J_BOLT_SURFACE,
+                "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+            }),
+        );
+        return record;
+    }
+    let driver_version = capture_node_package_version(&node, &node_resolve_base, "neo4j-driver");
+
+    let mut harness = match start_external_bolt_harness(ctx, "neo4j-javascript-bolt", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let script = ctx
+        .workspace_root
+        .join("testing/ecosystem/node/neo4j_driver_smoke.mjs");
+    let args = vec![script.display().to_string()];
+    let envs = vec![
+        (
+            "NEO4J_URI",
+            format!("bolt://{DEFAULT_HOST}:{}", harness.bolt_port),
+        ),
+        ("NEO4J_USER", DEFAULT_USER.to_owned()),
+        ("NEO4J_PASSWORD", BOLT_SMOKE_PASSWORD.to_owned()),
+        (
+            "AIONDB_NODE_RESOLVE_BASE",
+            node_resolve_base.display().to_string(),
+        ),
+    ];
+    let result = run_json_script_command(
+        "neo4j-javascript-bolt",
+        suite_description("neo4j-javascript-bolt"),
+        &node,
+        &args,
+        &envs,
+        &ctx.workspace_root,
+        start,
+    );
+    let _ = stop_child_process(&mut harness.child);
+    let mut record = result.unwrap_or_else(|record| *record);
+    let validation_state = if matches!(record.status, SuiteStatus::Passed) {
+        "experimental"
+    } else {
+        "target"
+    };
+    attach_payload_metadata(
+        &mut record,
+        json!({
+            "tool": "neo4j-javascript-driver",
+            "driver_version": driver_version,
+            "node_resolve_base": node_resolve_base.display().to_string(),
+            "validation_state": validation_state,
+            "surface": NEO4J_BOLT_SURFACE,
+            "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+        }),
+    );
+    record
+}
+
+fn run_neo4j_query_api_http_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(python) = find_in_path("python3") else {
+        return skipped_record(
+            "neo4j-query-api-http",
+            suite_description("neo4j-query-api-http"),
+            start.elapsed(),
+            "python3 was not found in PATH",
+        );
+    };
+
+    let mut harness = match start_external_query_api_harness(ctx, "neo4j-query-api-http", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let script = ctx
+        .workspace_root
+        .join("testing/ecosystem/python/neo4j_query_api_smoke.py");
+    let args = vec![script.display().to_string()];
+    let envs = vec![
+        (
+            "AIONDB_QUERY_API_BASE",
+            format!("http://{DEFAULT_HOST}:{}", harness.http_port),
+        ),
+        ("AIONDB_QUERY_API_USER", DEFAULT_USER.to_owned()),
+        ("AIONDB_QUERY_API_PASSWORD", BOLT_SMOKE_PASSWORD.to_owned()),
+    ];
+
+    let result = run_json_script_command(
+        "neo4j-query-api-http",
+        suite_description("neo4j-query-api-http"),
+        &python,
+        &args,
+        &envs,
+        &ctx.workspace_root,
+        start,
+    );
+    let _ = stop_child_process(&mut harness.child);
+    let mut record = result.unwrap_or_else(|record| *record);
+    attach_payload_metadata(
+        &mut record,
+        json!({
+            "tool": "neo4j-query-api-wrapper",
+            "validation_state": "experimental",
+            "surface": "query_api_wrapper",
+            "limitations_ref": "docs/content/documentation/connect/ecosystem-integrations.md#current-query-api-compatibility-limitations",
+        }),
+    );
+    record
+}
+
+fn run_cypher_shell_bolt_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(cypher_shell) = resolve_program_override(CYPHER_SHELL_PATH_ENV, "cypher-shell") else {
+        let mut record = skipped_record(
+            "cypher-shell-bolt",
+            suite_description("cypher-shell-bolt"),
+            start.elapsed(),
+            format!(
+                "cypher-shell was not found in PATH; set {CYPHER_SHELL_PATH_ENV} to a local client binary to provision this smoke"
+            ),
+        );
+        attach_payload_metadata(
+            &mut record,
+            json!({
+                "tool": "cypher-shell",
+                "tool_version": Value::Null,
+                "provisioning_env": CYPHER_SHELL_PATH_ENV,
+                "validation_state": "target",
+                "surface": NEO4J_BOLT_SURFACE,
+                "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+            }),
+        );
+        return record;
+    };
+    let cypher_shell_version =
+        capture_command_first_line(&cypher_shell, &[String::from("--version")], &ctx.workspace_root);
+
+    let mut harness = match start_external_bolt_harness(ctx, "cypher-shell-bolt", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let query = "SELECT 1 AS one, 'ok' AS status";
+    let args = vec![
+        "-a".to_owned(),
+        format!("bolt://{DEFAULT_HOST}:{}", harness.bolt_port),
+        "-u".to_owned(),
+        DEFAULT_USER.to_owned(),
+        "-p".to_owned(),
+        BOLT_SMOKE_PASSWORD.to_owned(),
+        "--non-interactive".to_owned(),
+        "--format".to_owned(),
+        "plain".to_owned(),
+        query.to_owned(),
+    ];
+    let command = command_display(&cypher_shell, &args);
+    let output = run_command(&cypher_shell, &args, &[], &ctx.workspace_root);
+    let _ = stop_child_process(&mut harness.child);
+    let elapsed = start.elapsed();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return failed_record(
+                "cypher-shell-bolt",
+                suite_description("cypher-shell-bolt"),
+                elapsed,
+                format!("failed to execute cypher-shell: {error}"),
+                vec!["bolt_connect".to_owned()],
+                Some(command),
+                None,
+                None,
+                None,
+            );
+        }
+    };
+    if output.status_code != Some(0) {
+        return failed_record(
+            "cypher-shell-bolt",
+            suite_description("cypher-shell-bolt"),
+            elapsed,
+            format!(
+                "cypher-shell exited with status {:?}: {}",
+                output.status_code,
+                stderr_or_stdout(&output)
+            ),
+            vec!["bolt_connect".to_owned(), "auth".to_owned()],
+            Some(command),
+            None,
+            Some(output.stdout),
+            Some(output.stderr),
+        );
+    }
+
+    let stdout_lines = normalized_lines(&output.stdout);
+    let stdout_joined = stdout_lines.join(" ");
+    if !stdout_joined.contains('1') || !stdout_joined.contains("ok") {
+        return failed_record(
+            "cypher-shell-bolt",
+            suite_description("cypher-shell-bolt"),
+            elapsed,
+            format!("unexpected cypher-shell output: {}", output.stdout.trim()),
+            vec![
+                "bolt_connect".to_owned(),
+                "auth".to_owned(),
+                "session".to_owned(),
+                "return_probe".to_owned(),
+            ],
+            Some(command),
+            None,
+            Some(output.stdout),
+            Some(output.stderr),
+        );
+    }
+
+    passed_record(
+        "cypher-shell-bolt",
+        suite_description("cypher-shell-bolt"),
+        elapsed,
+        "cypher-shell connected over Bolt, completed a db.ping compatibility check, and completed a read-only SQL probe".to_owned(),
+        vec![
+            "bolt_connect".to_owned(),
+            "auth".to_owned(),
+            "db_ping".to_owned(),
+            "session".to_owned(),
+            "sql_probe".to_owned(),
+        ],
+        Some(command),
+        Some(json!({
+            "tool": "cypher-shell",
+            "tool_version": cypher_shell_version,
+            "validation_state": "experimental",
+            "surface": NEO4J_BOLT_SURFACE,
+            "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+            "checks": ["bolt_connect", "auth", "db_ping", "session", "sql_probe"],
+            "stdout_lines": stdout_lines,
+        })),
+        Some(output.stdout),
+        Some(output.stderr),
+    )
+}
+
+fn run_neo4j_browser_preflight_bolt_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(cypher_shell) = resolve_program_override(CYPHER_SHELL_PATH_ENV, "cypher-shell") else {
+        let mut record = skipped_record(
+            "neo4j-browser-preflight-bolt",
+            suite_description("neo4j-browser-preflight-bolt"),
+            start.elapsed(),
+            format!(
+                "cypher-shell was not found in PATH; set {CYPHER_SHELL_PATH_ENV} to a local client binary to provision this Browser preflight smoke"
+            ),
+        );
+        attach_payload_metadata(
+            &mut record,
+            json!({
+                "tool": "neo4j-browser",
+                "validation_state": "target",
+                "surface": NEO4J_BOLT_SURFACE,
+                "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+                "provisioning_env": CYPHER_SHELL_PATH_ENV,
+                "evidence_kind": "browser_preflight_procedures",
+            }),
+        );
+        return record;
+    };
+
+    let cypher_shell_version =
+        capture_command_first_line(&cypher_shell, &[String::from("--version")], &ctx.workspace_root);
+    let mut harness = match start_external_bolt_harness(ctx, "neo4j-browser-preflight-bolt", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let probes = [
+        ("dbms_components", "CALL dbms.components()"),
+        (
+            "dbms_components_yield",
+            "CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edition",
+        ),
+        ("db_labels", "CALL db.labels()"),
+        ("db_labels_yield", "CALL db.labels() YIELD label RETURN label"),
+        ("db_relationship_types", "CALL db.relationshipTypes()"),
+        (
+            "db_relationship_types_yield",
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType",
+        ),
+        ("db_property_keys", "CALL db.propertyKeys()"),
+        (
+            "db_property_keys_yield",
+            "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey",
+        ),
+    ];
+    let mut commands = Vec::with_capacity(probes.len());
+    let mut outputs = BTreeMap::new();
+    let mut checks = vec!["bolt_connect".to_owned(), "auth".to_owned(), "session".to_owned()];
+
+    for (check_name, query) in probes {
+        let args = vec![
+            "-a".to_owned(),
+            format!("bolt://{DEFAULT_HOST}:{}", harness.bolt_port),
+            "-u".to_owned(),
+            DEFAULT_USER.to_owned(),
+            "-p".to_owned(),
+            BOLT_SMOKE_PASSWORD.to_owned(),
+            "--non-interactive".to_owned(),
+            "--format".to_owned(),
+            "plain".to_owned(),
+            query.to_owned(),
+        ];
+        commands.push(command_display(&cypher_shell, &args));
+        let output = match run_command(&cypher_shell, &args, &[], &ctx.workspace_root) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = stop_child_process(&mut harness.child);
+                return failed_record(
+                    "neo4j-browser-preflight-bolt",
+                    suite_description("neo4j-browser-preflight-bolt"),
+                    start.elapsed(),
+                    format!("failed to execute cypher-shell Browser preflight probe: {error}"),
+                    checks,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+        if output.status_code != Some(0) {
+            let _ = stop_child_process(&mut harness.child);
+            return failed_record(
+                "neo4j-browser-preflight-bolt",
+                suite_description("neo4j-browser-preflight-bolt"),
+                start.elapsed(),
+                format!(
+                    "Browser preflight probe `{query}` failed with status {:?}: {}",
+                    output.status_code,
+                    stderr_or_stdout(&output)
+                ),
+                checks,
+                None,
+                None,
+                Some(output.stdout),
+                Some(output.stderr),
+            );
+        }
+        outputs.insert(
+            check_name.to_owned(),
+            json!({
+                "query": query,
+                "stdout_lines": normalized_lines(&output.stdout),
+            }),
+        );
+        checks.push(check_name.to_owned());
+    }
+
+    let _ = stop_child_process(&mut harness.child);
+    if !outputs["dbms_components"]["stdout_lines"]
+        .as_array()
+        .is_some_and(|lines| lines.iter().any(|line| line.as_str().is_some_and(|line| line.contains("Neo4j Kernel"))))
+    {
+        return failed_record(
+            "neo4j-browser-preflight-bolt",
+            suite_description("neo4j-browser-preflight-bolt"),
+            start.elapsed(),
+            "dbms.components output did not expose the expected compatibility row".to_owned(),
+            checks,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+    if !outputs["dbms_components_yield"]["stdout_lines"]
+        .as_array()
+        .is_some_and(|lines| lines.iter().any(|line| line.as_str().is_some_and(|line| line.contains("Neo4j Kernel"))))
+    {
+        return failed_record(
+            "neo4j-browser-preflight-bolt",
+            suite_description("neo4j-browser-preflight-bolt"),
+            start.elapsed(),
+            "dbms.components YIELD/RETURN projection did not expose the expected compatibility row"
+                .to_owned(),
+            checks,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    passed_record(
+        "neo4j-browser-preflight-bolt",
+        suite_description("neo4j-browser-preflight-bolt"),
+        start.elapsed(),
+        "Browser-oriented Bolt preflight procedures completed over cypher-shell".to_owned(),
+        checks,
+        None,
+        Some(json!({
+            "tool": "neo4j-browser",
+            "tool_version": Value::Null,
+            "driver_tool": "cypher-shell",
+            "driver_tool_version": cypher_shell_version,
+            "validation_state": "target",
+            "surface": NEO4J_BOLT_SURFACE,
+            "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+            "evidence_kind": "browser_preflight_procedures",
+            "queries": probes.iter().map(|(_, query)| *query).collect::<Vec<_>>(),
+            "outputs": outputs,
+            "commands": commands,
+        })),
+        None,
+        None,
+    )
+}
+
+fn run_neo4j_java_bolt_suite(ctx: &SuiteContext) -> SuiteRecord {
+    let start = Instant::now();
+    let Some(java) = find_in_path("java") else {
+        return skipped_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            start.elapsed(),
+            "java was not found in PATH",
+        );
+    };
+    let Some(javac) = find_in_path("javac") else {
+        return skipped_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            start.elapsed(),
+            "javac was not found in PATH",
+        );
+    };
+    let Some(driver_jar) = resolve_neo4j_java_driver_jar(&ctx.workspace_root) else {
+        let mut record = skipped_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            start.elapsed(),
+            format!(
+                "neo4j-java-driver jar was not found; set {NEO4J_JAVA_DRIVER_JAR_ENV} or provision target/compat/java-libs or ~/.m2 first"
+            ),
+        );
+        attach_payload_metadata(
+            &mut record,
+            json!({
+                "tool": "neo4j-java-driver",
+                "driver_version": Value::Null,
+                "driver_jar": Value::Null,
+                "provisioning_env": NEO4J_JAVA_DRIVER_JAR_ENV,
+                "validation_state": "target",
+                "surface": NEO4J_BOLT_SURFACE,
+                "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+            }),
+        );
+        return record;
+    };
+    let driver_version = infer_neo4j_java_driver_version(&driver_jar);
+
+    let build_dir = ctx.workspace_root.join("target/compat/java-build/neo4j-bolt-smoke");
+    if let Err(error) = fs::create_dir_all(&build_dir) {
+        return failed_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            start.elapsed(),
+            format!("failed to create java build dir '{}': {error}", build_dir.display()),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    let source = ctx
+        .workspace_root
+        .join("testing/ecosystem/java/Neo4jBoltSmoke.java");
+    let driver_classpath = java_classpath_entries(&driver_jar);
+    let driver_classpath_string = driver_classpath.join(":");
+    let compile_args = vec![
+        "-d".to_owned(),
+        build_dir.display().to_string(),
+        "-cp".to_owned(),
+        driver_classpath_string.clone(),
+        source.display().to_string(),
+    ];
+    let compile_command = command_display(&javac, &compile_args);
+    let compile_output = match run_command(&javac, &compile_args, &[], &ctx.workspace_root) {
+        Ok(output) => output,
+        Err(error) => {
+            return failed_record(
+                "neo4j-java-bolt",
+                suite_description("neo4j-java-bolt"),
+                start.elapsed(),
+                format!("failed to execute javac: {error}"),
+                vec!["compile".to_owned()],
+                Some(compile_command),
+                None,
+                None,
+                None,
+            );
+        }
+    };
+    if compile_output.status_code != Some(0) {
+        return failed_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            start.elapsed(),
+            format!(
+                "javac exited with status {:?}: {}",
+                compile_output.status_code,
+                stderr_or_stdout(&compile_output)
+            ),
+            vec!["compile".to_owned()],
+            Some(compile_command),
+            None,
+            Some(compile_output.stdout),
+            Some(compile_output.stderr),
+        );
+    }
+
+    let mut harness = match start_external_bolt_harness(ctx, "neo4j-java-bolt", start) {
+        Ok(harness) => harness,
+        Err(record) => return *record,
+    };
+
+    let classpath = format!("{}:{}", build_dir.display(), driver_classpath_string);
+    let args = vec![
+        "-cp".to_owned(),
+        classpath.clone(),
+        "Neo4jBoltSmoke".to_owned(),
+        format!("bolt://{DEFAULT_HOST}:{}", harness.bolt_port),
+        DEFAULT_USER.to_owned(),
+        BOLT_SMOKE_PASSWORD.to_owned(),
+    ];
+    let command = command_display(&java, &args);
+    let output = run_command(&java, &args, &[], &ctx.workspace_root);
+    let _ = stop_child_process(&mut harness.child);
+    let elapsed = start.elapsed();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return failed_record(
+                "neo4j-java-bolt",
+                suite_description("neo4j-java-bolt"),
+                elapsed,
+                format!("failed to execute java smoke runner: {error}"),
+                vec!["compile".to_owned(), "bolt_connect".to_owned()],
+                Some(command),
+                None,
+                None,
+                None,
+            );
+        }
+    };
+    if output.status_code != Some(0) {
+        return failed_record(
+            "neo4j-java-bolt",
+            suite_description("neo4j-java-bolt"),
+            elapsed,
+            format!(
+                "neo4j-java-driver smoke exited with status {:?}: {}",
+                output.status_code,
+                stderr_or_stdout(&output)
+            ),
+            vec![
+                "compile".to_owned(),
+                "bolt_connect".to_owned(),
+                "auth".to_owned(),
+            ],
+            Some(command),
+            None,
+            Some(output.stdout),
+            Some(output.stderr),
+        );
+    }
+
+    let payload = match serde_json::from_str::<Value>(output.stdout.trim()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return failed_record(
+                "neo4j-java-bolt",
+                suite_description("neo4j-java-bolt"),
+                elapsed,
+                format!("neo4j-java-driver smoke returned invalid JSON: {error}"),
+                vec![
+                    "compile".to_owned(),
+                    "bolt_connect".to_owned(),
+                    "auth".to_owned(),
+                    "session".to_owned(),
+                    "return_probe".to_owned(),
+                ],
+                Some(command),
+                None,
+                Some(output.stdout),
+                Some(output.stderr),
+            );
+        }
+    };
+
+    let mut record = passed_record(
+        "neo4j-java-bolt",
+        suite_description("neo4j-java-bolt"),
+        elapsed,
+        payload
+            .get("details")
+            .and_then(Value::as_str)
+            .unwrap_or("Neo4j Java driver connected over Bolt and completed a read-only RETURN probe")
+            .to_owned(),
+        vec![
+            "compile".to_owned(),
+            "bolt_connect".to_owned(),
+            "auth".to_owned(),
+            "session".to_owned(),
+            "return_probe".to_owned(),
+        ],
+        Some(command),
+        Some(payload),
+        Some(output.stdout),
+        Some(output.stderr),
+    );
+    let validation_state = if matches!(record.status, SuiteStatus::Passed) {
+        "experimental"
+    } else {
+        "target"
+    };
+    attach_payload_metadata(
+        &mut record,
+        json!({
+            "tool": "neo4j-java-driver",
+            "driver_version": driver_version,
+            "driver_jar": driver_jar.display().to_string(),
+            "classpath_jars": driver_classpath,
+            "validation_state": validation_state,
+            "surface": NEO4J_BOLT_SURFACE,
+            "limitations_ref": NEO4J_BOLT_LIMITATIONS_REF,
+        }),
+    );
+    record
+}
+
+fn start_external_bolt_harness(
+    ctx: &SuiteContext,
+    suite_name: &str,
+    start: Instant,
+) -> Result<ExternalBoltHarness, Box<SuiteRecord>> {
+    let pgwire_port = match reserve_distinct_tcp_port(&[ctx.pgwire_port]) {
+        Ok(port) => port,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to reserve pgwire port: {error}"),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    let bolt_port = match reserve_distinct_tcp_port(&[ctx.pgwire_port, pgwire_port]) {
+        Ok(port) => port,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to reserve Bolt port: {error}"),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    let stdout_path = ctx
+        .scratch_dir
+        .join(format!("{suite_name}.server.stdout.log"));
+    let stderr_path = ctx
+        .scratch_dir
+        .join(format!("{suite_name}.server.stderr.log"));
+    let (server_program, server_args) = match resolve_aiondb_server_command(&ctx.workspace_root) {
+        Some(command) => command,
+        None => {
+            return Err(Box::new(skipped_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                "neither target/debug/aiondb nor cargo was available to launch the Bolt compatibility server",
+            )));
+        }
+    };
+    let server_command = command_display(&server_program, &server_args);
+    let server_envs = vec![
+        ("AIONDB_BOOTSTRAP_USER".to_owned(), DEFAULT_USER.to_owned()),
+        (
+            "AIONDB_BOOTSTRAP_PASSWORD".to_owned(),
+            BOLT_SMOKE_PASSWORD.to_owned(),
+        ),
+        (
+            "AIONDB_PGWIRE_LISTEN_ADDR".to_owned(),
+            format!("{DEFAULT_HOST}:{pgwire_port}"),
+        ),
+        ("AIONDB_ENABLE_BOLT_COMPAT".to_owned(), "true".to_owned()),
+        (
+            "AIONDB_BOLT_COMPAT_BIND".to_owned(),
+            DEFAULT_HOST.to_owned(),
+        ),
+        (
+            "AIONDB_BOLT_COMPAT_PORT".to_owned(),
+            bolt_port.to_string(),
+        ),
+    ];
+    let mut child = match spawn_logged_process(
+        &server_program,
+        &server_args,
+        &server_envs,
+        &ctx.workspace_root,
+        &stdout_path,
+        &stderr_path,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to start aiondb-server: {error}"),
+                vec![],
+                Some(server_command),
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    if let Err(error) = wait_for_process_tcp_ready(
+        &mut child,
+        bolt_port,
+        EXTERNAL_SERVER_READY_TIMEOUT,
+        &stdout_path,
+        &stderr_path,
+    ) {
+        let stdout = fs::read_to_string(&stdout_path).ok();
+        let stderr = fs::read_to_string(&stderr_path).ok();
+        let _ = stop_child_process(&mut child);
+        return Err(Box::new(failed_record(
+            suite_name,
+            suite_description(suite_name),
+            start.elapsed(),
+            format!("Bolt compatibility listener did not become ready: {error}"),
+            vec![],
+            Some(server_command),
+            Some(json!({
+                "pgwire_port": pgwire_port,
+                "bolt_port": bolt_port,
+                "stdout_path": stdout_path.display().to_string(),
+                "stderr_path": stderr_path.display().to_string()
+            })),
+            stdout,
+            stderr,
+        )));
+    }
+    Ok(ExternalBoltHarness {
+        child,
+        bolt_port,
+    })
+}
+
+fn start_external_query_api_harness(
+    ctx: &SuiteContext,
+    suite_name: &str,
+    start: Instant,
+) -> Result<ExternalQueryApiHarness, Box<SuiteRecord>> {
+    let pgwire_port = match reserve_distinct_tcp_port(&[ctx.pgwire_port]) {
+        Ok(port) => port,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to reserve pgwire port: {error}"),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    let http_port = match reserve_distinct_tcp_port(&[ctx.pgwire_port, pgwire_port]) {
+        Ok(port) => port,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to reserve observability http port: {error}"),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    let stdout_path = ctx
+        .scratch_dir
+        .join(format!("{suite_name}.server.stdout.log"));
+    let stderr_path = ctx
+        .scratch_dir
+        .join(format!("{suite_name}.server.stderr.log"));
+    let (server_program, mut server_args) = match resolve_aiondb_server_command(&ctx.workspace_root) {
+        Some(command) => command,
+        None => {
+            return Err(Box::new(skipped_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                "neither target/debug/aiondb nor cargo was available to launch the query api server",
+            )));
+        }
+    };
+    server_args.retain(|arg| arg != "--no-observability");
+    let server_command = command_display(&server_program, &server_args);
+    let server_envs = vec![
+        ("AIONDB_BOOTSTRAP_USER".to_owned(), DEFAULT_USER.to_owned()),
+        (
+            "AIONDB_BOOTSTRAP_PASSWORD".to_owned(),
+            BOLT_SMOKE_PASSWORD.to_owned(),
+        ),
+        (
+            "AIONDB_PGWIRE_LISTEN_ADDR".to_owned(),
+            format!("{DEFAULT_HOST}:{pgwire_port}"),
+        ),
+        (
+            "AIONDB_OBSERVABILITY_BIND".to_owned(),
+            DEFAULT_HOST.to_owned(),
+        ),
+        (
+            "AIONDB_OBSERVABILITY_PORT".to_owned(),
+            http_port.to_string(),
+        ),
+    ];
+    let mut child = match spawn_logged_process(
+        &server_program,
+        &server_args,
+        &server_envs,
+        &ctx.workspace_root,
+        &stdout_path,
+        &stderr_path,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(Box::new(failed_record(
+                suite_name,
+                suite_description(suite_name),
+                start.elapsed(),
+                format!("failed to start aiondb-server: {error}"),
+                vec![],
+                Some(server_command),
+                None,
+                None,
+                None,
+            )));
+        }
+    };
+    if let Err(error) = wait_for_process_tcp_ready(
+        &mut child,
+        http_port,
+        EXTERNAL_SERVER_READY_TIMEOUT,
+        &stdout_path,
+        &stderr_path,
+    ) {
+        let stdout = fs::read_to_string(&stdout_path).ok();
+        let stderr = fs::read_to_string(&stderr_path).ok();
+        let _ = stop_child_process(&mut child);
+        return Err(Box::new(failed_record(
+            suite_name,
+            suite_description(suite_name),
+            start.elapsed(),
+            format!("query api listener did not become ready: {error}"),
+            vec![],
+            Some(server_command),
+            Some(json!({
+                "pgwire_port": pgwire_port,
+                "http_port": http_port,
+                "stdout_path": stdout_path.display().to_string(),
+                "stderr_path": stderr_path.display().to_string()
+            })),
+            stdout,
+            stderr,
+        )));
+    }
+    Ok(ExternalQueryApiHarness {
+        child,
+        http_port,
+    })
+}
+
+fn resolve_aiondb_server_command(workspace_root: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let debug_binary = workspace_root.join("target/debug/aiondb");
+    if debug_binary.is_file() {
+        return Some((
+            debug_binary,
+            vec!["--ephemeral".to_owned(), "--no-observability".to_owned()],
+        ));
+    }
+    let cargo = find_in_path("cargo")?;
+    Some((
+        cargo,
+        vec![
+            "run".to_owned(),
+            "-q".to_owned(),
+            "-p".to_owned(),
+            "aiondb-server".to_owned(),
+            "--bin".to_owned(),
+            "aiondb".to_owned(),
+            "--".to_owned(),
+            "--ephemeral".to_owned(),
+            "--no-observability".to_owned(),
+        ],
+    ))
+}
+
 fn run_python_json_suite(
     ctx: &SuiteContext,
     suite_name: &str,
@@ -1061,10 +2212,28 @@ fn ensure_python_modules(python: &Path, modules: &[&str], cwd: &Path) -> Result<
 }
 
 fn ensure_node_packages(node: &Path, cwd: &Path, packages: &[&str]) -> Result<(), String> {
+    if !cwd.is_dir() {
+        return Err(format!(
+            "node package base '{}' does not exist; set {NEO4J_JS_DRIVER_BASE_ENV} or provision target/compat/node-tools first",
+            cwd.display()
+        ));
+    }
+    let package_json = cwd.join("package.json");
+    if !package_json.is_file() {
+        return Err(format!(
+            "node package base '{}' has no package.json; cannot resolve packages from it (set {NEO4J_JS_DRIVER_BASE_ENV} to another base if needed)",
+            cwd.display()
+        ));
+    }
     for package in packages {
         let args = vec![
             "-e".to_owned(),
-            format!("require.resolve('{package}/package.json')"),
+            format!(
+                "const {{ createRequire }} = require('node:module');\
+                 const requireFromBase = createRequire({base:?});\
+                 requireFromBase.resolve('{package}/package.json');",
+                base = package_json.display().to_string()
+            ),
         ];
         let output = run_command(node, &args, &[], cwd)
             .map_err(|error| format!("failed to probe node package '{package}': {error}"))?;
@@ -1076,6 +2245,141 @@ fn ensure_node_packages(node: &Path, cwd: &Path, packages: &[&str]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn capture_python_module_version(python: &Path, module: &str, cwd: &Path) -> Option<String> {
+    let args = vec![
+        "-c".to_owned(),
+        format!(
+            "import importlib.metadata; print(importlib.metadata.version('{module}'))"
+        ),
+    ];
+    capture_command_first_line(python, &args, cwd)
+}
+
+fn capture_node_package_version(node: &Path, base: &Path, package: &str) -> Option<String> {
+    let package_json = base.join("package.json");
+    let args = vec![
+        "-e".to_owned(),
+        format!(
+            "const {{ createRequire }} = require('node:module');\
+             const requireFromBase = createRequire({base:?});\
+             console.log(requireFromBase('{package}/package.json').version);",
+            base = package_json.display().to_string()
+        ),
+    ];
+    capture_command_first_line(node, &args, base)
+}
+
+fn capture_command_first_line(program: &Path, args: &[String], cwd: &Path) -> Option<String> {
+    let output = run_command(program, args, &[], cwd).ok()?;
+    if output.status_code != Some(0) {
+        return None;
+    }
+    normalized_lines(&output.stdout).into_iter().next()
+}
+
+fn infer_neo4j_java_driver_version(driver_jar: &Path) -> Option<String> {
+    let file_name = driver_jar.file_name()?.to_str()?;
+    let stripped = file_name
+        .strip_prefix("neo4j-java-driver-")?
+        .strip_suffix(".jar")?;
+    Some(stripped.to_owned())
+}
+
+fn java_classpath_entries(driver_jar: &Path) -> Vec<String> {
+    let mut entries = vec![driver_jar.display().to_string()];
+    let Some(parent) = driver_jar.parent() else {
+        return entries;
+    };
+    let Ok(read_dir) = fs::read_dir(parent) else {
+        return entries;
+    };
+    let mut sibling_jars = read_dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != driver_jar)
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jar"))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    sibling_jars.sort();
+    entries.extend(sibling_jars);
+    entries
+}
+
+fn attach_payload_metadata(record: &mut SuiteRecord, metadata: Value) {
+    let Some(meta_obj) = metadata.as_object() else {
+        return;
+    };
+    match record.payload.as_mut() {
+        Some(Value::Object(payload)) => {
+            for (key, value) in meta_obj {
+                payload.insert(key.clone(), value.clone());
+            }
+        }
+        Some(_) => {}
+        None => {
+            record.payload = Some(Value::Object(meta_obj.clone()));
+        }
+    }
+}
+
+fn resolve_node_package_base(workspace_root: &Path) -> PathBuf {
+    env::var_os(NEO4J_JS_DRIVER_BASE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target/compat/node-tools"))
+}
+
+fn resolve_program_override(env_key: &str, fallback_program: &str) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(env_key).map(PathBuf::from) {
+        return Some(path);
+    }
+    find_in_path(fallback_program)
+}
+
+fn resolve_neo4j_java_driver_jar(workspace_root: &Path) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(NEO4J_JAVA_DRIVER_JAR_ENV).map(PathBuf::from) {
+        return Some(path);
+    }
+    let compat_dir = workspace_root.join("target/compat/java-libs");
+    if let Some(path) = newest_matching_file(&compat_dir, "neo4j-java-driver-", "jar") {
+        return Some(path);
+    }
+    let m2_dir = env::var_os("HOME").map(PathBuf::from)?.join(".m2/repository/org/neo4j/driver");
+    newest_matching_file(&m2_dir, "neo4j-java-driver-", "jar")
+}
+
+fn newest_matching_file(root: &Path, prefix: &str, extension: &str) -> Option<PathBuf> {
+    if !root.exists() {
+        return None;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            if !file_name.starts_with(prefix)
+                || path.extension().and_then(|ext| ext.to_str()) != Some(extension)
+            {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            match &best {
+                Some((_, best_modified)) if modified <= *best_modified => {}
+                _ => best = Some((path, modified)),
+            }
+        }
+    }
+    best.map(|(path, _)| path)
 }
 
 fn resolve_prisma_command(workspace_root: &Path) -> Option<PathBuf> {
@@ -1128,6 +2432,32 @@ fn run_command(
     })
 }
 
+fn spawn_logged_process(
+    program: &Path,
+    args: &[String],
+    envs: &[(String, String)],
+    cwd: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<std::process::Child, String> {
+    let stdout = fs::File::create(stdout_path)
+        .map_err(|error| format!("creating {}: {error}", stdout_path.display()))?;
+    let stderr = fs::File::create(stderr_path)
+        .map_err(|error| format!("creating {}: {error}", stderr_path.display()))?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("{}: {error}", command_display(program, args)))
+}
+
 fn wait_for_server_ready(port: u16, error_slot: &Arc<Mutex<Option<String>>>) -> Result<(), String> {
     let deadline = Instant::now() + SERVER_READY_TIMEOUT;
     let addr = format!("{DEFAULT_HOST}:{port}");
@@ -1145,13 +2475,87 @@ fn wait_for_server_ready(port: u16, error_slot: &Arc<Mutex<Option<String>>>) -> 
     ))
 }
 
+fn wait_for_process_tcp_ready(
+    child: &mut std::process::Child,
+    port: u16,
+    timeout: Duration,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let addr = format!("{DEFAULT_HOST}:{port}");
+    while Instant::now() < deadline {
+        if TcpStream::connect(&addr).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to poll child process: {error}"))?
+        {
+            let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+            return Err(format!(
+                "process exited with status {:?}; stdout: {}; stderr: {}",
+                status.code(),
+                stdout,
+                stderr
+            ));
+        }
+        thread::sleep(SERVER_READY_POLL_INTERVAL);
+    }
+    Err(format!(
+        "timed out waiting for tcp listener on {addr} after {timeout:?}"
+    ))
+}
+
+fn stop_child_process(child: &mut std::process::Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            child
+                .kill()
+                .map_err(|error| format!("failed to kill child process: {error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("failed to wait for child process: {error}"))?;
+            Ok(())
+        }
+        Err(error) => Err(format!("failed to poll child process: {error}")),
+    }
+}
+
 fn reserve_tcp_port() -> Result<u16, String> {
-    let listener = TcpListener::bind((DEFAULT_HOST, 0))
-        .map_err(|error| format!("failed to reserve tcp port on {DEFAULT_HOST}: {error}"))?;
-    listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|error| format!("failed to read reserved tcp port: {error}"))
+    let mut last_error = None;
+    for attempt in 1..=TCP_PORT_RESERVE_ATTEMPTS {
+        match TcpListener::bind((DEFAULT_HOST, 0)) {
+            Ok(listener) => {
+                return listener
+                    .local_addr()
+                    .map(|addr| addr.port())
+                    .map_err(|error| format!("failed to read reserved tcp port: {error}"));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt != TCP_PORT_RESERVE_ATTEMPTS {
+                    thread::sleep(TCP_PORT_RESERVE_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to reserve tcp port on {DEFAULT_HOST} after {TCP_PORT_RESERVE_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_owned())
+    ))
+}
+
+fn reserve_distinct_tcp_port(used_ports: &[u16]) -> Result<u16, String> {
+    for _ in 0..16 {
+        let port = reserve_tcp_port()?;
+        if !used_ports.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err("failed to reserve a distinct tcp port".to_owned())
 }
 
 fn run_engine_sql(engine: &Engine, application_name: &str, sql: &str) -> Result<(), String> {
@@ -1256,6 +2660,8 @@ fn build_history_entry(report: &EcosystemCompatReport) -> Value {
         "git_commit_short": report.git_commit_short,
         "git_dirty": report.git_dirty,
         "listen_addr": report.listen_addr,
+        "group_filter": report.group_filter,
+        "group_summary": report.group_summary,
         "strict": report.strict,
         "summary": {
             "passed": report.summary.passed,
@@ -1263,6 +2669,96 @@ fn build_history_entry(report: &EcosystemCompatReport) -> Value {
             "skipped": report.summary.skipped,
         },
         "suites": suites,
+    })
+}
+
+fn build_group_summary(group_filter: Option<&str>, records: &[SuiteRecord]) -> Option<GroupSummary> {
+    let name = group_filter?;
+    let blocked_suites = records
+        .iter()
+        .filter(|record| !matches!(record.status, SuiteStatus::Passed))
+        .map(|record| record.name.clone())
+        .collect::<Vec<_>>();
+    let provisioning_hints = records
+        .iter()
+        .filter_map(|record| {
+            let payload = record.payload.as_ref()?;
+            let env = payload.get("provisioning_env")?.as_str()?.to_owned();
+            let tool = payload
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Some(ProvisioningHint {
+                suite: record.name.clone(),
+                tool,
+                env,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let experimental_passed = records
+        .iter()
+        .filter(|record| {
+            matches!(record.status, SuiteStatus::Passed)
+                && record
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("validation_state"))
+                    .and_then(Value::as_str)
+                    == Some("experimental")
+        })
+        .count();
+    let target_pending_provisioning = records
+        .iter()
+        .filter(|record| {
+            matches!(record.status, SuiteStatus::Skipped)
+                && record
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("validation_state"))
+                    .and_then(Value::as_str)
+                    == Some("target")
+                && record
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("provisioning_env"))
+                    .and_then(Value::as_str)
+                    .is_some()
+        })
+        .count();
+    let failed = records
+        .iter()
+        .filter(|record| matches!(record.status, SuiteStatus::Failed))
+        .count();
+    let skipped = records
+        .iter()
+        .filter(|record| matches!(record.status, SuiteStatus::Skipped))
+        .count();
+    let passed = records
+        .iter()
+        .filter(|record| matches!(record.status, SuiteStatus::Passed))
+        .count();
+    let fully_validated = failed == 0 && skipped == 0;
+    let group_status = if failed > 0 {
+        "failing"
+    } else if skipped > 0 {
+        "partial"
+    } else {
+        "passing"
+    };
+
+    Some(GroupSummary {
+        name: name.to_owned(),
+        group_status,
+        suites_total: records.len(),
+        passed,
+        failed,
+        skipped,
+        experimental_passed,
+        target_pending_provisioning,
+        blocked_suites,
+        fully_validated,
+        provisioning_hints,
     })
 }
 
@@ -1332,6 +2828,27 @@ fn print_report_summary(report: &EcosystemCompatReport) {
         "summary: {} passed, {} failed, {} skipped",
         report.summary.passed, report.summary.failed, report.summary.skipped
     );
+    if let Some(group) = report.group_summary.as_ref() {
+        println!(
+            "group: {} status={}, fully_validated={}, blocked_suites={}",
+            group.name,
+            group.group_status,
+            group.fully_validated,
+            group.blocked_suites.join(",")
+        );
+        if !group.provisioning_hints.is_empty() {
+            let hints = group
+                .provisioning_hints
+                .iter()
+                .map(|hint| match hint.tool.as_deref() {
+                    Some(tool) => format!("{tool}->{env}", env = hint.env),
+                    None => format!("{}->{}", hint.suite, hint.env),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("group_provisioning_hints: {hints}");
+        }
+    }
     for suite in &report.suites {
         println!(
             "- {:<22} {:<7} {}",
@@ -1513,6 +3030,7 @@ mod tests {
         .expect("args should parse");
 
         assert_eq!(opts.suite_filter.as_deref(), Some("psql-libpq"));
+        assert_eq!(opts.group_filter, None);
         assert_eq!(opts.report_path, PathBuf::from("tmp/report.json"));
         assert!(opts.strict);
         assert!(!opts.list_only);
@@ -1524,6 +3042,57 @@ mod tests {
         let error = parse_args(&["--suite".to_owned(), "missing".to_owned()])
             .expect_err("unknown suite should fail");
         assert!(error.contains("unknown suite"));
+    }
+
+    #[test]
+    fn parse_args_accepts_known_group() {
+        let opts = parse_args(&[
+            "--group".to_owned(),
+            "neo4j-p0".to_owned(),
+            "--report".to_owned(),
+            "target/compat/neo4j-p0-smoke.json".to_owned(),
+        ])
+        .expect("group args should parse");
+
+        assert_eq!(opts.suite_filter, None);
+        assert_eq!(opts.group_filter.as_deref(), Some("neo4j-p0"));
+        assert_eq!(
+            opts.report_path,
+            PathBuf::from("target/compat/neo4j-p0-smoke.json")
+        );
+
+        let opts = parse_args(&[
+            "--group".to_owned(),
+            "neo4j-http-p1".to_owned(),
+        ])
+        .expect("http group args should parse");
+        assert_eq!(opts.group_filter.as_deref(), Some("neo4j-http-p1"));
+
+        let opts = parse_args(&[
+            "--group".to_owned(),
+            "neo4j-browser-p0".to_owned(),
+        ])
+        .expect("browser group args should parse");
+        assert_eq!(opts.group_filter.as_deref(), Some("neo4j-browser-p0"));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_group() {
+        let error = parse_args(&["--group".to_owned(), "missing".to_owned()])
+            .expect_err("unknown group should fail");
+        assert!(error.contains("unknown group"));
+    }
+
+    #[test]
+    fn parse_args_rejects_suite_and_group_together() {
+        let error = parse_args(&[
+            "--suite".to_owned(),
+            "psql-libpq".to_owned(),
+            "--group".to_owned(),
+            "neo4j-p0".to_owned(),
+        ])
+        .expect_err("suite and group together should fail");
+        assert!(error.contains("either --suite or --group"));
     }
 
     #[test]
@@ -1593,6 +3162,24 @@ mod tests {
             git_commit_short: Some("abcdef012345".to_owned()),
             git_dirty: Some(false),
             listen_addr: "127.0.0.1:55555".to_owned(),
+            group_filter: Some("neo4j-p0".to_owned()),
+            group_summary: Some(GroupSummary {
+                name: "neo4j-p0".to_owned(),
+                group_status: "partial",
+                suites_total: 2,
+                passed: 1,
+                failed: 0,
+                skipped: 1,
+                experimental_passed: 1,
+                target_pending_provisioning: 1,
+                blocked_suites: vec!["neo4j-javascript-bolt".to_owned()],
+                fully_validated: false,
+                provisioning_hints: vec![ProvisioningHint {
+                    suite: "neo4j-javascript-bolt".to_owned(),
+                    tool: Some("neo4j-javascript-driver".to_owned()),
+                    env: "AIONDB_NEO4J_JS_DRIVER_BASE".to_owned(),
+                }],
+            }),
             strict: true,
             report_path: "tmp/clean_prod/ecosystem_compat.json".to_owned(),
             history_path: Some("tmp/clean_prod/ecosystem_compat_history.jsonl".to_owned()),
@@ -1635,6 +3222,10 @@ mod tests {
         assert_eq!(entry["summary"]["skipped"], json!(1));
         assert_eq!(entry["git_commit_short"], json!("abcdef012345"));
         assert_eq!(entry["git_dirty"], json!(false));
+        assert_eq!(entry["group_filter"], json!("neo4j-p0"));
+        assert_eq!(entry["group_summary"]["name"], json!("neo4j-p0"));
+        assert_eq!(entry["group_summary"]["group_status"], json!("partial"));
+        assert_eq!(entry["group_summary"]["experimental_passed"], json!(1));
         assert_eq!(
             entry["generated_at_iso8601"],
             json!("1970-01-01T00:00:01.000Z")
@@ -1658,6 +3249,8 @@ mod tests {
             git_commit_short: None,
             git_dirty: None,
             listen_addr: "127.0.0.1:0".to_owned(),
+            group_filter: None,
+            group_summary: None,
             strict: false,
             report_path: "/dev/null".to_owned(),
             history_path: Some(path.display().to_string()),
@@ -1681,5 +3274,116 @@ mod tests {
                 json!("1970-01-01T00:00:00.001Z")
             );
         }
+    }
+
+    #[test]
+    fn build_group_summary_tracks_provisioning_hints() {
+        let records = vec![
+            SuiteRecord {
+                name: "neo4j-python-bolt".to_owned(),
+                description: String::new(),
+                status: SuiteStatus::Passed,
+                duration_ms: 1,
+                details: String::new(),
+                checks: vec![],
+                command: None,
+                payload: Some(json!({
+                    "tool": "neo4j-python-driver",
+                    "validation_state": "experimental",
+                })),
+                stdout: None,
+                stderr: None,
+            },
+            SuiteRecord {
+                name: "neo4j-javascript-bolt".to_owned(),
+                description: String::new(),
+                status: SuiteStatus::Skipped,
+                duration_ms: 1,
+                details: String::new(),
+                checks: vec![],
+                command: None,
+                payload: Some(json!({
+                    "tool": "neo4j-javascript-driver",
+                    "validation_state": "target",
+                    "provisioning_env": "AIONDB_NEO4J_JS_DRIVER_BASE",
+                })),
+                stdout: None,
+                stderr: None,
+            },
+        ];
+
+        let summary = build_group_summary(Some("neo4j-p0"), &records).expect("group summary");
+        assert_eq!(summary.name, "neo4j-p0");
+        assert_eq!(summary.group_status, "partial");
+        assert_eq!(summary.experimental_passed, 1);
+        assert_eq!(summary.target_pending_provisioning, 1);
+        assert_eq!(summary.blocked_suites, vec!["neo4j-javascript-bolt".to_owned()]);
+        assert!(!summary.fully_validated);
+        assert_eq!(summary.provisioning_hints.len(), 1);
+        assert_eq!(
+            summary.provisioning_hints[0].env,
+            "AIONDB_NEO4J_JS_DRIVER_BASE"
+        );
+    }
+
+    #[test]
+    fn build_group_summary_marks_single_http_suite_as_passing() {
+        let records = vec![SuiteRecord {
+            name: "neo4j-query-api-http".to_owned(),
+            description: String::new(),
+            status: SuiteStatus::Passed,
+            duration_ms: 1,
+            details: String::new(),
+            checks: vec![],
+            command: None,
+            payload: Some(json!({
+                "tool": "neo4j-query-api-wrapper",
+                "validation_state": "experimental",
+                "surface": "query_api_wrapper",
+            })),
+            stdout: None,
+            stderr: None,
+        }];
+
+        let summary =
+            build_group_summary(Some("neo4j-http-p1"), &records).expect("http group summary");
+        assert_eq!(summary.name, "neo4j-http-p1");
+        assert_eq!(summary.group_status, "passing");
+        assert_eq!(summary.experimental_passed, 1);
+        assert_eq!(summary.target_pending_provisioning, 0);
+        assert!(summary.blocked_suites.is_empty());
+        assert!(summary.fully_validated);
+        assert!(summary.provisioning_hints.is_empty());
+    }
+
+    #[test]
+    fn build_group_summary_marks_browser_preflight_group_as_passing() {
+        let records = vec![SuiteRecord {
+            name: "neo4j-browser-preflight-bolt".to_owned(),
+            description: String::new(),
+            status: SuiteStatus::Passed,
+            duration_ms: 1,
+            details: String::new(),
+            checks: vec![],
+            command: None,
+            payload: Some(json!({
+                "tool": "neo4j-browser",
+                "validation_state": "target",
+                "surface": "bolt_compat",
+                "evidence_kind": "browser_preflight_procedures",
+            })),
+            stdout: None,
+            stderr: None,
+        }];
+
+        let summary = build_group_summary(Some("neo4j-browser-p0"), &records)
+            .expect("browser group summary");
+        assert_eq!(summary.name, "neo4j-browser-p0");
+        assert_eq!(summary.group_status, "passing");
+        assert_eq!(summary.experimental_passed, 0);
+        assert_eq!(summary.target_pending_provisioning, 0);
+        assert!(summary.blocked_suites.is_empty());
+        assert!(summary.fully_validated);
+        assert!(summary.provisioning_hints.is_empty());
     }
 }

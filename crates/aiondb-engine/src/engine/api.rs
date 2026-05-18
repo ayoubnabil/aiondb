@@ -592,6 +592,78 @@ pub trait QueryEngine: Send + Sync {
     fn commit_transaction(&self, session: &SessionHandle) -> DbResult<()>;
     fn rollback_transaction(&self, session: &SessionHandle) -> DbResult<()>;
     fn execute_sql(&self, session: &SessionHandle, sql: &str) -> DbResult<Vec<StatementResult>>;
+    fn execute_explain_graph_summary_json(
+        &self,
+        session: &SessionHandle,
+        sql: &str,
+        analyze: bool,
+    ) -> DbResult<serde_json::Value> {
+        let explain_sql = if analyze {
+            format!("EXPLAIN ANALYZE {sql}")
+        } else {
+            format!("EXPLAIN {sql}")
+        };
+        let results = self.execute_sql(session, &explain_sql)?;
+        let result = results
+            .first()
+            .ok_or_else(|| DbError::internal("EXPLAIN did not return a query result"))?;
+        let StatementResult::Query { rows, .. } = result else {
+            return Err(DbError::internal("EXPLAIN did not return a query result"));
+        };
+        let lines = rows
+            .iter()
+            .filter_map(|row| match row.values.as_slice() {
+                [Value::Text(line)] => Some(line.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let payload = lines
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("Graph Summary JSON:")
+                    .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload.trim()).ok())
+            })
+            .ok_or_else(|| {
+                DbError::internal("EXPLAIN output did not contain Graph Summary JSON payload")
+            })?;
+        Ok(payload)
+    }
+    fn execute_explain_graph_detail_json(
+        &self,
+        session: &SessionHandle,
+        sql: &str,
+        analyze: bool,
+    ) -> DbResult<serde_json::Value> {
+        let explain_sql = if analyze {
+            format!("EXPLAIN ANALYZE {sql}")
+        } else {
+            format!("EXPLAIN {sql}")
+        };
+        let results = self.execute_sql(session, &explain_sql)?;
+        let result = results
+            .first()
+            .ok_or_else(|| DbError::internal("EXPLAIN did not return a query result"))?;
+        let StatementResult::Query { rows, .. } = result else {
+            return Err(DbError::internal("EXPLAIN did not return a query result"));
+        };
+        let lines = rows
+            .iter()
+            .filter_map(|row| match row.values.as_slice() {
+                [Value::Text(line)] => Some(line.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let payload = lines
+            .iter()
+            .find_map(|line| {
+                line.strip_prefix("Graph Detail JSON:")
+                    .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload.trim()).ok())
+            })
+            .ok_or_else(|| {
+                DbError::internal("EXPLAIN output did not contain Graph Detail JSON payload")
+            })?;
+        Ok(payload)
+    }
     /// Optional fast-path used by EXPLAIN-driven check_estimated_rows
     /// regression helpers. Default returns `Ok(None)` so engines that
     /// don't model EXPLAIN output fall back to standard execution.

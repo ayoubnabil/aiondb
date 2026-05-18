@@ -227,6 +227,8 @@ pub struct ExecutionContext {
     pub sequence_lookup_cache: Arc<Mutex<HashMap<String, SequenceId>>>,
     pub table_index_cache: Arc<Mutex<HashMap<RelationId, Vec<IndexDescriptor>>>>,
     pub statement_tuple_writes: Arc<Mutex<HashSet<(RelationId, TupleId)>>>,
+    pub graph_profile_actual_rows: Arc<Mutex<HashMap<String, u64>>>,
+    pub graph_profile_elapsed_nanos: Arc<Mutex<HashMap<String, u64>>>,
     pub udf_depth: Arc<AtomicU32>,
     /// Counts how deeply trigger invocations are nested in the current
     /// statement. Triggers that fire DML which fires triggers can recurse
@@ -297,6 +299,8 @@ impl ExecutionContext {
             sequence_lookup_cache: Arc::new(Mutex::new(HashMap::new())),
             table_index_cache: Arc::new(Mutex::new(HashMap::new())),
             statement_tuple_writes: Arc::new(Mutex::new(HashSet::new())),
+            graph_profile_actual_rows: Arc::new(Mutex::new(HashMap::new())),
+            graph_profile_elapsed_nanos: Arc::new(Mutex::new(HashMap::new())),
             udf_depth: Arc::new(AtomicU32::new(0)),
             trigger_depth: Arc::new(AtomicU32::new(0)),
             fk_cascade_depth: Arc::new(AtomicU32::new(0)),
@@ -399,6 +403,54 @@ impl ExecutionContext {
         })?;
         cache.insert(table_id, indexes);
         Ok(())
+    }
+
+    pub fn record_graph_profile_actual_rows(&self, key: &str, actual_rows: u64) -> DbResult<()> {
+        let mut counters = self.graph_profile_actual_rows.lock().map_err(|e| {
+            DbError::internal(format!(
+                "execution context graph profile counters lock poisoned: {e}"
+            ))
+        })?;
+        let entry = counters.entry(key.to_owned()).or_insert(0);
+        *entry = entry.saturating_add(actual_rows);
+        Ok(())
+    }
+
+    pub fn snapshot_graph_profile_actual_rows(&self) -> DbResult<HashMap<String, u64>> {
+        self.graph_profile_actual_rows
+            .lock()
+            .map_err(|e| {
+                DbError::internal(format!(
+                    "execution context graph profile counters lock poisoned: {e}"
+                ))
+            })
+            .map(|counters| counters.clone())
+    }
+
+    pub fn record_graph_profile_elapsed_nanos(
+        &self,
+        key: &str,
+        elapsed_nanos: u64,
+    ) -> DbResult<()> {
+        let mut counters = self.graph_profile_elapsed_nanos.lock().map_err(|e| {
+            DbError::internal(format!(
+                "execution context graph profile timings lock poisoned: {e}"
+            ))
+        })?;
+        let entry = counters.entry(key.to_owned()).or_insert(0);
+        *entry = entry.saturating_add(elapsed_nanos);
+        Ok(())
+    }
+
+    pub fn snapshot_graph_profile_elapsed_nanos(&self) -> DbResult<HashMap<String, u64>> {
+        self.graph_profile_elapsed_nanos
+            .lock()
+            .map_err(|e| {
+                DbError::internal(format!(
+                    "execution context graph profile timings lock poisoned: {e}"
+                ))
+            })
+            .map(|counters| counters.clone())
     }
 
     pub fn current_session_setting(
@@ -875,6 +927,8 @@ impl Default for ExecutionContext {
             sequence_lookup_cache: Arc::new(Mutex::new(HashMap::new())),
             table_index_cache: Arc::new(Mutex::new(HashMap::new())),
             statement_tuple_writes: Arc::new(Mutex::new(HashSet::new())),
+            graph_profile_actual_rows: Arc::new(Mutex::new(HashMap::new())),
+            graph_profile_elapsed_nanos: Arc::new(Mutex::new(HashMap::new())),
             udf_depth: Arc::new(AtomicU32::new(0)),
             trigger_depth: Arc::new(AtomicU32::new(0)),
             fk_cascade_depth: Arc::new(AtomicU32::new(0)),

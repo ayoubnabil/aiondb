@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use aiondb_core::{DbError, DbResult, RelationId, Value};
@@ -16,8 +17,11 @@ use crate::executor::graph_plans::{
     build_graph_filter_conjuncts, collect_graph_filter_conjuncts,
     compact_graph_binding_node_payloads, compact_node_bound_value, estimate_binding_row_bytes,
     exact_column_literal_equality, extract_column_literal_range, flip_relationship_direction,
-    graph_filter_node_id_inequality_peers, pick_match_pivot_index, retain_graph_binding_variables,
-    BindingRow, BoundValue, GraphBindingReduction, GraphFilterConjunct, GraphMatchRuntimeCache,
+    graph_access_clause_profile_input_key, graph_access_clause_profile_output_key,
+    graph_access_clause_profile_time_key, graph_access_pattern_profile_time_key,
+    graph_access_profile_key, graph_filter_node_id_inequality_peers, pick_match_pivot_index,
+    retain_graph_binding_variables, BindingRow, BoundValue, GraphBindingReduction,
+    GraphFilterConjunct, GraphMatchRuntimeCache,
 };
 
 fn materialize_named_path_pattern(pattern: &CypherPattern) -> CypherPattern {
@@ -549,6 +553,8 @@ impl Executor {
         &self,
         context: &ExecutionContext,
         patterns: &[CypherPattern],
+        clause_label: &'static str,
+        clause_index: usize,
         input_binding: &BindingRow,
         filter_conjuncts: &[GraphFilterConjunct<'a>],
         required_output_variables: Option<&HashSet<String>>,
@@ -638,6 +644,7 @@ impl Executor {
                                 if can_use_id_inequality_semijoin {
                                     let probe_var = probe_branch_var.expect("checked above");
                                     let target_var = target_branch_var.expect("checked above");
+                                    let target_pattern_started_at = Instant::now();
                                     let target_branch_filter_conjuncts =
                                         filter_conjuncts_for_star_branch(
                                             target_pattern,
@@ -673,7 +680,27 @@ impl Executor {
                                     };
                                     let target_bindings =
                                         dedup_bindings_by_node_id(&target_bindings, target_var);
+                                    context.record_graph_profile_actual_rows(
+                                        &graph_access_profile_key(
+                                            clause_label,
+                                            clause_index,
+                                            target_branch_idx,
+                                        ),
+                                        u64::try_from(target_bindings.len()).unwrap_or(u64::MAX),
+                                    )?;
+                                    context.record_graph_profile_elapsed_nanos(
+                                        &graph_access_pattern_profile_time_key(
+                                            clause_label,
+                                            clause_index,
+                                            target_branch_idx,
+                                        ),
+                                        u64::try_from(
+                                            target_pattern_started_at.elapsed().as_nanos(),
+                                        )
+                                        .unwrap_or(u64::MAX),
+                                    )?;
 
+                                    let probe_pattern_started_at = Instant::now();
                                     let probe_branch_filter_conjuncts =
                                         filter_conjuncts_for_star_branch(
                                             probe_pattern,
@@ -699,8 +726,28 @@ impl Executor {
                                         }
                                     }
                                     if probe_ids.is_empty() {
+                                        context.record_graph_profile_actual_rows(
+                                            &graph_access_profile_key(
+                                                clause_label,
+                                                clause_index,
+                                                probe_branch_idx,
+                                            ),
+                                            0,
+                                        )?;
+                                        context.record_graph_profile_elapsed_nanos(
+                                            &graph_access_pattern_profile_time_key(
+                                                clause_label,
+                                                clause_index,
+                                                probe_branch_idx,
+                                            ),
+                                            u64::try_from(
+                                                probe_pattern_started_at.elapsed().as_nanos(),
+                                            )
+                                            .unwrap_or(u64::MAX),
+                                        )?;
                                         continue;
                                     }
+                                    let output_before = output.len();
                                     for target_binding in &target_bindings {
                                         let Some(target_id) =
                                             binding_node_id_key(target_binding, target_var)
@@ -711,10 +758,31 @@ impl Executor {
                                             output.push(target_binding.clone());
                                         }
                                     }
+                                    context.record_graph_profile_actual_rows(
+                                        &graph_access_profile_key(
+                                            clause_label,
+                                            clause_index,
+                                            probe_branch_idx,
+                                        ),
+                                        u64::try_from(output.len().saturating_sub(output_before))
+                                            .unwrap_or(u64::MAX),
+                                    )?;
+                                    context.record_graph_profile_elapsed_nanos(
+                                        &graph_access_pattern_profile_time_key(
+                                            clause_label,
+                                            clause_index,
+                                            probe_branch_idx,
+                                        ),
+                                        u64::try_from(
+                                            probe_pattern_started_at.elapsed().as_nanos(),
+                                        )
+                                        .unwrap_or(u64::MAX),
+                                    )?;
                                     continue;
                                 }
                                 let mut branch_bindings = Vec::with_capacity(2);
-                                for pattern in patterns {
+                                for (pattern_idx, pattern) in patterns.iter().enumerate() {
+                                    let pattern_started_at = Instant::now();
                                     let branch_filter_conjuncts = filter_conjuncts_for_star_branch(
                                         pattern,
                                         &base_variables,
@@ -767,10 +835,28 @@ impl Executor {
                                                 runtime_cache,
                                             )?
                                         };
+                                    context.record_graph_profile_actual_rows(
+                                        &graph_access_profile_key(
+                                            clause_label,
+                                            clause_index,
+                                            pattern_idx,
+                                        ),
+                                        u64::try_from(matched_branch.len()).unwrap_or(u64::MAX),
+                                    )?;
+                                    context.record_graph_profile_elapsed_nanos(
+                                        &graph_access_pattern_profile_time_key(
+                                            clause_label,
+                                            clause_index,
+                                            pattern_idx,
+                                        ),
+                                        u64::try_from(pattern_started_at.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    )?;
                                     branch_bindings.push(matched_branch);
                                 }
                                 let target_bindings = &branch_bindings[target_branch_idx];
                                 let probe_bindings = &branch_bindings[probe_branch_idx];
+                                let output_before = output.len();
                                 for target_binding in target_bindings {
                                     let mut matched = None;
                                     for probe_binding in probe_bindings {
@@ -790,6 +876,15 @@ impl Executor {
                                         output.push(binding);
                                     }
                                 }
+                                context.record_graph_profile_actual_rows(
+                                    &graph_access_profile_key(
+                                        clause_label,
+                                        clause_index,
+                                        probe_branch_idx,
+                                    ),
+                                    u64::try_from(output.len().saturating_sub(output_before))
+                                        .unwrap_or(u64::MAX),
+                                )?;
                                 continue;
                             }
                         }
@@ -807,7 +902,8 @@ impl Executor {
             retain_graph_binding_variables(&mut star_seed, &star_seed_keep);
             compact_graph_binding_node_payloads(&mut star_seed);
             let mut combined_bindings = vec![star_seed];
-            for pattern in patterns {
+            for (pattern_idx, pattern) in patterns.iter().enumerate() {
+                let pattern_started_at = Instant::now();
                 let mut branch_allowed_vars = base_variables.clone();
                 collect_pattern_binding_variables(pattern, &mut branch_allowed_vars);
                 let branch_filter_conjuncts = filter_conjuncts
@@ -882,6 +978,18 @@ impl Executor {
                     )?
                 };
                 combined_bindings = next_combined;
+                context.record_graph_profile_actual_rows(
+                    &graph_access_profile_key(clause_label, clause_index, pattern_idx),
+                    u64::try_from(combined_bindings.len()).unwrap_or(u64::MAX),
+                )?;
+                context.record_graph_profile_elapsed_nanos(
+                    &graph_access_pattern_profile_time_key(
+                        clause_label,
+                        clause_index,
+                        pattern_idx,
+                    ),
+                    u64::try_from(pattern_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                )?;
                 if combined_bindings.is_empty() {
                     break;
                 }
@@ -1171,10 +1279,17 @@ impl Executor {
         &self,
         context: &ExecutionContext,
         clause: &CypherMatchClause,
+        clause_label: &'static str,
+        clause_index: usize,
         input_bindings: Vec<BindingRow>,
         required_output_variables: Option<&HashSet<String>>,
         binding_reduction: Option<&GraphBindingReduction>,
     ) -> DbResult<Vec<BindingRow>> {
+        let clause_started_at = Instant::now();
+        context.record_graph_profile_actual_rows(
+            &graph_access_clause_profile_input_key(clause_label, clause_index),
+            u64::try_from(input_bindings.len()).unwrap_or(u64::MAX),
+        )?;
         let col_count_cache: HashMap<RelationId, usize> = if clause.optional {
             let mut cache = HashMap::new();
             for pattern in &clause.patterns {
@@ -1271,6 +1386,8 @@ impl Executor {
             } else if let Some(bindings) = self.try_match_shared_anchor_star(
                 context,
                 patterns,
+                clause_label,
+                clause_index,
                 input_binding,
                 &pending_filter_conjuncts,
                 required_output_variables,
@@ -1284,6 +1401,7 @@ impl Executor {
 
             if !used_star_path {
                 for (pattern_idx, pattern) in patterns.iter().enumerate() {
+                    let pattern_started_at = Instant::now();
                     validate_named_path_pattern(pattern)?;
                     let materialized_pattern;
                     let pattern = if pattern.path_variable.is_some() {
@@ -1301,6 +1419,18 @@ impl Executor {
                         &mut runtime_cache,
                     )?;
                     current_bindings = bind_named_path_variable(pattern, current_bindings);
+                    context.record_graph_profile_actual_rows(
+                        &graph_access_profile_key(clause_label, clause_index, pattern_idx),
+                        u64::try_from(current_bindings.len()).unwrap_or(u64::MAX),
+                    )?;
+                    context.record_graph_profile_elapsed_nanos(
+                        &graph_access_pattern_profile_time_key(
+                            clause_label,
+                            clause_index,
+                            pattern_idx,
+                        ),
+                        u64::try_from(pattern_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    )?;
                     Self::prune_applied_graph_filter_conjuncts(
                         &current_bindings,
                         &mut pending_filter_conjuncts,
@@ -1323,8 +1453,11 @@ impl Executor {
                 }
             }
 
-            if clause.filter.is_some() && !pending_filter_conjuncts.is_empty() {
-                let filter = clause.filter.as_ref().expect("filter exists");
+            if let Some(filter) = clause
+                .filter
+                .as_ref()
+                .filter(|_| !pending_filter_conjuncts.is_empty())
+            {
                 let mut filtered = Vec::new();
                 for binding in current_bindings {
                     match self.evaluate_graph_predicate(context, filter, &binding) {
@@ -1465,9 +1598,26 @@ impl Executor {
                 crate::executor::graph_plans::compare_cypher_sort_keys(a_keys, b_keys, order_by)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            let output_rows = top_rows.len();
+            context.record_graph_profile_actual_rows(
+                &graph_access_clause_profile_output_key(clause_label, clause_index),
+                u64::try_from(output_rows).unwrap_or(u64::MAX),
+            )?;
+            context.record_graph_profile_elapsed_nanos(
+                &graph_access_clause_profile_time_key(clause_label, clause_index),
+                u64::try_from(clause_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            )?;
             return Ok(top_rows.into_iter().map(|(_, binding)| binding).collect());
         }
 
+        context.record_graph_profile_actual_rows(
+            &graph_access_clause_profile_output_key(clause_label, clause_index),
+            u64::try_from(result_bindings.len()).unwrap_or(u64::MAX),
+        )?;
+        context.record_graph_profile_elapsed_nanos(
+            &graph_access_clause_profile_time_key(clause_label, clause_index),
+            u64::try_from(clause_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        )?;
         Ok(result_bindings)
     }
 

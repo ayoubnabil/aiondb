@@ -338,6 +338,7 @@ fn parses_explain_analyze_select() {
     let statement = parse_prepared_statement("EXPLAIN ANALYZE SELECT 1 AS one").expect("parse");
     let Statement::Explain {
         analyze,
+        format_json,
         statement: inner,
         ..
     } = statement
@@ -346,6 +347,45 @@ fn parses_explain_analyze_select() {
     };
 
     assert!(analyze);
+    assert!(!format_json);
+    assert!(matches!(*inner, Statement::Select(_)));
+}
+
+#[test]
+fn parses_explain_format_json_select() {
+    let statement =
+        parse_prepared_statement("EXPLAIN (FORMAT JSON) SELECT 1 AS one").expect("parse");
+    let Statement::Explain {
+        analyze,
+        format_json,
+        statement: inner,
+        ..
+    } = statement
+    else {
+        panic!("expected explain");
+    };
+
+    assert!(!analyze);
+    assert!(format_json);
+    assert!(matches!(*inner, Statement::Select(_)));
+}
+
+#[test]
+fn parses_explain_analyze_format_json_select() {
+    let statement = parse_prepared_statement("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 AS one")
+        .expect("parse");
+    let Statement::Explain {
+        analyze,
+        format_json,
+        statement: inner,
+        ..
+    } = statement
+    else {
+        panic!("expected explain");
+    };
+
+    assert!(analyze);
+    assert!(format_json);
     assert!(matches!(*inner, Statement::Select(_)));
 }
 

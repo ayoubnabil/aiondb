@@ -81,6 +81,38 @@ CI runs `make product-smoke` in the Product Surface job and uploads
 artifact. The upload action is pinned by commit. Use that artifact for review
 evidence; cut public release assets from a clean tagged checkout.
 
+For the current graph/interop surface, also review the grouped HTTP
+compatibility artifact produced by the smoke gate:
+
+- `target/compat/neo4j-http-p1-smoke.json`
+
+That report should remain `group_status = "passing"` before the release line is
+described as carrying experimental Neo4j Query API wrapper support.
+
+For the broader Neo4j-oriented Bolt surface, keep the grouped P0 artifact as
+review evidence, but not yet as a hard release gate:
+
+- `target/compat/neo4j-p0-smoke.json`
+- `target/compat/neo4j-browser-p0-smoke.json`
+
+At the current maturity level, that report should be reviewed in one of two
+honest states:
+
+- `group_status = "passing"` when the local JavaScript driver, Java driver, and
+  `cypher-shell` provisioning inputs are present and the four-tool P0 wave is
+  rerun end-to-end;
+- `group_status = "partial"` only when some optional local client provisioning
+  inputs are missing, as long as:
+  - the passing Python, JavaScript, and Java driver smokes stay green;
+  - the remaining blocked suites are clearly provisioned through
+    `group_summary.provisioning_hints`;
+  - release notes do not overclaim official Neo4j driver or tool coverage.
+
+For Neo4j Browser specifically, `target/compat/neo4j-browser-p0-smoke.json`
+may be reviewed as supplemental evidence when `AIONDB_CYPHER_SHELL` is
+provisioned locally. Treat it strictly as **Browser preflight** evidence, not
+as full Browser UI validation.
+
 Check workflow action pinning explicitly:
 
 ```bash
@@ -109,12 +141,17 @@ make product-smoke
 
 This is the local release-candidate smoke gate. It runs formatting checks,
 workspace compilation, CI policy checks, storage compatibility tests,
-observability route tests, CLI dump/restore checks, static documentation
-generation with local link checking, package reproducibility checks, verified
-package creation, and local release artifact collection. It also validates the
-local deployment profiles. It does not replace full CI, clippy, coverage,
-ecosystem
-compatibility, or long-running benchmarks.
+observability route tests, `EXPLAIN (FORMAT JSON)` / `EXPLAIN (ANALYZE, FORMAT JSON)`
+surface checks, the grouped `neo4j-http-p1` Query API compatibility smoke,
+and, when local client provisioning is present, the grouped `neo4j-p0`
+Bolt compatibility smoke. When `AIONDB_CYPHER_SHELL` is present, it also runs
+the grouped `neo4j-browser-p0` Browser preflight smoke. It also runs CLI
+dump/restore checks, static documentation generation with local link checking,
+package reproducibility checks, verified package creation, and local release
+artifact collection. It validates the local deployment profiles as well. It
+does not replace full CI, clippy, coverage, the broader Bolt-oriented Neo4j
+ecosystem matrix when the optional clients are absent, or long-running
+benchmarks.
 
 ## Release notes
 
@@ -128,6 +165,12 @@ The release notes should include:
 - upgrade warning for alpha data directories.
 
 Release notes should avoid vague claims. Prefer "pgwire server surface is available for evaluation" over "PostgreSQL compatible database" unless the compatibility matrix supports the broader claim.
+
+If `EXPLAIN (FORMAT JSON)` is described as a supported surface, release notes should keep that contract narrow and explicit:
+
+- it is an AionDB-native versioned payload;
+- it is suitable for local tooling and evaluation;
+- it is not a cross-database interoperability format.
 
 ## Benchmark checks
 

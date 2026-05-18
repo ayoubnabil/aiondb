@@ -163,6 +163,7 @@ pub(in crate::engine) fn statement_wire_effective_statement_for_statement(
 ) -> DbResult<aiondb_parser::Statement> {
     if let Statement::Explain {
         analyze,
+        format_json,
         statement: inner,
         span,
     } = statement
@@ -174,6 +175,7 @@ pub(in crate::engine) fn statement_wire_effective_statement_for_statement(
         if resolved != **inner {
             return Ok(Statement::Explain {
                 analyze: *analyze,
+                format_json: *format_json,
                 statement: Box::new(resolved),
                 span: *span,
             });

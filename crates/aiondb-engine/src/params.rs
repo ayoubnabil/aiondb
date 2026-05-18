@@ -362,10 +362,12 @@ pub(crate) fn bind_statement_params(
         Statement::Lock(lock) => Ok(Statement::Lock(lock.clone())),
         Statement::Explain {
             analyze,
+            format_json,
             statement: inner,
             span,
         } => Ok(Statement::Explain {
             analyze: *analyze,
+            format_json: *format_json,
             statement: Box::new(bind_statement_params(inner, params, expected_types)?),
             span: *span,
         }),

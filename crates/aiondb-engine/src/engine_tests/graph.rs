@@ -281,6 +281,422 @@ fn explain_match_includes_graph_access_lines() {
 }
 
 #[test]
+fn explain_analyze_match_includes_graph_actual_rows() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_analyze (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_analyze (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_analyze VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_analyze VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_analyze ON people_explain_analyze; \
+             CREATE EDGE LABEL knows_explain_analyze ON knows_explain_analyze SOURCE person_explain_analyze TARGET person_explain_analyze",
+        )
+        .expect("setup graph explain analyze tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_analyze)-[:knows_explain_analyze]->(b:person_explain_analyze) RETURN b.id",
+        )
+        .expect("execute explain analyze match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Severity:")
+                && line.contains("severity=watch")
+                && line.contains("fragile_pivots=1")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary JSON:")
+                && line.contains("\"severity\":\"watch\"")
+                && line.contains("\"fragile_pivots\":1")
+                && line.contains("\"risky_join_clauses\":0")
+                && line.contains("\"max_fanout\":0.0")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Detail JSON:")
+                && line.contains("\"summary\":{\"severity\":\"watch\"")
+                && line.contains("\"clauses\":[{\"kind\":\"PipelineMatch\"")
+                && line.contains("\"actual_rows\":1")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Clause [PipelineMatch 0]")
+                && line.contains("actual_input_rows=1")
+                && line.contains("actual_output_rows=1")
+                && line.contains("actual_selectivity=1.000")
+                && line.contains("actual_time_ms=")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("estimated_rows=")
+                && line.contains("actual_rows=1")
+                && line.contains("estimate_error_ratio=1.000")
+                && line.contains("actual_selectivity=1.000")
+                && line.contains("actual_time_ms=")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+}
+
+#[test]
+fn query_engine_explain_graph_json_helpers_return_structured_payloads() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+    let query_engine: &dyn crate::engine::api::QueryEngine = &engine;
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_json (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_json (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_json VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_json VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_json ON people_explain_json; \
+             CREATE EDGE LABEL knows_explain_json ON knows_explain_json SOURCE person_explain_json TARGET person_explain_json",
+        )
+        .expect("setup graph explain json tables");
+
+    let summary_json = query_engine
+        .execute_explain_graph_summary_json(
+            &session,
+            "MATCH (a:person_explain_json)-[:knows_explain_json]->(b:person_explain_json) RETURN b.id",
+            true,
+        )
+        .expect("summary json");
+    let detail_json = query_engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_json)-[:knows_explain_json]->(b:person_explain_json) RETURN b.id",
+            true,
+        )
+        .expect("detail json");
+
+    assert_eq!(summary_json["severity"], "watch");
+    assert_eq!(summary_json["fragile_pivots"], 1);
+    assert_eq!(detail_json["summary"]["severity"], "watch");
+    assert_eq!(detail_json["clauses"][0]["kind"], "PipelineMatch");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["actual_rows"], 1);
+}
+
+#[test]
+fn explain_format_json_returns_single_json_payload_row() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_format_json (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_format_json (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_format_json VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_format_json VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_format_json ON people_explain_format_json; \
+             CREATE EDGE LABEL knows_explain_format_json ON knows_explain_format_json SOURCE person_explain_format_json TARGET person_explain_format_json",
+        )
+        .expect("setup graph explain format json tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN (FORMAT JSON) MATCH (a:person_explain_format_json)-[:knows_explain_format_json]->(b:person_explain_format_json) RETURN b.id",
+        )
+        .expect("execute explain format json");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    let [aiondb_core::Value::Text(payload)] = rows[0].values.as_slice() else {
+        panic!("expected single text json row");
+    };
+    let payload: serde_json::Value = serde_json::from_str(payload).expect("json payload");
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["format_kind"], "aiondb.explain_json");
+    assert_eq!(payload["graph_summary"]["severity"], "watch");
+    assert_eq!(payload["graph_detail"]["summary"]["severity"], "watch");
+    assert_eq!(payload["graph_detail"]["clauses"][0]["kind"], "PipelineMatch");
+    assert!(
+        payload["query_plan_lines"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+    );
+    assert!(
+        payload["graph_lines"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+    );
+    assert_eq!(payload["plan_overview"]["root_kind"], "Cypher Query");
+    assert!(
+        payload["plan_overview"]["graph_line_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(payload["execution_summary"]["kind"].is_null());
+}
+
+#[test]
+fn explain_analyze_format_json_returns_actual_graph_metrics() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_analyze_format_json (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_analyze_format_json (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_analyze_format_json VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_analyze_format_json VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_analyze_format_json ON people_explain_analyze_format_json; \
+             CREATE EDGE LABEL knows_explain_analyze_format_json ON knows_explain_analyze_format_json SOURCE person_explain_analyze_format_json TARGET person_explain_analyze_format_json",
+        )
+        .expect("setup graph explain analyze format json tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN (ANALYZE, FORMAT JSON) MATCH (a:person_explain_analyze_format_json)-[:knows_explain_analyze_format_json]->(b:person_explain_analyze_format_json) RETURN b.id",
+        )
+        .expect("execute explain analyze format json");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    let [aiondb_core::Value::Text(payload)] = rows[0].values.as_slice() else {
+        panic!("expected single text json row");
+    };
+    let payload: serde_json::Value = serde_json::from_str(payload).expect("json payload");
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["format_kind"], "aiondb.explain_json");
+    assert_eq!(payload["graph_summary"]["severity"], "watch");
+    assert_eq!(payload["graph_detail"]["summary"]["severity"], "watch");
+    assert_eq!(
+        payload["graph_detail"]["clauses"][0]["actual_input_rows"],
+        1
+    );
+    assert_eq!(
+        payload["graph_detail"]["clauses"][0]["actual_output_rows"],
+        1
+    );
+    assert_eq!(
+        payload["graph_detail"]["clauses"][0]["pattern_details"][0]["actual_rows"],
+        1
+    );
+    assert_eq!(payload["plan_overview"]["root_kind"], "Cypher Query");
+    assert_eq!(payload["execution_summary"]["kind"], "Query");
+    assert_eq!(payload["execution_summary"]["rows_returned"], 1);
+    assert!(
+        payload["execution_summary"]["memory_used_bytes"]
+            .as_u64()
+            .is_some()
+    );
+}
+
+#[test]
+fn explain_analyze_shared_anchor_star_includes_per_pattern_actual_rows() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_star (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_star (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_star VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'); \
+             INSERT INTO knows_explain_star VALUES (1, 2), (1, 3); \
+             CREATE NODE LABEL person_explain_star ON people_explain_star; \
+             CREATE EDGE LABEL knows_explain_star ON knows_explain_star SOURCE person_explain_star TARGET person_explain_star",
+        )
+        .expect("setup graph explain analyze star tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_star)-[:knows_explain_star]->(b:person_explain_star), (a)-[:knows_explain_star]->(c:person_explain_star) RETURN a.id, b.id, c.id",
+        )
+        .expect("execute explain analyze shared anchor star");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("actual_rows=2")
+                && line.contains("actual_time_ms=")
+        }),
+        "explain analyze star lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 1]")
+                && line.contains("actual_rows=4")
+                && line.contains("actual_time_ms=")
+        }),
+        "explain analyze star lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_independent_multi_scan_reports_risk_severity() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_independent (id INT NOT NULL, name TEXT); \
+             INSERT INTO people_explain_independent VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'); \
+             CREATE NODE LABEL person_explain_independent ON people_explain_independent",
+        )
+        .expect("setup independent explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_independent), (b:person_explain_independent) RETURN a.id, b.id",
+        )
+        .expect("execute explain analyze independent multi scan");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary Severity:")
+                && line.contains("severity=risk")
+                && line.contains("high_risk_join_clauses=1")
+        }),
+        "explain analyze independent lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Summary JSON:")
+                && line.contains("\"severity\":\"risk\"")
+                && line.contains("\"independent_multi_scan\":1")
+                && line.contains("\"risky_join_clauses\":1")
+                && line.contains("\"high_risk_join_clauses\":1")
+                && line.contains("\"max_fanout\":9.0")
+        }),
+        "explain analyze independent lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Join Risk [PipelineMatch 0]:")
+                && line.contains("severity=high")
+                && line.contains("correlated=false")
+                && line.contains("join_shape=independent_multi_scan")
+        }),
+        "explain analyze independent lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_distinct_star_semijoin_includes_per_pattern_actual_rows() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_distinct_star (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_explain_distinct_star_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_distinct_star ON people_explain_distinct_star; \
+             CREATE EDGE LABEL knows_explain_distinct_star ON knows_explain_distinct_star_edges SOURCE person_explain_distinct_star TARGET person_explain_distinct_star; \
+             INSERT INTO people_explain_distinct_star VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_explain_distinct_star_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed distinct explain star graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_distinct_star)-[:knows_explain_distinct_star]->(b:person_explain_distinct_star), \
+                   (a)-[:knows_explain_distinct_star]->(c:person_explain_distinct_star) \
+             WHERE b.number > 20 AND b.id <> c.id RETURN count(DISTINCT c.id)",
+        )
+        .expect("execute explain analyze distinct shared anchor star");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("actual_rows=")
+        }),
+        "explain analyze distinct star lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 1]")
+                && line.contains("actual_rows=")
+        }),
+        "explain analyze distinct star lines: {lines:?}"
+    );
+}
+
+#[test]
 fn explain_graph_procedure_includes_projection_lines() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");

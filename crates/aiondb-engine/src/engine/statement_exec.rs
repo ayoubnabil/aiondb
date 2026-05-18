@@ -989,9 +989,10 @@ impl Engine {
             }
             Statement::Explain {
                 analyze,
+                format_json,
                 statement: inner,
                 ..
-            } => self.execute_explain(session, inner, *analyze, allow_plan_cache),
+            } => self.execute_explain(session, inner, *analyze, *format_json, allow_plan_cache),
             Statement::Backup { path, .. } => backup::execute_backup(self, session, path),
             Statement::Restore { path, .. } => backup::execute_restore(self, session, path),
             Statement::Listen { channel, .. } => self.execute_listen_statement(session, channel),
@@ -1474,6 +1475,7 @@ impl Engine {
         session: &SessionHandle,
         inner_statement: &Statement,
         analyze: bool,
+        format_json: bool,
         allow_plan_cache: bool,
     ) -> DbResult<StatementResult> {
         query_api::reject_invalid_noop_statement(inner_statement, None)?;
@@ -1489,8 +1491,13 @@ impl Engine {
             None,
         )?;
         let analyze_summary = if analyze {
-            let (result, memory_used_bytes) =
-                self.execute_physical_plan(session, physical_plan.as_ref(), None, 0)?;
+            let (result, memory_used_bytes, graph_profile_actual_rows, graph_profile_elapsed_nanos) =
+                self.execute_physical_plan_with_graph_profile(
+                    session,
+                    physical_plan.as_ref(),
+                    None,
+                    0,
+                )?;
             Some(match result {
                 StatementResult::Query { rows, .. } => ExplainAnalyzeSummary::Query {
                     rows_returned: rows.len(),
@@ -1517,6 +1524,7 @@ impl Engine {
                     memory_used_bytes,
                 },
             })
+            .map(|summary| (summary, graph_profile_actual_rows, graph_profile_elapsed_nanos))
         } else {
             None
         };
@@ -1539,14 +1547,26 @@ impl Engine {
         let txn_id = self.current_txn_id(session).unwrap_or_default();
         let graph_access_lines = self
             .executor
-            .explain_physical_plan_graph_access_lines(txn_id, physical_plan.as_ref());
+            .explain_physical_plan_graph_access_lines(
+                txn_id,
+                physical_plan.as_ref(),
+                analyze_summary.as_ref().map(|(_, rows, _)| rows),
+                analyze_summary.as_ref().map(|(_, _, nanos)| nanos),
+            );
         let rows = support::explain_result_rows_pg(
             physical_plan.as_ref(),
-            analyze_summary.as_ref(),
+            analyze_summary.as_ref().map(|(summary, _, _)| summary),
             &table_names,
             &session_vars,
             &graph_access_lines,
         );
+        if format_json {
+            let payload = query_api_explain::explain_query_rows_to_json(&rows);
+            let rows = vec![aiondb_core::Row::new(vec![aiondb_core::Value::Text(
+                payload.to_string(),
+            )])];
+            return Ok(StatementResult::Query { columns, rows });
+        }
         Ok(StatementResult::Query { columns, rows })
     }
 
@@ -2166,8 +2186,38 @@ impl Engine {
                 .context
                 .with_storage_autocommit_fast_path(true);
         }
-        let context = &prepared_context.context;
+        let result = self.execute_prepared_physical_plan(&prepared_context, physical_plan);
+        self.finish_statement_execution(prepared_context, result)
+    }
 
+    fn execute_physical_plan_with_graph_profile(
+        &self,
+        session: &SessionHandle,
+        physical_plan: &aiondb_plan::PhysicalPlan,
+        row_limit: Option<u64>,
+        row_offset: u64,
+    ) -> DbResult<(StatementResult, u64, HashMap<String, u64>, HashMap<String, u64>)> {
+        let prepared_context = self.prepare_execution_context(session, row_limit, row_offset)?;
+        let result = self.execute_prepared_physical_plan(&prepared_context, physical_plan);
+        let graph_profile_actual_rows = prepared_context.context.snapshot_graph_profile_actual_rows()?;
+        let graph_profile_elapsed_nanos =
+            prepared_context.context.snapshot_graph_profile_elapsed_nanos()?;
+        let (statement_result, memory_used_bytes) =
+            self.finish_statement_execution(prepared_context, result)?;
+        Ok((
+            statement_result,
+            memory_used_bytes,
+            graph_profile_actual_rows,
+            graph_profile_elapsed_nanos,
+        ))
+    }
+
+    fn execute_prepared_physical_plan(
+        &self,
+        prepared_context: &PreparedExecutionContext,
+        physical_plan: &aiondb_plan::PhysicalPlan,
+    ) -> DbResult<(StatementResult, u64)> {
+        let context = &prepared_context.context;
         // Sensitive compatibility commands must be handled before executor
         // fallback. If one reaches this point, no upstream handler matched it;
         if let aiondb_plan::PhysicalPlan::InternalNoOp { tag, .. } = physical_plan {
@@ -2276,7 +2326,7 @@ impl Engine {
                 }
             }
         };
-        self.finish_statement_execution(prepared_context, result)
+        result
     }
 
     fn try_execute_distributed_sharded_insert_values(

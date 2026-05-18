@@ -13,7 +13,7 @@ PACKAGE_CONTENTS := target/$(PACKAGE_BASENAME).contents
 PACKAGE_EXTRACT_DIR := target/$(PACKAGE_BASENAME)-verify
 PACKAGE_HELP := target/$(PACKAGE_BASENAME).help
 
-.PHONY: all check test clippy fmt doc clean ci-policy dependency-inventory spdx-sbom package-local package-verify package-reproducible release-local release-verify product-smoke docker-build docker-run deployment-validate docker-validate dashboard-studio pg-regress-safe pg-regress-oomsafe pg-regress-suite-safe pg-regress-resume-safe bench bench-pgbench bench-surreal-suite bench-tpch bench-job bench-tpcds
+.PHONY: all check test clippy fmt doc clean ci-policy dependency-inventory spdx-sbom package-local package-verify package-reproducible release-local release-verify product-smoke product-smoke-neo4j-p0 product-smoke-neo4j-browser-p0 docker-build docker-run deployment-validate docker-validate dashboard-studio pg-regress-safe pg-regress-oomsafe pg-regress-suite-safe pg-regress-resume-safe bench bench-pgbench bench-surreal-suite bench-tpch bench-job bench-tpcds
 
 all: check test clippy fmt
 
@@ -179,11 +179,42 @@ product-smoke:
 	$(MAKE) ci-policy
 	cargo test -p aiondb-storage-engine storage_compat
 	cargo test -p aiondb-server "route_"
+	cargo test -p aiondb-parser parses_explain_format_json_select
+	cargo test -p aiondb-parser parses_explain_analyze_format_json_select
+	cargo test -p aiondb-engine explain_format_json_returns_single_json_payload_row
+	cargo test -p aiondb-engine explain_analyze_format_json_returns_actual_graph_metrics
+	cargo run -q -p xtask -- ecosystem-compat --group neo4j-http-p1 --no-history --report target/compat/neo4j-http-p1-smoke.json
+	@if [ -n "$(AIONDB_NEO4J_JS_DRIVER_BASE)" ] && [ -n "$(AIONDB_NEO4J_JAVA_DRIVER_JAR)" ] && [ -n "$(AIONDB_CYPHER_SHELL)" ]; then \
+		echo "running optional neo4j-p0 Bolt smoke"; \
+		cargo run -q -p xtask -- ecosystem-compat --group neo4j-p0 --no-history --report target/compat/neo4j-p0-smoke.json; \
+	else \
+		echo "skipping optional neo4j-p0 Bolt smoke; set AIONDB_NEO4J_JS_DRIVER_BASE, AIONDB_NEO4J_JAVA_DRIVER_JAR, and AIONDB_CYPHER_SHELL to enable it"; \
+	fi
+	@if [ -n "$(AIONDB_CYPHER_SHELL)" ]; then \
+		echo "running optional neo4j-browser-p0 preflight smoke"; \
+		cargo run -q -p xtask -- ecosystem-compat --group neo4j-browser-p0 --no-history --report target/compat/neo4j-browser-p0-smoke.json; \
+	else \
+		echo "skipping optional neo4j-browser-p0 preflight smoke; set AIONDB_CYPHER_SHELL to enable it"; \
+	fi
 	cargo test -p aiondb-server --test cli_storage
 	python3 docs/build.py --check-links
 	$(MAKE) package-reproducible
 	$(MAKE) release-local
 	$(MAKE) deployment-validate
+
+product-smoke-neo4j-p0:
+	@if [ -z "$(AIONDB_NEO4J_JS_DRIVER_BASE)" ] || [ -z "$(AIONDB_NEO4J_JAVA_DRIVER_JAR)" ] || [ -z "$(AIONDB_CYPHER_SHELL)" ]; then \
+		echo "product-smoke-neo4j-p0 requires AIONDB_NEO4J_JS_DRIVER_BASE, AIONDB_NEO4J_JAVA_DRIVER_JAR, and AIONDB_CYPHER_SHELL"; \
+		exit 1; \
+	fi
+	cargo run -q -p xtask -- ecosystem-compat --group neo4j-p0 --no-history --report target/compat/neo4j-p0-smoke.json
+
+product-smoke-neo4j-browser-p0:
+	@if [ -z "$(AIONDB_CYPHER_SHELL)" ]; then \
+		echo "product-smoke-neo4j-browser-p0 requires AIONDB_CYPHER_SHELL"; \
+		exit 1; \
+	fi
+	cargo run -q -p xtask -- ecosystem-compat --group neo4j-browser-p0 --no-history --report target/compat/neo4j-browser-p0-smoke.json
 
 docker-build:
 	docker compose -f docker-compose.yml -f docker-compose.build.yml build
