@@ -45,6 +45,13 @@ struct ExecutorGraphRowProvider<'a> {
     edge_endpoint_overrides: HashMap<RelationId, (usize, usize)>,
 }
 
+#[derive(Clone)]
+struct ShortestPathPredecessor {
+    value: Value,
+    parent: Option<ValueHashKey>,
+    via_edge: Option<TupleId>,
+}
+
 impl<'a> GraphRowProvider for ExecutorGraphRowProvider<'a> {
     fn scan_table(&self, table_id: RelationId) -> DbResult<Vec<Row>> {
         let mut rows = Vec::new();
@@ -343,6 +350,26 @@ impl<'a> ExecutorGraphRowProvider<'a> {
 }
 
 impl Executor {
+    fn reconstruct_shortest_path_from_predecessors(
+        &self,
+        predecessors: &HashMap<ValueHashKey, ShortestPathPredecessor>,
+        end_key: ValueHashKey,
+    ) -> DbResult<Vec<TupleId>> {
+        let mut edges = Vec::new();
+        let mut current_key = Some(end_key);
+        while let Some(key) = current_key {
+            let state = predecessors
+                .get(&key)
+                .ok_or_else(|| DbError::internal("shortest path predecessor chain missing node"))?;
+            if let Some(edge) = state.via_edge {
+                edges.push(edge);
+            }
+            current_key = state.parent.clone();
+        }
+        edges.reverse();
+        Ok(edges)
+    }
+
     pub(super) fn match_shortest_path(
         &self,
         context: &ExecutionContext,
@@ -868,6 +895,144 @@ impl Executor {
     }
 
     fn search_paths_bfs_adjacency(
+        &self,
+        context: &ExecutionContext,
+        mode: PathSearchMode,
+        start_id: &Value,
+        end_id: &Value,
+        edge_table_id: RelationId,
+        target_idx: usize,
+        provider: &dyn GraphRowProvider,
+        max_depth: u32,
+    ) -> DbResult<Vec<Vec<TupleId>>> {
+        let all = mode.allows_multiple_shortest_paths();
+        if !all {
+            let Some(start_key) = value_to_bfs_key(start_id) else {
+                return self.search_paths_bfs_adjacency_all_paths(
+                    context,
+                    mode,
+                    start_id,
+                    end_id,
+                    edge_table_id,
+                    target_idx,
+                    provider,
+                    max_depth,
+                );
+            };
+
+            let mut queue: VecDeque<ValueHashKey> = VecDeque::new();
+            let mut predecessors: HashMap<ValueHashKey, ShortestPathPredecessor> = HashMap::new();
+            predecessors.insert(
+                start_key.clone(),
+                ShortestPathPredecessor {
+                    value: start_id.clone(),
+                    parent: None,
+                    via_edge: None,
+                },
+            );
+            context.track_memory(estimate_shortest_path_queue_entry_bytes(start_id, 0, 0))?;
+            context.track_memory(
+                size_of_u64::<ValueHashKey>()
+                    .saturating_mul(2)
+                    .saturating_add(32),
+            )?;
+            ensure_graph_workset_capacity(context, queue.len(), "shortest-path queue")?;
+            queue.push_back(start_key);
+
+            for depth in 0..max_depth {
+                let frontier_len = queue.len();
+                if frontier_len == 0 {
+                    break;
+                }
+
+                for _ in 0..frontier_len {
+                    let Some(current_key) = queue.pop_front() else {
+                        break;
+                    };
+                    let Some(current_state) = predecessors.get(&current_key).cloned() else {
+                        continue;
+                    };
+
+                    let edges = provider.adjacency_lookup_edges(
+                        edge_table_id,
+                        &current_state.value,
+                        aiondb_graph::traversal::TraversalDirection::Outgoing,
+                    )?;
+                    for edge in &edges {
+                        context.check_deadline()?;
+                        let edge_tgt = edge
+                            .row
+                            .values
+                            .get(target_idx)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let Some(edge_tgt_key) = value_to_bfs_key(&edge_tgt) else {
+                            return self.search_paths_bfs_adjacency_all_paths(
+                                context,
+                                mode,
+                                start_id,
+                                end_id,
+                                edge_table_id,
+                                target_idx,
+                                provider,
+                                max_depth,
+                            );
+                        };
+                        if predecessors.contains_key(&edge_tgt_key) {
+                            continue;
+                        }
+
+                        predecessors.insert(
+                            edge_tgt_key.clone(),
+                            ShortestPathPredecessor {
+                                value: edge_tgt.clone(),
+                                parent: Some(current_key.clone()),
+                                via_edge: Some(edge.tuple_id),
+                            },
+                        );
+                        context.track_memory(
+                            size_of_u64::<ValueHashKey>()
+                                .saturating_mul(2)
+                                .saturating_add(32),
+                        )?;
+
+                        if edge_tgt == *end_id {
+                            let path = self.reconstruct_shortest_path_from_predecessors(
+                                &predecessors,
+                                edge_tgt_key,
+                            )?;
+                            ensure_graph_result_row_capacity(context, 0)?;
+                            context.track_memory(estimate_bfs_path_bytes(path.len()))?;
+                            return Ok(vec![path]);
+                        }
+
+                        context.track_memory(estimate_shortest_path_queue_entry_bytes(
+                            &edge_tgt,
+                            usize::try_from(depth.saturating_add(1)).unwrap_or(usize::MAX),
+                            0,
+                        ))?;
+                        ensure_graph_workset_capacity(context, queue.len(), "shortest-path queue")?;
+                        queue.push_back(edge_tgt_key);
+                    }
+                }
+            }
+
+            return Ok(Vec::new());
+        }
+
+        self.search_paths_bfs_adjacency_all_paths(
+            context,
+            mode,
+            start_id,
+            end_id,
+            edge_table_id,
+            target_idx,
+            provider,
+            max_depth,
+        )
+    }
+
+    fn search_paths_bfs_adjacency_all_paths(
         &self,
         context: &ExecutionContext,
         mode: PathSearchMode,
