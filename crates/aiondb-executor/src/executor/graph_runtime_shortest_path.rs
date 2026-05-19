@@ -378,7 +378,7 @@ impl Executor {
         input_bindings: Vec<crate::executor::graph_plans::BindingRow>,
     ) -> DbResult<Vec<crate::executor::graph_plans::BindingRow>> {
         if pattern.nodes.len() != 2 || pattern.relationships.len() != 1 {
-            return Err(DbError::internal(
+            return Err(DbError::feature_not_supported(
                 "shortestPath/allShortestPaths requires exactly two nodes and one relationship",
             ));
         }
@@ -389,7 +389,7 @@ impl Executor {
         let max_depth = rel_pat.max_hops.unwrap_or(15);
 
         let Some(edge_table_id) = rel_pat.table_id else {
-            return Err(DbError::internal(
+            return Err(DbError::feature_not_supported(
                 "shortestPath requires a typed relationship pattern (e.g. [:KNOWS*])",
             ));
         };

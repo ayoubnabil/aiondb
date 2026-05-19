@@ -297,6 +297,87 @@ fn shortest_path_exists_within_bound() {
 }
 
 #[test]
+fn shortest_path_multi_segment_shape_is_rejected_explicitly() {
+    let (engine, session) = social();
+    let err = engine
+        .execute_sql(
+            &session,
+            "MATCH shortestPath((a:Person {id: 1})-[:KNOWS*..2]->(:Person)-[:KNOWS*..2]->(b:Person {id: 5})) RETURN 1",
+        )
+        .expect_err("multi-segment shortestPath should fail explicitly");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        format!("{err}").contains("requires exactly two nodes and one relationship"),
+        "{err}"
+    );
+}
+
+#[test]
+fn shortest_path_untyped_relationship_is_rejected_explicitly() {
+    let (engine, session) = social();
+    let err = engine
+        .execute_sql(
+            &session,
+            "MATCH shortestPath((a:Person {id: 1})-[*..2]->(b:Person {id: 5})) RETURN 1",
+        )
+        .expect_err("untyped shortestPath should fail explicitly");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        format!("{err}").contains("requires a typed relationship pattern"),
+        "{err}"
+    );
+}
+
+#[test]
+fn all_shortest_paths_multi_segment_shape_is_rejected_explicitly() {
+    let (engine, session) = social();
+    let err = engine
+        .execute_sql(
+            &session,
+            "MATCH allShortestPaths((a:Person {id: 1})-[:KNOWS*..2]->(:Person)-[:KNOWS*..2]->(b:Person {id: 5})) RETURN 1",
+        )
+        .expect_err("multi-segment allShortestPaths should fail explicitly");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        format!("{err}").contains("requires exactly two nodes and one relationship"),
+        "{err}"
+    );
+}
+
+#[test]
+fn all_shortest_paths_untyped_relationship_is_rejected_explicitly() {
+    let (engine, session) = social();
+    let err = engine
+        .execute_sql(
+            &session,
+            "MATCH allShortestPaths((a:Person {id: 1})-[*..2]->(b:Person {id: 5})) RETURN 1",
+        )
+        .expect_err("untyped allShortestPaths should fail explicitly");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        format!("{err}").contains("requires a typed relationship pattern"),
+        "{err}"
+    );
+}
+
+#[test]
+fn named_path_with_multiple_variable_length_segments_is_rejected_explicitly() {
+    let (engine, session) = social();
+    let err = engine
+        .execute_sql(
+            &session,
+            "MATCH p = (:Person {id: 1})-[:KNOWS*1..2]->(:Person)-[:KNOWS*1..2]->(:Person {id: 5}) RETURN p",
+        )
+        .expect_err("named path with multiple variable-length segments should fail explicitly");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        format!("{err}")
+            .contains("named paths with more than one variable-length relationship are not supported yet"),
+        "{err}"
+    );
+}
+
+#[test]
 fn path_binding_returns_nodes_and_relationships() {
     let (engine, session) = social();
     let rows = query_rows(

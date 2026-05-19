@@ -1003,6 +1003,60 @@ pub(in crate::engine) fn is_unsupported_cypher_feature(err: &DbError) -> bool {
     err.sqlstate() == SqlState::FeatureNotSupported
 }
 
+pub(in crate::engine) fn cypher_statement_blocks_sql_fallback(
+    statement: &aiondb_parser::cypher_ast::CypherStatement,
+) -> bool {
+    statement
+        .clauses
+        .iter()
+        .any(cypher_clause_blocks_sql_fallback)
+        || statement
+            .union
+            .as_ref()
+            .is_some_and(|union| cypher_statement_blocks_sql_fallback(&union.right))
+}
+
+fn cypher_clause_blocks_sql_fallback(clause: &aiondb_parser::cypher_ast::CypherClause) -> bool {
+    use aiondb_parser::cypher_ast::CypherClause;
+
+    match clause {
+        CypherClause::Match(match_clause) => match_clause
+            .patterns
+            .iter()
+            .any(cypher_pattern_blocks_sql_fallback),
+        CypherClause::Create(create_clause) => create_clause
+            .patterns
+            .iter()
+            .any(cypher_pattern_blocks_sql_fallback),
+        CypherClause::Merge(merge_clause) => cypher_pattern_blocks_sql_fallback(&merge_clause.pattern),
+        CypherClause::Call(call_clause) => call_clause
+            .subquery
+            .as_ref()
+            .is_some_and(|subquery| cypher_statement_blocks_sql_fallback(subquery)),
+        CypherClause::Foreach(foreach_clause) => foreach_clause
+            .clauses
+            .iter()
+            .any(cypher_clause_blocks_sql_fallback),
+        CypherClause::Set(_)
+        | CypherClause::Delete(_)
+        | CypherClause::Unwind(_)
+        | CypherClause::Remove(_)
+        | CypherClause::With(_)
+        | CypherClause::Return(_) => false,
+    }
+}
+
+fn cypher_pattern_blocks_sql_fallback(pattern: &aiondb_parser::cypher_ast::CypherPathPattern) -> bool {
+    pattern.path_function.is_some()
+        || (pattern.path_variable.is_some()
+            && pattern
+                .rels
+                .iter()
+                .filter(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+                .count()
+                > 1)
+}
+
 pub(in crate::engine) fn is_transaction_not_active_in_storage_error(err: &DbError) -> bool {
     err.report()
         .message

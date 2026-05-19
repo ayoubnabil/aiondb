@@ -1050,6 +1050,9 @@ impl Engine {
                 ) {
                     Ok(result) => Ok(result),
                     Err(ref native_err) if is_unsupported_cypher_feature(native_err) => {
+                        if cypher_statement_blocks_sql_fallback(cypher_stmt) {
+                            return Err(native_err.clone());
+                        }
                         debug!(
                             error = %native_err,
                             "native Cypher execution unsupported, falling back to SQL translation"
