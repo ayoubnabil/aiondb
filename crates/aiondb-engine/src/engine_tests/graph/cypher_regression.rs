@@ -419,20 +419,36 @@ fn all_shortest_paths_untyped_relationship_is_rejected_explicitly() {
 }
 
 #[test]
-fn named_path_with_multiple_variable_length_segments_is_rejected_explicitly() {
+fn named_path_with_multiple_variable_length_segments_returns_full_path() {
     let (engine, session) = social();
-    let err = engine
-        .execute_sql(
-            &session,
-            "MATCH p = (:Person {id: 1})-[:KNOWS*1..2]->(:Person)-[:KNOWS*1..2]->(:Person {id: 5}) RETURN p",
-        )
-        .expect_err("named path with multiple variable-length segments should fail explicitly");
-    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
-    assert!(
-        format!("{err}")
-            .contains("named paths with more than one variable-length relationship are not supported yet"),
-        "{err}"
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH p = (:Person {id: 1})-[:KNOWS*1..2]->(:Person)-[:KNOWS*1..2]->(:Person {id: 5}) RETURN length(p), p",
     );
+    assert_eq!(rows.len(), 3);
+    let mut lengths = rows
+        .iter()
+        .map(|row| match row.values[0] {
+            Value::BigInt(length) => length,
+            ref other => panic!("expected path length, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    assert_eq!(lengths, vec![3, 3, 4]);
+    for row in &rows {
+        let Value::Text(path) = &row.values[1] else {
+            panic!("expected rendered path, got {:?}", row.values[1]);
+        };
+        assert!(
+            path.matches("(:Person").count() == 4 || path.matches("(:Person").count() == 5,
+            "path: {path}"
+        );
+        assert!(
+            path.matches("[:KNOWS").count() == 3 || path.matches("[:KNOWS").count() == 4,
+            "path: {path}"
+        );
+    }
 }
 
 #[test]

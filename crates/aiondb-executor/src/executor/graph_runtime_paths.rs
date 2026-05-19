@@ -72,6 +72,26 @@ pub(super) struct VariableTraversalFrontierEntry {
     pub path_edges: HashSet<(RelationId, TupleId)>,
     pub path_nodes: Vec<String>,
     pub path_relationships: Vec<String>,
+    pub path_directions: Vec<CypherRelDirection>,
+}
+
+fn existing_path_values(
+    binding: &BindingRow,
+    path_variable: Option<&str>,
+) -> Option<(Vec<String>, Vec<String>, Vec<CypherRelDirection>)> {
+    let path_variable = path_variable?;
+    match binding.get(path_variable)? {
+        BoundValue::PathValues {
+            nodes,
+            relationships,
+            directions,
+        } => Some((
+            nodes.as_ref().clone(),
+            relationships.as_ref().clone(),
+            directions.as_ref().clone(),
+        )),
+        _ => None,
+    }
 }
 
 pub(super) fn far_end_for_direction(
@@ -115,6 +135,7 @@ pub(super) fn record_variable_traversal_step(
     let mut new_binding = entry.binding.clone();
     let mut new_path_nodes = entry.path_nodes.clone();
     let mut new_path_relationships = entry.path_relationships.clone();
+    let mut new_path_directions = entry.path_directions.clone();
 
     if let Some(ref var) = spec.rel.variable {
         new_binding = new_binding.with_binding(
@@ -137,13 +158,13 @@ pub(super) fn record_variable_traversal_step(
         if let Some(node_literal) = next_node_literal {
             new_path_nodes.push(node_literal);
         }
-        let path_len = new_path_relationships.len();
+        new_path_directions.push(spec.rel.direction);
         new_binding.insert_binding(
             path_variable.to_owned(),
             BoundValue::PathValues {
                 nodes: Arc::new(new_path_nodes.clone()),
                 relationships: Arc::new(new_path_relationships.clone()),
-                directions: Arc::new(vec![spec.rel.direction; path_len]),
+                directions: Arc::new(new_path_directions.clone()),
             },
         );
     }
@@ -182,6 +203,7 @@ pub(super) fn record_variable_traversal_step(
             path_edges: new_path_edges,
             path_nodes: new_path_nodes,
             path_relationships: new_path_relationships,
+            path_directions: new_path_directions,
         });
     }
 
@@ -201,6 +223,8 @@ pub(super) fn build_traversed_edge_binding(
     current_node_id: Option<&Value>,
     source_id: &Value,
     target_id: &Value,
+    path_variable: Option<&str>,
+    next_node_literal: Option<String>,
 ) -> BindingRow {
     let mut new_binding = binding.clone();
 
@@ -229,6 +253,30 @@ pub(super) fn build_traversed_edge_binding(
             }
         }
     };
+
+    if let Some((mut path_nodes, mut path_relationships, mut path_directions)) =
+        existing_path_values(binding, path_variable)
+    {
+        path_relationships.push(format_cypher_edge_literal(
+            edge_col_names.as_ref(),
+            compat_row.as_ref(),
+            edge_rel_type.as_ref(),
+        ));
+        if let Some(node_literal) = next_node_literal {
+            path_nodes.push(node_literal);
+        }
+        path_directions.push(rel.direction);
+        if let Some(path_variable) = path_variable {
+            new_binding.insert_binding(
+                path_variable.to_owned(),
+                BoundValue::PathValues {
+                    nodes: Arc::new(path_nodes),
+                    relationships: Arc::new(path_relationships),
+                    directions: Arc::new(path_directions),
+                },
+            );
+        }
+    }
 
     new_binding.push_fresh_shared_binding(
         "__edge_next_node_id__".to_owned(),
@@ -400,22 +448,32 @@ impl Executor {
             else {
                 continue;
             };
-            let initial_path_nodes = if path_variable.is_some() {
-                vec![self.path_node_literal_from_binding_or_fetch(
-                    context,
-                    current_node,
-                    binding,
-                    &start_id,
-                )?]
-            } else {
-                Vec::new()
-            };
+            let (initial_path_nodes, initial_path_relationships, initial_path_directions) =
+                if let Some((nodes, relationships, directions)) =
+                    existing_path_values(binding, path_variable)
+                {
+                    (nodes, relationships, directions)
+                } else if path_variable.is_some() {
+                    (
+                        vec![self.path_node_literal_from_binding_or_fetch(
+                            context,
+                            current_node,
+                            binding,
+                            &start_id,
+                        )?],
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
             let mut frontier = vec![VariableTraversalFrontierEntry {
                 node_id: start_id.clone(),
                 binding: binding.clone(),
                 path_edges: HashSet::new(),
                 path_nodes: initial_path_nodes,
-                path_relationships: Vec::new(),
+                path_relationships: initial_path_relationships,
+                path_directions: initial_path_directions,
             }];
             context.track_memory(estimate_variable_frontier_entry_bytes(
                 &start_id, binding, 0,
@@ -542,7 +600,7 @@ impl Executor {
         next_node: Option<&CypherNodePattern>,
         input_bindings: Vec<BindingRow>,
         excluded_next_node_id_vars: &[String],
-        _path_variable: Option<&str>,
+        path_variable: Option<&str>,
         filter_conjuncts: &[GraphFilterConjunct<'_>],
         runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
@@ -874,6 +932,12 @@ impl Executor {
                             current_id.as_ref(),
                             &source_id,
                             &target_id,
+                            path_variable,
+                            if path_variable.is_some() {
+                                Some(self.fetch_path_node_literal(context, next_node, &next_node_id)?)
+                            } else {
+                                None
+                            },
                         );
                         push_graph_binding(context, &mut output, new_binding)?;
                     }
@@ -954,6 +1018,12 @@ impl Executor {
                                 current_id.as_ref(),
                                 &source_id,
                                 &target_id,
+                                path_variable,
+                                if path_variable.is_some() {
+                                    Some(self.fetch_path_node_literal(context, next_node, &next_node_id)?)
+                                } else {
+                                    None
+                                },
                             );
                             push_graph_binding(context, &mut output, new_binding)?;
                         }
@@ -1064,6 +1134,12 @@ impl Executor {
                         current_id.as_ref(),
                         &source_id,
                         &target_id,
+                        path_variable,
+                        if path_variable.is_some() {
+                            Some(self.fetch_path_node_literal(context, next_node, &next_node_id)?)
+                        } else {
+                            None
+                        },
                     );
                     push_graph_binding(context, &mut output, new_binding)?;
                 }

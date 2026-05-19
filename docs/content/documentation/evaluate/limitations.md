@@ -55,7 +55,7 @@ Current graph boundaries:
 
 - `shortestPath` supports one typed relationship pattern between two node patterns, plus multi-segment patterns with typed relationships and at most one variable-length segment.
 - `allShortestPaths` supports typed multi-segment patterns, but still requires at most one variable-length segment.
-- Named paths are supported for ordinary paths, `shortestPath`, `allShortestPaths`, and patterns that combine fixed segments with one bounded variable-length relationship. Patterns with more than one variable-length relationship are still not supported.
+- Named paths are supported for ordinary paths, `shortestPath`, and `allShortestPaths`, including multi-segment patterns with multiple bounded variable-length relationships.
 - `CALL graph.*` exposes a broad algorithm registry, but procedure compatibility should be pinned by name, arguments, yielded columns, and expected rows.
 - Graph procedures use projection cache data where possible and rebuild from adjacency data when needed; this is not a substitute for published operational runbooks.
 - Neo4j-class claims require reproducible benchmark artifacts. Do not generalize from one graph shape to all graph workloads.

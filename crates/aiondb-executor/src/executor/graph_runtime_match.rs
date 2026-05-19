@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use aiondb_core::{DbError, DbResult, RelationId, Value};
+use aiondb_core::{DbResult, RelationId, Value};
 use aiondb_eval::{build_hash_key, ValueHashKey};
 use aiondb_optimizer::graph_optimizer::{GraphOptimizer, GraphStats};
 use aiondb_plan::graph::{
@@ -206,16 +206,6 @@ fn validate_named_path_pattern(pattern: &CypherPattern) -> DbResult<()> {
     }
     if pattern.path_function.is_some() {
         return Ok(());
-    }
-    let variable_length_relationships = pattern
-        .relationships
-        .iter()
-        .filter(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
-        .count();
-    if variable_length_relationships > 1 {
-        return Err(DbError::feature_not_supported(
-            "named paths with more than one variable-length relationship are not supported yet",
-        ));
     }
     Ok(())
 }
