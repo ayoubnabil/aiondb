@@ -19,6 +19,9 @@ This page is the product-facing summary of what changed in v0.2.
 
 > New in v0.2: AionDB now has experimental Neo4j-oriented Bolt compatibility evidence across the official Python, JavaScript, and Java drivers, plus `cypher-shell`, and a versioned `EXPLAIN JSON` contract for graph tooling.
 
+For the current benchmark-facing snapshot, use
+[v0.2 Performance Snapshot](/documentation/evaluate/v0-2-performance.html).
+
 ## Summary
 
 v0.2 adds five major product changes:

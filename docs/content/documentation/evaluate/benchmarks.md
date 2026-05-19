@@ -9,6 +9,9 @@ AionDB includes local benchmark harnesses under `benchmarks/`. They are intended
 
 The benchmark docs are deliberately conservative. A fast number without the command, dataset size, durability mode, hardware, and raw output should not be treated as a product claim.
 
+For the short product-facing read on the current v0.2 snapshots, use
+[v0.2 Performance Snapshot](/documentation/evaluate/v0-2-performance.html).
+
 ## Available harnesses
 
 ```bash
