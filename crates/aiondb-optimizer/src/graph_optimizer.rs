@@ -381,23 +381,65 @@ fn cypher_direction_to_cbo(direction: CypherRelDirection) -> RelDirection {
     }
 }
 
-fn cbo_seed_node(plan: &ExpansionPlan) -> Option<usize> {
+fn cbo_direction_to_cypher(direction: RelDirection) -> CypherRelDirection {
+    match direction {
+        RelDirection::Outgoing => CypherRelDirection::Outgoing,
+        RelDirection::Incoming => CypherRelDirection::Incoming,
+        RelDirection::Both => CypherRelDirection::Both,
+    }
+}
+
+/// Flatten a linear [`ExpansionPlan`] into `(seed_node, steps)` where each step
+/// is `(rel_id, from_node, to_node, direction)` in execution order (the expand
+/// adjacent to the seed first).
+///
+/// Returns `None` for any shape the executor's left-to-right path runner cannot
+/// represent: `HashJoin`, `CartesianProduct`, or an `ExpandInto` (`into:
+/// true`). Because the recursion descends into `input` before recording the
+/// step, the collected steps are already seed-first — no post-reversal needed.
+fn cbo_linear_sequence(
+    plan: &ExpansionPlan,
+) -> Option<(usize, Vec<(usize, usize, usize, RelDirection)>)> {
+    fn walk(
+        plan: &ExpansionPlan,
+        steps: &mut Vec<(usize, usize, usize, RelDirection)>,
+    ) -> Option<usize> {
+        match &plan.op {
+            PhysicalOp::AllNodesScan { node }
+            | PhysicalOp::NodeByLabelScan { node, .. }
+            | PhysicalOp::NodeIndexSeek { node, .. } => Some(node.0),
+            PhysicalOp::Expand {
+                input,
+                rel,
+                from,
+                to,
+                direction,
+                into: false,
+                ..
+            } => {
+                let seed = walk(input, steps)?;
+                steps.push((rel.0, from.0, to.0, *direction));
+                Some(seed)
+            }
+            PhysicalOp::Expand { into: true, .. }
+            | PhysicalOp::HashJoin { .. }
+            | PhysicalOp::CartesianProduct { .. } => None,
+        }
+    }
+    let mut steps = Vec::new();
+    let seed = walk(plan, &mut steps)?;
+    Some((seed, steps))
+}
+
+fn cbo_leaf_seed(plan: &ExpansionPlan) -> Option<usize> {
     match &plan.op {
         PhysicalOp::AllNodesScan { node }
         | PhysicalOp::NodeByLabelScan { node, .. }
         | PhysicalOp::NodeIndexSeek { node, .. } => Some(node.0),
-        PhysicalOp::Expand { input, .. } => cbo_seed_node(input),
-        PhysicalOp::HashJoin { .. } | PhysicalOp::CartesianProduct { .. } => None,
-    }
-}
-
-fn cbo_plan_is_linear(plan: &ExpansionPlan) -> bool {
-    match &plan.op {
-        PhysicalOp::AllNodesScan { .. }
-        | PhysicalOp::NodeByLabelScan { .. }
-        | PhysicalOp::NodeIndexSeek { .. } => true,
-        PhysicalOp::Expand { input, into, .. } => !into && cbo_plan_is_linear(input),
-        PhysicalOp::HashJoin { .. } | PhysicalOp::CartesianProduct { .. } => false,
+        PhysicalOp::Expand { input, .. } => cbo_leaf_seed(input),
+        PhysicalOp::HashJoin { left, .. } | PhysicalOp::CartesianProduct { left, .. } => {
+            cbo_leaf_seed(left)
+        }
     }
 }
 
@@ -502,6 +544,22 @@ impl GraphOptimizer {
         plan
     }
 
+    /// Return the CBO-chosen seed node index for `pattern` when the pattern
+    /// shape can be lowered to the graph planner.
+    ///
+    /// This is narrower than full pattern projection: callers such as the
+    /// executor can still exploit the seed choice through their own pivoted
+    /// walk even when `project_cbo_plan(...)` cannot rewrite the pattern into a
+    /// contiguous left-to-right path.
+    pub fn cbo_seed_index(
+        &self,
+        pattern: &CypherPattern,
+        filters: &[TypedExpr],
+    ) -> Option<usize> {
+        let plan = self.cbo_plan_for_pattern(pattern, filters)?;
+        cbo_leaf_seed(&plan)
+    }
+
     fn optimize_cypher_query_in_place(&self, plan: &mut CypherQueryPlan) {
         // Phase 1: Optimize each MATCH clause.
         for match_clause in &mut plan.matches {
@@ -539,8 +597,11 @@ impl GraphOptimizer {
         // selective one.
         self.reorder_patterns(match_clause, &filters);
 
-        // Step 3: For each pattern, reorder the starting node.
-        let allow_cbo_start = match_clause.patterns.len() == 1;
+        // Step 3: For each pattern, reorder the starting node. The CBO drives
+        // every path now: it projects per-pattern internal order, while Step 2
+        // (`reorder_patterns`) independently fixes inter-pattern order, so
+        // running it per pattern is safe regardless of pattern count.
+        let allow_cbo_start = true;
         for pattern in &mut match_clause.patterns {
             self.optimize_pattern_start(pattern, &filters, allow_cbo_start);
         }
@@ -618,20 +679,17 @@ impl GraphOptimizer {
         if pattern.path_variable.is_some() || pattern.path_function.is_some() {
             return;
         }
-        if pattern
-            .relationships
-            .iter()
-            .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
-        {
-            return;
-        }
-        if allow_cbo_start
-            && self
-                .cbo_seed_node_for_pattern(pattern, filters)
-                .is_some_and(|seed_node| seed_node + 1 == pattern.nodes.len())
-        {
-            self.reverse_pattern(pattern);
-            return;
+        // Variable-length rels are now CBO-driven too: the cost model already
+        // prices them (geometric hop fan-out), and reversing a `*min..max`
+        // walk is path-set-equivalent. `project_cbo_plan` clones each rel, so
+        // `min_hops`/`max_hops` ride along with the reorder unchanged. (Named
+        // paths and shortestPath stay anchored — guarded above.)
+        if allow_cbo_start {
+            if let Some(plan) = self.cbo_plan_for_pattern(pattern, filters) {
+                if self.project_cbo_plan(pattern, &plan) {
+                    return;
+                }
+            }
         }
 
         let first_card = self.node_est_cardinality(&pattern.nodes[0], filters);
@@ -647,11 +705,11 @@ impl GraphOptimizer {
         }
     }
 
-    fn cbo_seed_node_for_pattern(
+    fn cbo_plan_for_pattern(
         &self,
         pattern: &CypherPattern,
         filters: &[TypedExpr],
-    ) -> Option<usize> {
+    ) -> Option<ExpansionPlan> {
         if pattern
             .relationships
             .iter()
@@ -660,12 +718,52 @@ impl GraphOptimizer {
             return None;
         }
         let query_graph = self.lower_pattern_to_query_graph(pattern, filters)?;
-        let plan = plan_query_graph(&query_graph, &self.stats, &PlannerConfig::default()).ok()?;
-        if !cbo_plan_is_linear(&plan) {
-            return None;
+        plan_query_graph(&query_graph, &self.stats, &PlannerConfig::default()).ok()
+    }
+
+    /// Project a cost-based [`ExpansionPlan`] back onto `pattern`: reorder its
+    /// nodes/relationships into the planner's traversal order and set each
+    /// relationship's direction to the orientation the planner chose.
+    ///
+    /// `lower_pattern_to_query_graph` maps `NodeId(i)` to `pattern.nodes[i]` and
+    /// `RelId(i)` to `pattern.relationships[i]`, so plan ids index the original
+    /// vectors directly. Only a *contiguous left-deep path* (seed at one path
+    /// end, every expand extending the running endpoint) can be expressed as a
+    /// `CypherPattern`; a middle seed, `ExpandInto`, or `HashJoin` is not a
+    /// simple path, so `false` is returned and the caller falls back to the
+    /// cardinality heuristic.
+    fn project_cbo_plan(&self, pattern: &mut CypherPattern, plan: &ExpansionPlan) -> bool {
+        let Some((seed, steps)) = cbo_linear_sequence(plan) else {
+            return false;
+        };
+        if steps.len() != pattern.relationships.len() || seed >= pattern.nodes.len() {
+            return false;
         }
-        let seed_node = cbo_seed_node(&plan)?;
-        (seed_node == 0 || seed_node + 1 == pattern.nodes.len()).then_some(seed_node)
+
+        let old_nodes = pattern.nodes.clone();
+        let old_rels = pattern.relationships.clone();
+        let mut nodes = Vec::with_capacity(old_nodes.len());
+        let mut rels = Vec::with_capacity(old_rels.len());
+
+        nodes.push(old_nodes[seed].clone());
+        let mut endpoint = seed;
+        for (rel_id, from, to, direction) in steps {
+            if from != endpoint || rel_id >= old_rels.len() || to >= old_nodes.len() {
+                return false;
+            }
+            let mut rel = old_rels[rel_id].clone();
+            rel.direction = cbo_direction_to_cypher(direction);
+            rels.push(rel);
+            nodes.push(old_nodes[to].clone());
+            endpoint = to;
+        }
+
+        if nodes.len() != old_nodes.len() {
+            return false;
+        }
+        pattern.nodes = nodes;
+        pattern.relationships = rels;
+        true
     }
 
     fn lower_pattern_to_query_graph(
@@ -675,7 +773,12 @@ impl GraphOptimizer {
     ) -> Option<QueryGraph> {
         let mut predicate_map: HashMap<String, Vec<PropertyPredicate>> = HashMap::new();
         for filter in filters {
-            let Some((variable, property)) = extract_variable_property_ref(filter) else {
+            // Unwrap the comparison (`b.x > 20`, `BETWEEN`, …) to its
+            // column-ref operand; `extract_variable_property_ref` alone only
+            // matches a bare ref, so range/inequality WHERE predicates were
+            // silently dropped and never reached the cost model.
+            let Some((variable, property)) = extract_variable_property_literal_filter(filter)
+            else {
                 continue;
             };
             let Some(op) = typed_expr_predicate_op(filter) else {
@@ -1370,28 +1473,52 @@ mod tests {
     }
 
     #[test]
-    fn optimize_start_preserves_variable_length_walk() {
-        let stats = make_stats();
+    fn cbo_reorders_variable_length_walk_preserving_hop_bounds() {
+        // Symmetric-degree KNOWS (so direction alone is cost-neutral) plus a
+        // highly selective equality on the *far* node `b`: the cost-based
+        // planner must seed `b` and reverse the `*1..2` walk. The reversal is
+        // path-set-equivalent only if the hop bounds survive intact -- that is
+        // the safety invariant variable-length wiring must hold.
+        let mut stats = GraphStats::empty();
+        stats.label_cardinality.insert("Person".to_owned(), 100_000);
+        stats.edge_cardinality.insert("KNOWS".to_owned(), 500_000);
+        stats.edge_endpoints.insert(
+            "KNOWS".to_owned(),
+            ("Person".to_owned(), "Person".to_owned()),
+        );
+        stats
+            .distinct
+            .insert(("Person".to_owned(), "email".to_owned()), 100_000.0);
         let optimizer = GraphOptimizer::new(stats);
 
         let mut rel = make_rel(None, Some("KNOWS"), CypherRelDirection::Outgoing);
         rel.min_hops = Some(1);
-        rel.max_hops = Some(3);
-        let mut pattern = make_pattern(
+        rel.max_hops = Some(2);
+        let pattern = make_pattern(
             vec![
-                make_node(Some("p"), Some("Person")),
-                make_node(Some("c"), Some("City")),
+                make_node(Some("a"), Some("Person")),
+                make_node(Some("b"), Some("Person")),
             ],
             vec![rel],
         );
+        let mut match_clause = make_match(vec![pattern]);
+        match_clause.filter = Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("b.email", 0, DataType::Text, false),
+            TypedExpr::literal(Value::Text("x@example.com".into()), DataType::Text, false),
+        ));
 
-        optimizer.optimize_pattern_start(&mut pattern, &[], true);
+        optimizer.optimize_match_clause(&mut match_clause);
+        let pattern = &match_clause.patterns[0];
 
-        assert_eq!(pattern.nodes[0].label.as_deref(), Some("Person"));
+        // Reordered to seed the selective end, direction flipped...
+        assert_eq!(pattern.nodes[0].variable.as_deref(), Some("b"));
         assert_eq!(
             pattern.relationships[0].direction,
-            CypherRelDirection::Outgoing
+            CypherRelDirection::Incoming
         );
+        // ...but the variable-length bounds must ride along unchanged.
+        assert_eq!(pattern.relationships[0].min_hops, Some(1));
+        assert_eq!(pattern.relationships[0].max_hops, Some(2));
     }
 
     #[test]
@@ -1666,6 +1793,10 @@ mod tests {
             TypedExpr::literal(Value::Text("x@example.com".into()), DataType::Text, false),
         ));
 
+        assert_eq!(
+            optimizer.cbo_seed_index(&match_clause.patterns[0], match_clause.filter.as_slice()),
+            Some(1)
+        );
         optimizer.optimize_match_clause(&mut match_clause);
 
         // Seed flipped to the highly-selective `b`.

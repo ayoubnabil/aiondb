@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::Bound,
     sync::Arc,
     time::Instant,
 };
 
 use aiondb_core::{DbError, DbResult, RelationId, Value};
 use aiondb_eval::{build_hash_key, ValueHashKey};
+use aiondb_optimizer::graph_optimizer::{GraphOptimizer, GraphStats};
 use aiondb_plan::graph::{
     CypherMatchClause, CypherNodePattern, CypherPattern, CypherPropertyExpr, IndexScanInfo,
 };
@@ -18,11 +20,155 @@ use crate::executor::graph_plans::{
     compact_graph_binding_node_payloads, compact_node_bound_value, estimate_binding_row_bytes,
     exact_column_literal_equality, extract_column_literal_range, flip_relationship_direction,
     graph_access_clause_profile_input_key, graph_access_clause_profile_output_key,
+    graph_access_clause_runtime_blocker_key, graph_access_clause_runtime_reason_key,
+    graph_access_clause_runtime_strategy_key,
+    graph_access_pattern_pivot_decision_key,
+    graph_access_pattern_pivot_driver_key,
+    graph_access_pattern_pivot_reason_key,
+    graph_access_pattern_runtime_reason_key,
+    graph_access_pattern_runtime_strategy_key,
     graph_access_clause_profile_time_key, graph_access_pattern_profile_time_key,
     graph_access_profile_key, graph_filter_node_id_inequality_peers, pick_match_pivot_index,
     retain_graph_binding_variables, BindingRow, BoundValue, GraphBindingReduction,
-    GraphFilterConjunct, GraphMatchRuntimeCache,
+    GraphFilterConjunct, GraphMatchRuntimeCache, SharedStrings, SharedText,
 };
+
+const RELATION_SEEDED_NODE_CANDIDATE_THRESHOLD: usize = 8;
+const RELATION_SEEDED_NODE_CANDIDATE_SOFT_THRESHOLD: usize = 16;
+
+fn observed_clause_runtime_reason(
+    clause: &CypherMatchClause,
+    observed_strategy: &str,
+) -> &'static str {
+    let Some(anchor) = clause.patterns.first().and_then(|pattern| pattern.nodes.first()) else {
+        return "empty_clause";
+    };
+    if observed_strategy == "shared_anchor_star" {
+        return "all_patterns_single_hop_same_anchor";
+    }
+    if clause.optional {
+        "optional_clause"
+    } else if clause.patterns.len() < 2 {
+        "single_pattern_clause"
+    } else if clause
+        .patterns
+        .iter()
+        .skip(1)
+        .all(|pattern| pattern.nodes.first() == Some(anchor))
+    {
+        "shared_anchor_non_single_hop_or_rewritten"
+    } else {
+        "general_multi_pattern_clause"
+    }
+}
+
+fn observed_clause_runtime_blocker(
+    clause: &CypherMatchClause,
+    observed_strategy: &str,
+) -> Option<&'static str> {
+    if observed_strategy == "shared_anchor_star" {
+        return None;
+    }
+    if clause.optional {
+        return Some("optional_clause");
+    }
+    if clause.patterns.len() < 2 {
+        return Some("single_pattern_clause");
+    }
+    let anchor = clause.patterns.first().and_then(|pattern| pattern.nodes.first())?;
+    if !clause
+        .patterns
+        .iter()
+        .skip(1)
+        .all(|pattern| pattern.nodes.first() == Some(anchor))
+    {
+        return Some("anchor_not_shared");
+    }
+    if clause
+        .patterns
+        .iter()
+        .any(|pattern| pattern.path_function.is_some() || pattern.path_variable.is_some())
+    {
+        return Some("path_binding_or_function_present");
+    }
+    if clause.patterns.iter().any(|pattern| pattern.nodes.len() != 2) {
+        return Some("non_two_node_pattern_present");
+    }
+    if clause
+        .patterns
+        .iter()
+        .any(|pattern| pattern.relationships.len() != 1)
+    {
+        return Some("non_single_relationship_pattern_present");
+    }
+    if clause
+        .patterns
+        .iter()
+        .any(|pattern| pattern.nodes.first() != Some(anchor))
+    {
+        return Some("pattern_not_single_hop_from_anchor");
+    }
+    Some("unknown")
+}
+
+fn runtime_pivot_node_mode(node: &CypherNodePattern) -> &'static str {
+    let has_inline_id = node
+        .properties
+        .iter()
+        .any(|property| property.key.eq_ignore_ascii_case("id"));
+    if has_inline_id {
+        "id_constrained"
+    } else if node.index_scan.is_some() {
+        "indexed"
+    } else if !node.range_pushdown.is_empty() {
+        "range_constrained"
+    } else if node.variable.is_some() {
+        "label_scan"
+    } else {
+        "anonymous_scan"
+    }
+}
+
+fn relation_filter_is_exact(filter: &super::graph_runtime_paths::RelationshipScanFilter) -> bool {
+    matches!(
+        (&filter.lower, &filter.upper),
+        (Bound::Included(lo), Bound::Included(hi)) if lo == hi
+    )
+}
+
+fn node_candidate_bound(
+    start_node_candidate_ids: Option<&HashSet<ValueHashKey>>,
+    end_node_candidate_ids: Option<&HashSet<ValueHashKey>>,
+) -> Option<usize> {
+    [start_node_candidate_ids, end_node_candidate_ids]
+        .into_iter()
+        .flatten()
+        .map(HashSet::len)
+        .min()
+}
+
+fn column_ndistinct(
+    table_stats: &aiondb_catalog::TableStatistics,
+    column_id: aiondb_core::ColumnId,
+) -> Option<f64> {
+    table_stats
+        .column_stats
+        .iter()
+        .find(|stats| stats.column_id == column_id)
+        .and_then(|stats| (stats.ndistinct > 0.0).then_some(stats.ndistinct))
+}
+
+fn column_ndistinct_by_name(
+    table: &aiondb_catalog::TableDescriptor,
+    table_stats: &aiondb_catalog::TableStatistics,
+    column_name: &str,
+) -> Option<f64> {
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(column_name))?;
+    column_ndistinct(table_stats, column.column_id)
+}
 
 fn materialize_named_path_pattern(pattern: &CypherPattern) -> CypherPattern {
     let Some(path_variable) = pattern.path_variable.as_deref() else {
@@ -319,6 +465,392 @@ fn node_has_filter_constraints(node: &CypherNodePattern) -> bool {
 }
 
 impl Executor {
+    pub(in crate::executor) fn cbo_seed_index_for_pattern(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+    ) -> DbResult<Option<usize>> {
+        if pattern.nodes.len() <= 1
+            || pattern.path_function.is_some()
+            || pattern.path_variable.is_some()
+        {
+            return Ok(None);
+        }
+        let mut stats = GraphStats::empty();
+        self.collect_graph_stats_for_pattern(context, pattern, &mut stats)?;
+        let optimizer = GraphOptimizer::new(stats);
+        Ok(optimizer.cbo_seed_index(pattern, &[]).filter(|seed| *seed > 0))
+    }
+
+    fn collect_graph_stats_for_pattern(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+        stats: &mut GraphStats,
+    ) -> DbResult<()> {
+        for node in &pattern.nodes {
+            self.collect_graph_stats_for_node(context, node, stats)?;
+        }
+        for rel in &pattern.relationships {
+            if let Some(rel_type) = rel.rel_type.as_deref() {
+                self.collect_graph_stats_for_rel_type(context, rel_type, rel.table_id, stats)?;
+            }
+            for rel_type in &rel.rel_type_alternatives {
+                self.collect_graph_stats_for_rel_type(context, rel_type, None, stats)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_graph_stats_for_node(
+        &self,
+        context: &ExecutionContext,
+        node: &CypherNodePattern,
+        stats: &mut GraphStats,
+    ) -> DbResult<()> {
+        let Some(label) = node.label.as_deref() else {
+            return Ok(());
+        };
+        let Some(table_id) = self.node_table_id_for_graph_stats(context, node)? else {
+            return Ok(());
+        };
+        let Some(table_stats) = self.catalog_reader.get_statistics(context.txn_id, table_id)? else {
+            return Ok(());
+        };
+        stats
+            .label_cardinality
+            .insert(label.to_owned(), table_stats.row_count);
+        if let Some(table) = self.catalog_reader.get_table_by_id(context.txn_id, table_id)? {
+            for column in &table.columns {
+                if let Some(ndistinct) = column_ndistinct(&table_stats, column.column_id) {
+                    stats
+                        .distinct
+                        .insert((label.to_owned(), column.name.clone()), ndistinct);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_graph_stats_for_rel_type(
+        &self,
+        context: &ExecutionContext,
+        rel_type: &str,
+        table_id_hint: Option<RelationId>,
+        stats: &mut GraphStats,
+    ) -> DbResult<()> {
+        let descriptor = self.catalog_reader.get_edge_label(context.txn_id, rel_type)?;
+        if let Some(descriptor) = &descriptor {
+            stats.edge_endpoints.insert(
+                rel_type.to_owned(),
+                (
+                    descriptor.source_label.clone(),
+                    descriptor.target_label.clone(),
+                ),
+            );
+        }
+        let Some(table_id) = table_id_hint.or_else(|| descriptor.as_ref().map(|d| d.table_id))
+        else {
+            return Ok(());
+        };
+        let Some(table_stats) = self.catalog_reader.get_statistics(context.txn_id, table_id)? else {
+            return Ok(());
+        };
+        stats
+            .edge_cardinality
+            .insert(rel_type.to_owned(), table_stats.row_count);
+        let Some(endpoints) = descriptor.as_ref().and_then(|d| d.endpoints.as_ref()) else {
+            return Ok(());
+        };
+        let Some(table) = self.catalog_reader.get_table_by_id(context.txn_id, table_id)? else {
+            return Ok(());
+        };
+        let row_count = table_stats.row_count as f64;
+        if let Some(distinct_src) =
+            column_ndistinct_by_name(&table, &table_stats, &endpoints.source_id_column)
+        {
+            stats
+                .avg_out_degree
+                .insert(rel_type.to_owned(), row_count / distinct_src);
+        }
+        if let Some(distinct_tgt) =
+            column_ndistinct_by_name(&table, &table_stats, &endpoints.target_id_column)
+        {
+            stats
+                .avg_in_degree
+                .insert(rel_type.to_owned(), row_count / distinct_tgt);
+        }
+        Ok(())
+    }
+
+    fn node_table_id_for_graph_stats(
+        &self,
+        context: &ExecutionContext,
+        node: &CypherNodePattern,
+    ) -> DbResult<Option<RelationId>> {
+        if let Some(table_id) = node.table_id {
+            return Ok(Some(table_id));
+        }
+        let Some(label) = node.label.as_deref() else {
+            return Ok(None);
+        };
+        Ok(self
+            .catalog_reader
+            .get_node_label(context.txn_id, label)?
+            .map(|descriptor| descriptor.table_id))
+    }
+
+    fn relation_seed_support_score(
+        &self,
+        context: &ExecutionContext,
+        table_id: RelationId,
+        pushed_filters: &[super::graph_runtime_paths::RelationshipScanFilter],
+    ) -> DbResult<u8> {
+        let indexes = self.catalog_reader.list_indexes(context.txn_id, table_id)?;
+        let has_indexed_exact = pushed_filters.iter().any(|filter| {
+            relation_filter_is_exact(filter)
+                && indexes.iter().any(|index| {
+                    index.kind == aiondb_catalog::IndexKind::BTree
+                        && index
+                            .key_columns
+                            .first()
+                            .is_some_and(|key| key.column_id == filter.column_id)
+                })
+        });
+        if has_indexed_exact {
+            return Ok(0);
+        }
+        let has_indexed_range = pushed_filters.iter().any(|filter| {
+            indexes.iter().any(|index| {
+                index.kind == aiondb_catalog::IndexKind::BTree
+                    && index
+                        .key_columns
+                        .first()
+                        .is_some_and(|key| key.column_id == filter.column_id)
+            })
+        });
+        if has_indexed_range {
+            return Ok(1);
+        }
+        Ok(2)
+    }
+
+    fn try_match_pattern_relation_seeded(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+        input_bindings: &[BindingRow],
+        filter_conjuncts: &[GraphFilterConjunct<'_>],
+        runtime_cache: &mut GraphMatchRuntimeCache,
+    ) -> DbResult<Option<Vec<BindingRow>>> {
+        if pattern.path_function.is_some()
+            || pattern.path_variable.is_some()
+            || pattern.nodes.len() != 2
+            || pattern.relationships.len() != 1
+        {
+            return Ok(None);
+        }
+        let rel = &pattern.relationships[0];
+        if rel.min_hops.is_some()
+            || rel.max_hops.is_some()
+            || rel.direction == aiondb_plan::graph::CypherRelDirection::Both
+        {
+            return Ok(None);
+        }
+        let Some(table_id) = rel.table_id else {
+            return Ok(None);
+        };
+        if input_bindings.iter().any(|binding| {
+            pattern
+                .nodes
+                .iter()
+                .filter_map(|node| node.variable.as_deref())
+                .any(|var| binding.get(var).is_some())
+        }) {
+            return Ok(None);
+        }
+
+        let pushed_filters =
+            self.collect_relationship_scan_filters(context, table_id, rel, filter_conjuncts)?;
+        if pushed_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let edge_table_descriptor = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, table_id)?;
+        let edge_col_names: SharedStrings = Arc::new(
+            edge_table_descriptor
+                .as_ref()
+                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        let include_oid_system_column =
+            self.compat_include_oid_system_column_for_table_id(context, table_id)?;
+        let edge_rls_policies = match edge_table_descriptor.as_ref() {
+            Some(table) => self.compile_compat_rls_policies(
+                table,
+                super::dml_plans::CompatRlsAction::Select,
+                context,
+            )?,
+            None => None,
+        };
+        let ((src_col_idx, tgt_col_idx), _) =
+            self.resolve_edge_endpoint_columns_for_rel(context, table_id, rel.rel_type.as_deref())?;
+        let edge_rel_type: SharedText = Arc::from(rel.rel_type.as_deref().unwrap_or("").to_owned());
+        let mut stream = match self.scan_relationship_candidates_with_filters(
+            context,
+            table_id,
+            &pushed_filters,
+            None,
+        )? {
+            Some(stream) => stream,
+            None => return Ok(None),
+        };
+
+        let start_node = &pattern.nodes[0];
+        let end_node = &pattern.nodes[1];
+        let start_node_candidate_ids =
+            self.collect_static_node_candidate_id_keys(context, start_node)?;
+        if start_node_candidate_ids
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let end_node_candidate_ids = self.collect_static_node_candidate_id_keys(context, end_node)?;
+        if end_node_candidate_ids
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let relation_seed_score =
+            self.relation_seed_support_score(context, table_id, &pushed_filters)?;
+        let smallest_node_candidate_bound = node_candidate_bound(
+            start_node_candidate_ids.as_ref(),
+            end_node_candidate_ids.as_ref(),
+        );
+        if smallest_node_candidate_bound.is_some_and(|size| {
+            size <= RELATION_SEEDED_NODE_CANDIDATE_THRESHOLD
+                || (size <= RELATION_SEEDED_NODE_CANDIDATE_SOFT_THRESHOLD
+                    && relation_seed_score >= 1)
+        }) {
+            return Ok(None);
+        }
+        let mut output = Vec::new();
+        let edge_marker_node = |id_value: Value| -> BoundValue {
+            let marker_row = Arc::new(aiondb_core::Row::new(vec![id_value.clone()]));
+            BoundValue::Node {
+                table_id: RelationId::new(0),
+                row: Arc::clone(&marker_row),
+                raw_row: marker_row,
+                id_value,
+                tuple_id: aiondb_core::TupleId::new(0),
+                labels: Arc::new(Vec::new()),
+                column_names: Arc::new(Vec::new()),
+            }
+        };
+
+        while let Some(record) = stream.next()? {
+            context.check_deadline()?;
+            if !self.compat_rls_allows_existing_row(
+                edge_rls_policies.as_deref(),
+                &record.row,
+                context,
+            )? {
+                continue;
+            }
+
+            let compat_row = Arc::new(self.compat_scan_row(
+                &record,
+                include_oid_system_column,
+                Some(table_id),
+            ));
+            let raw_row = Arc::new(record.row);
+
+            for base_binding in input_bindings {
+                if !self.check_property_filters(
+                    context,
+                    &rel.properties,
+                    edge_col_names.as_ref(),
+                    compat_row.as_ref(),
+                    base_binding,
+                )? {
+                    continue;
+                }
+
+                let source_id = compat_row
+                    .values
+                    .get(src_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let target_id = compat_row
+                    .values
+                    .get(tgt_col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let (start_node_id, end_node_id) = match rel.direction {
+                    aiondb_plan::graph::CypherRelDirection::Outgoing => {
+                        (source_id, target_id)
+                    }
+                    aiondb_plan::graph::CypherRelDirection::Incoming => {
+                        (target_id, source_id)
+                    }
+                    aiondb_plan::graph::CypherRelDirection::Both => unreachable!(),
+                };
+                let Some(start_node_key) = build_hash_key(&start_node_id).ok() else {
+                    continue;
+                };
+                if start_node_candidate_ids
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&start_node_key))
+                {
+                    continue;
+                }
+                let Some(end_node_key) = build_hash_key(&end_node_id).ok() else {
+                    continue;
+                };
+                if end_node_candidate_ids
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&end_node_key))
+                {
+                    continue;
+                }
+
+                let mut seeded = base_binding.clone();
+                if let Some(var) = rel.variable.as_deref() {
+                    seeded.insert_binding(
+                        var.to_owned(),
+                        BoundValue::Edge {
+                            table_id,
+                            row: Arc::clone(&compat_row),
+                            raw_row: Arc::clone(&raw_row),
+                            tuple_id: record.tuple_id,
+                            rel_type: Arc::clone(&edge_rel_type),
+                            column_names: Arc::clone(&edge_col_names),
+                        },
+                    );
+                }
+                seeded.insert_binding(
+                    "__edge_next_node_id__".to_owned(),
+                    edge_marker_node(start_node_id),
+                );
+                let mut first = self.match_node(context, start_node, vec![seeded], runtime_cache)?;
+                for binding in &mut first {
+                    binding.insert_binding(
+                        "__edge_next_node_id__".to_owned(),
+                        edge_marker_node(end_node_id.clone()),
+                    );
+                }
+                let second = self.match_node(context, end_node, first, runtime_cache)?;
+                output.extend(second);
+            }
+        }
+
+        Ok(Some(output))
+    }
+
     fn match_single_hop_star_branch(
         &self,
         context: &ExecutionContext,
@@ -351,6 +883,7 @@ impl Executor {
             vec![input_binding],
             &excluded_next_node_id_vars,
             None,
+            filter_conjuncts,
             runtime_cache,
         )?;
         bindings = self.apply_ready_graph_filter_conjuncts(context, bindings, filter_conjuncts)?;
@@ -1062,30 +1595,97 @@ impl Executor {
         &self,
         context: &ExecutionContext,
         pattern: &CypherPattern,
-        mut bindings: Vec<BindingRow>,
+        bindings: Vec<BindingRow>,
         filter_conjuncts: &[GraphFilterConjunct<'_>],
         required_output_variables: Option<&HashSet<String>>,
         runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
+        self.match_pattern_with_strategy(
+            context,
+            pattern,
+            bindings,
+            filter_conjuncts,
+            required_output_variables,
+            runtime_cache,
+        )
+        .map(|(bindings, _, _, _, _)| bindings)
+    }
+
+    pub(super) fn match_pattern_with_strategy(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+        mut bindings: Vec<BindingRow>,
+        filter_conjuncts: &[GraphFilterConjunct<'_>],
+        required_output_variables: Option<&HashSet<String>>,
+        runtime_cache: &mut GraphMatchRuntimeCache,
+    ) -> DbResult<(
+        Vec<BindingRow>,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<usize>,
+    )> {
         let mut pending_filter_conjuncts = filter_conjuncts.to_vec();
         for binding in &mut bindings {
             binding.remove("__edge_next_node_id__");
         }
 
         if let Some(ref func) = pattern.path_function {
-            return self.match_shortest_path(context, pattern, *func, bindings);
+            return self
+                .match_shortest_path(context, pattern, *func, bindings)
+                .map(|bindings| (bindings, "path_function", "path_function_dispatch", None, None));
         }
 
-        if let Some(pivot) = pick_match_pivot_index(pattern) {
-            return self.match_pattern_pivoted(
-                context,
-                pattern,
-                bindings,
-                filter_conjuncts,
-                pivot,
-                required_output_variables,
-                runtime_cache,
-            );
+        if let Some(bindings) = self.try_match_pattern_relation_seeded(
+            context,
+            pattern,
+            &bindings,
+            &pending_filter_conjuncts,
+            runtime_cache,
+        )? {
+            return self
+                .apply_ready_graph_filter_conjuncts(context, bindings, &pending_filter_conjuncts)
+                .map(|bindings| {
+                    (
+                        bindings,
+                        "relation_seeded",
+                        "relationship_filter_seed",
+                        None,
+                        None,
+                    )
+                });
+        }
+
+        let cbo_pivot = self.cbo_seed_index_for_pattern(context, pattern)?;
+        let heuristic_pivot = pick_match_pivot_index(pattern);
+        if let Some(pivot) = cbo_pivot.or(heuristic_pivot) {
+            let pivot_driver = if cbo_pivot.is_some() {
+                Some("cbo")
+            } else if heuristic_pivot.is_some() {
+                Some("heuristic")
+            } else {
+                None
+            };
+            return self
+                .match_pattern_pivoted(
+                    context,
+                    pattern,
+                    bindings,
+                    filter_conjuncts,
+                    pivot,
+                    required_output_variables,
+                    runtime_cache,
+                )
+                .map(|bindings| {
+                    (
+                        bindings,
+                        "pivoted_node_seed",
+                        "pivot_seed",
+                        pivot_driver,
+                        Some(pivot),
+                    )
+                });
         }
 
         for (i, node) in pattern.nodes.iter().enumerate() {
@@ -1102,7 +1702,7 @@ impl Executor {
                 }
             }
             if bindings.is_empty() {
-                return Ok(bindings);
+                return Ok((bindings, "left_to_right_node_seed", "left_to_right_walk", None, None));
             }
             if i < pattern.relationships.len() {
                 let rel = &pattern.relationships[i];
@@ -1121,6 +1721,7 @@ impl Executor {
                     bindings,
                     &excluded_next_node_id_vars,
                     pattern.path_variable.as_deref(),
+                    &pending_filter_conjuncts,
                     runtime_cache,
                 )?;
                 bindings = self.apply_ready_graph_filter_conjuncts(
@@ -1136,11 +1737,11 @@ impl Executor {
                     compact_graph_binding_node_payloads(binding);
                 }
                 if bindings.is_empty() {
-                    return Ok(bindings);
+                    return Ok((bindings, "left_to_right_node_seed", "left_to_right_walk", None, None));
                 }
             }
         }
-        Ok(bindings)
+        Ok((bindings, "left_to_right_node_seed", "left_to_right_walk", None, None))
     }
 
     fn match_pattern_pivoted(
@@ -1185,6 +1786,7 @@ impl Executor {
                 bindings,
                 &excluded_next_node_id_vars,
                 None,
+                filter_conjuncts,
                 runtime_cache,
             )?;
             bindings =
@@ -1227,6 +1829,7 @@ impl Executor {
                 bindings,
                 &excluded_next_node_id_vars,
                 None,
+                filter_conjuncts,
                 runtime_cache,
             )?;
             bindings =
@@ -1373,6 +1976,7 @@ impl Executor {
             Some(GraphBindingReduction::GlobalDistinctExpr(_)) => None,
             None => None,
         };
+        let mut observed_clause_runtime_strategy = "pattern_by_pattern";
 
         for input_binding in &input_bindings {
             context.check_deadline()?;
@@ -1394,6 +1998,7 @@ impl Executor {
                 binding_reduction,
                 &mut runtime_cache,
             )? {
+                observed_clause_runtime_strategy = "shared_anchor_star";
                 (bindings, true)
             } else {
                 (vec![input_binding.clone()], false)
@@ -1410,7 +2015,13 @@ impl Executor {
                     } else {
                         pattern
                     };
-                    current_bindings = self.match_pattern(
+                    let (
+                        matched_bindings,
+                        pattern_runtime_strategy,
+                        pattern_runtime_reason,
+                        pattern_pivot_driver,
+                        pattern_pivot_index,
+                    ) = self.match_pattern_with_strategy(
                         context,
                         pattern,
                         current_bindings,
@@ -1418,11 +2029,60 @@ impl Executor {
                         required_output_variables,
                         &mut runtime_cache,
                     )?;
+                    current_bindings = matched_bindings;
                     current_bindings = bind_named_path_variable(pattern, current_bindings);
                     context.record_graph_profile_actual_rows(
                         &graph_access_profile_key(clause_label, clause_index, pattern_idx),
                         u64::try_from(current_bindings.len()).unwrap_or(u64::MAX),
                     )?;
+                    context.record_graph_profile_runtime_text(
+                        &graph_access_pattern_runtime_strategy_key(
+                            clause_label,
+                            clause_index,
+                            pattern_idx,
+                        ),
+                        pattern_runtime_strategy,
+                    )?;
+                    context.record_graph_profile_runtime_text(
+                        &graph_access_pattern_runtime_reason_key(
+                            clause_label,
+                            clause_index,
+                            pattern_idx,
+                        ),
+                        pattern_runtime_reason,
+                    )?;
+                    if let Some(pattern_pivot_driver) = pattern_pivot_driver {
+                        context.record_graph_profile_runtime_text(
+                            &graph_access_pattern_pivot_driver_key(
+                                clause_label,
+                                clause_index,
+                                pattern_idx,
+                            ),
+                            pattern_pivot_driver,
+                        )?;
+                        if let Some(pattern_pivot_index) = pattern_pivot_index {
+                            context.record_graph_profile_runtime_text(
+                                &graph_access_pattern_pivot_reason_key(
+                                    clause_label,
+                                    clause_index,
+                                    pattern_idx,
+                                ),
+                                &format!(
+                                    "pivot_to_node_{}:{}",
+                                    pattern_pivot_index,
+                                    runtime_pivot_node_mode(&pattern.nodes[pattern_pivot_index])
+                                ),
+                            )?;
+                            context.record_graph_profile_runtime_text(
+                                &graph_access_pattern_pivot_decision_key(
+                                    clause_label,
+                                    clause_index,
+                                    pattern_idx,
+                                ),
+                                &format!("selected_node_{}", pattern_pivot_index),
+                            )?;
+                        }
+                    }
                     context.record_graph_profile_elapsed_nanos(
                         &graph_access_pattern_profile_time_key(
                             clause_label,
@@ -1614,6 +2274,22 @@ impl Executor {
             &graph_access_clause_profile_output_key(clause_label, clause_index),
             u64::try_from(result_bindings.len()).unwrap_or(u64::MAX),
         )?;
+        context.record_graph_profile_runtime_text(
+            &graph_access_clause_runtime_strategy_key(clause_label, clause_index),
+            observed_clause_runtime_strategy,
+        )?;
+        context.record_graph_profile_runtime_text(
+            &graph_access_clause_runtime_reason_key(clause_label, clause_index),
+            observed_clause_runtime_reason(clause, observed_clause_runtime_strategy),
+        )?;
+        if let Some(blocker) =
+            observed_clause_runtime_blocker(clause, observed_clause_runtime_strategy)
+        {
+            context.record_graph_profile_runtime_text(
+                &graph_access_clause_runtime_blocker_key(clause_label, clause_index),
+                blocker,
+            )?;
+        }
         context.record_graph_profile_elapsed_nanos(
             &graph_access_clause_profile_time_key(clause_label, clause_index),
             u64::try_from(clause_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),

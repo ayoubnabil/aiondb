@@ -10,7 +10,9 @@ struct MockStorageWithIndex {
     index_rows: Mutex<std::collections::HashMap<IndexId, Vec<TupleRecord>>>,
     index_limited_count: Mutex<usize>,
     scan_table_count: Mutex<usize>,
+    scan_table_counts: Mutex<std::collections::HashMap<RelationId, usize>>,
     scan_index_count: Mutex<usize>,
+    scan_index_counts: Mutex<std::collections::HashMap<IndexId, usize>>,
     scan_index_ordered_count: Mutex<usize>,
     fetch_count: Mutex<usize>,
     next_tuple_id: Mutex<u64>,
@@ -23,7 +25,9 @@ impl MockStorageWithIndex {
             index_rows: Mutex::new(std::collections::HashMap::new()),
             index_limited_count: Mutex::new(0),
             scan_table_count: Mutex::new(0),
+            scan_table_counts: Mutex::new(std::collections::HashMap::new()),
             scan_index_count: Mutex::new(0),
+            scan_index_counts: Mutex::new(std::collections::HashMap::new()),
             scan_index_ordered_count: Mutex::new(0),
             fetch_count: Mutex::new(0),
             next_tuple_id: Mutex::new(1),
@@ -43,8 +47,26 @@ impl MockStorageWithIndex {
         *self.scan_table_count.lock().unwrap()
     }
 
+    fn scan_table_count_for(&self, table_id: RelationId) -> usize {
+        self.scan_table_counts
+            .lock()
+            .unwrap()
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn scan_index_count(&self) -> usize {
         *self.scan_index_count.lock().unwrap()
+    }
+
+    fn scan_index_count_for(&self, index_id: IndexId) -> usize {
+        self.scan_index_counts
+            .lock()
+            .unwrap()
+            .get(&index_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn scan_index_ordered_count(&self) -> usize {
@@ -113,6 +135,12 @@ impl StorageDML for MockStorageWithIndex {
         projected_columns: Option<Vec<ColumnId>>,
     ) -> DbResult<Box<dyn TupleStream>> {
         *self.scan_table_count.lock().unwrap() += 1;
+        *self
+            .scan_table_counts
+            .lock()
+            .unwrap()
+            .entry(table_id)
+            .or_default() += 1;
         let tables = self.tables.lock().unwrap();
         let records: Vec<TupleRecord> = tables
             .get(&table_id)
@@ -136,6 +164,12 @@ impl StorageDML for MockStorageWithIndex {
         projected_columns: Option<Vec<ColumnId>>,
     ) -> DbResult<Box<dyn TupleStream>> {
         *self.scan_index_count.lock().unwrap() += 1;
+        *self
+            .scan_index_counts
+            .lock()
+            .unwrap()
+            .entry(index_id)
+            .or_default() += 1;
         let index_rows = self.index_rows.lock().unwrap();
         let records = index_rows
             .get(&index_id)
@@ -1976,3 +2010,208 @@ fn aggregate_group_by_single_column_uses_ordered_index_stream() {
 }
 
 // =========================================================================
+
+#[test]
+fn shortest_path_fallback_uses_endpoint_index_before_edge_table_scan() {
+    use aiondb_catalog::{IndexKeyColumn, IndexKind, SortOrder};
+    use aiondb_plan::graph::{
+        CypherMatchClause, CypherNodePattern, CypherPathFunction, CypherPattern,
+        CypherPropertyExpr, CypherRelDirection, CypherRelPattern,
+    };
+    use aiondb_plan::graph::CypherQueryPlan;
+
+    let lit_int = |value: i32| TypedExpr::literal(Value::Int(value), DataType::Int, false);
+
+    let (executor, catalog, storage) = make_executor_with_index_storage();
+    let ctx = default_context();
+
+    let person_id = create_test_table(
+        &executor,
+        &catalog,
+        "person_shortest_idx",
+        vec![
+            ColumnPlan {
+                name: "id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+    let knows_id = create_test_table(
+        &executor,
+        &catalog,
+        "knows_shortest_idx",
+        vec![
+            ColumnPlan {
+                name: "source_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "target_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "weight".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+
+    storage
+        .insert(
+            ctx.txn_id,
+            person_id,
+            Row::new(vec![Value::Int(1), Value::Text("A".to_owned())]),
+        )
+        .expect("insert person 1");
+    storage
+        .insert(
+            ctx.txn_id,
+            person_id,
+            Row::new(vec![Value::Int(2), Value::Text("B".to_owned())]),
+        )
+        .expect("insert person 2");
+    let edge_tid = storage
+        .insert(
+            ctx.txn_id,
+            knows_id,
+            Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        )
+        .expect("insert edge");
+
+    let edge_table = catalog
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|table| table.table_id == knows_id)
+        .cloned()
+        .expect("edge table descriptor");
+    let source_column_id = edge_table.columns[0].column_id;
+    let source_index_id = IndexId::new(9901);
+    catalog.indexes.lock().unwrap().push(IndexDescriptor {
+        index_id: source_index_id,
+        schema_id: SchemaId::new(1),
+        table_id: knows_id,
+        name: QualifiedName::qualified("public", "idx_knows_shortest_idx_source"),
+        unique: false,
+        nulls_not_distinct: false,
+        kind: IndexKind::BTree,
+        key_columns: vec![IndexKeyColumn {
+            column_id: source_column_id,
+            sort_order: SortOrder::Ascending,
+            nulls_first: false,
+        }],
+        include_columns: Vec::new(),
+        constraint_name: None,
+        hnsw_params: None,
+    });
+    storage.set_index_rows(
+        source_index_id,
+        vec![TupleRecord {
+            tuple_id: edge_tid,
+            heap_position: edge_tid.get(),
+            row: Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        }],
+    );
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: Some(CypherPathFunction::ShortestPath),
+                path_variable: None,
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: None,
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(1),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: None,
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(2),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![CypherRelPattern {
+                    variable: Some("r".to_owned()),
+                    rel_type: None,
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: Some(1),
+                    max_hops: Some(1),
+                    index_scan: None,
+                }],
+            }],
+            filter: None,
+        }],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: TypedExpr::column_ref("r.weight", 6, DataType::Int, true),
+            field: ResultField {
+                name: "r.weight".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor.execute(&plan, &ctx).expect("execute shortest path");
+    match result {
+        ExecutionResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Int(10));
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+
+    assert_eq!(storage.scan_index_count_for(source_index_id), 1);
+    assert_eq!(storage.scan_table_count_for(knows_id), 0);
+}

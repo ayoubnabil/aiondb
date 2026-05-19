@@ -64,6 +64,12 @@ Human-readable `EXPLAIN` output now includes:
 - estimate drift and warning lines;
 - graph summary severity and machine-readable summary metrics.
 
+It now also distinguishes between:
+
+- runtime-observed signals;
+- plan-inferred signals;
+- mixed summaries that combine both.
+
 This makes graph plan triage much more practical during evaluation.
 
 Use:
@@ -91,6 +97,7 @@ The payload now includes:
 - `graph_summary`;
 - `graph_detail`;
 - `execution_summary`;
+- explicit provenance fields such as `*_source`;
 - stable helper APIs on the engine side.
 
 This is not presented as a cross-database format. It is an AionDB-native tooling contract.

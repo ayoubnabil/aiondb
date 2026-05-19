@@ -1,18 +1,27 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, ops::Bound, sync::Arc};
 
-use aiondb_core::{DbResult, RelationId, TupleId, Value};
+use aiondb_core::{ColumnId, DbResult, RelationId, TupleId, Value};
 use aiondb_eval::{build_hash_key, ValueHashKey};
 use aiondb_graph::{GraphDirection, GraphStorage};
 use aiondb_plan::graph::{CypherNodePattern, CypherRelDirection, CypherRelPattern};
+use aiondb_plan::TypedExprKind;
 use tracing::debug;
 
 use super::graph_runtime_traversal::RelationshipTraversalSpec;
 use super::{ExecutionContext, Executor};
 use crate::executor::graph_plans::{
     ensure_graph_result_row_capacity, ensure_graph_workset_capacity, estimate_binding_row_bytes,
-    estimate_variable_frontier_entry_bytes, format_cypher_edge_literal, push_graph_binding,
-    BindingRow, BoundValue, GraphMatchRuntimeCache, SharedRow, SharedStrings, SharedText,
+    estimate_variable_frontier_entry_bytes, exact_variable_column_literal_range,
+    format_cypher_edge_literal, push_graph_binding, BindingRow, BoundValue, GraphFilterConjunct,
+    GraphMatchRuntimeCache, SharedRow, SharedStrings, SharedText,
 };
+
+#[derive(Clone)]
+pub(super) struct RelationshipScanFilter {
+    pub(super) column_id: ColumnId,
+    pub(super) lower: Bound<Value>,
+    pub(super) upper: Bound<Value>,
+}
 
 fn value_to_bfs_key(v: &Value) -> Option<ValueHashKey> {
     build_hash_key(v).ok()
@@ -251,6 +260,7 @@ impl Executor {
         input_bindings: Vec<BindingRow>,
         excluded_next_node_id_vars: &[String],
         path_variable: Option<&str>,
+        filter_conjuncts: &[GraphFilterConjunct<'_>],
         runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
         let rel_variants = self.relationship_pattern_variants(context, rel)?;
@@ -280,6 +290,7 @@ impl Executor {
                     input_bindings.clone(),
                     excluded_next_node_id_vars,
                     path_variable,
+                    filter_conjuncts,
                     runtime_cache,
                 )?;
                 output.extend(bindings);
@@ -298,6 +309,7 @@ impl Executor {
             input_bindings,
             excluded_next_node_id_vars,
             path_variable,
+            filter_conjuncts,
             runtime_cache,
         )
     }
@@ -531,6 +543,7 @@ impl Executor {
         input_bindings: Vec<BindingRow>,
         excluded_next_node_id_vars: &[String],
         _path_variable: Option<&str>,
+        filter_conjuncts: &[GraphFilterConjunct<'_>],
         runtime_cache: &mut GraphMatchRuntimeCache,
     ) -> DbResult<Vec<BindingRow>> {
         let Some(table_id) = rel.table_id else {
@@ -571,6 +584,8 @@ impl Executor {
         } else {
             None
         };
+        let pushed_relation_filters =
+            self.collect_relationship_scan_filters(context, table_id, rel, filter_conjuncts)?;
         let neighbor_only_adjacency = rel.variable.is_none() && rel.properties.is_empty();
         let next_node_candidate_ids = if neighbor_only_adjacency {
             next_node
@@ -950,13 +965,21 @@ impl Executor {
                     }
                 }
 
-                let mut stream = self.scan_table_locked(
-                    context,
-                    table_id,
-                    projected_scan
-                        .as_ref()
-                        .map(|projection| projection.projected_columns.clone()),
-                )?;
+                let projected_columns = projected_scan
+                    .as_ref()
+                    .map(|projection| projection.projected_columns.clone());
+                let mut stream = if let Some(stream) = self
+                    .scan_relationship_candidates_with_filters(
+                        context,
+                        table_id,
+                        &pushed_relation_filters,
+                        projected_columns.clone(),
+                    )?
+                {
+                    stream
+                } else {
+                    self.scan_table_locked(context, table_id, projected_columns)?
+                };
                 let mut scan_counter: u32 = 0;
                 while let Some(record) = stream.next()? {
                     if has_interrupts {
@@ -1052,5 +1075,153 @@ impl Executor {
         }
 
         Ok(output)
+    }
+
+    pub(super) fn collect_relationship_scan_filters(
+        &self,
+        context: &ExecutionContext,
+        table_id: RelationId,
+        rel: &CypherRelPattern,
+        filter_conjuncts: &[GraphFilterConjunct<'_>],
+    ) -> DbResult<Vec<RelationshipScanFilter>> {
+        let Some(table) = self
+            .catalog_reader
+            .get_table_by_id(context.txn_id, table_id)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut filters = Vec::new();
+
+        for property in &rel.properties {
+            let TypedExprKind::Literal(value) = &property.value.kind else {
+                continue;
+            };
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let Some(column_index) = self.find_column_index(&table.columns, &property.key) else {
+                continue;
+            };
+            let Some(column) = table.columns.get(column_index) else {
+                continue;
+            };
+            filters.push(RelationshipScanFilter {
+                column_id: column.column_id,
+                lower: Bound::Included(value.clone()),
+                upper: Bound::Included(value.clone()),
+            });
+        }
+
+        let Some(rel_variable) = rel.variable.as_deref() else {
+            return Ok(filters);
+        };
+
+        for conjunct in filter_conjuncts {
+            let Some(vars) = conjunct.referenced_vars.as_ref() else {
+                continue;
+            };
+            if vars.len() != 1 || !vars.iter().any(|var| var.eq_ignore_ascii_case(rel_variable)) {
+                continue;
+            }
+            let Some((column_name, lower, upper)) =
+                exact_variable_column_literal_range(conjunct.expr, rel_variable)
+            else {
+                continue;
+            };
+            let Some(column_index) = self.find_column_index(&table.columns, &column_name) else {
+                continue;
+            };
+            let Some(column) = table.columns.get(column_index) else {
+                continue;
+            };
+            filters.push(RelationshipScanFilter {
+                column_id: column.column_id,
+                lower,
+                upper,
+            });
+        }
+
+        Ok(filters)
+    }
+
+    pub(super) fn scan_relationship_candidates_with_filters(
+        &self,
+        context: &ExecutionContext,
+        table_id: RelationId,
+        filters: &[RelationshipScanFilter],
+        projected_columns: Option<Vec<ColumnId>>,
+    ) -> DbResult<Option<Box<dyn super::TupleStream>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        if filters.len() >= 2 {
+            let multi = filters
+                .iter()
+                .map(|filter| {
+                    (
+                        filter.column_id,
+                        filter.lower.clone(),
+                        filter.upper.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            return match self.storage_dml.scan_table_multi_range_filter(
+                context.txn_id,
+                &context.snapshot,
+                table_id,
+                &multi,
+                projected_columns,
+            ) {
+                Ok(stream) => Ok(Some(stream)),
+                Err(error)
+                    if error.report().sqlstate == aiondb_core::SqlState::FeatureNotSupported =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let Some(filter) = filters.first() else {
+            return Ok(None);
+        };
+        match (&filter.lower, &filter.upper) {
+            (Bound::Included(lo), Bound::Included(hi)) if lo == hi => {
+                match self.storage_dml.scan_table_eq_filter(
+                    context.txn_id,
+                    &context.snapshot,
+                    table_id,
+                    filter.column_id,
+                    lo,
+                    projected_columns,
+                ) {
+                    Ok(stream) => Ok(Some(stream)),
+                    Err(error)
+                        if error.report().sqlstate == aiondb_core::SqlState::FeatureNotSupported =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => match self.storage_dml.scan_table_range_filter(
+                context.txn_id,
+                &context.snapshot,
+                table_id,
+                filter.column_id,
+                filter.lower.clone(),
+                filter.upper.clone(),
+                projected_columns,
+            ) {
+                Ok(stream) => Ok(Some(stream)),
+                Err(error)
+                    if error.report().sqlstate == aiondb_core::SqlState::FeatureNotSupported =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+        }
     }
 }

@@ -229,6 +229,7 @@ pub struct ExecutionContext {
     pub statement_tuple_writes: Arc<Mutex<HashSet<(RelationId, TupleId)>>>,
     pub graph_profile_actual_rows: Arc<Mutex<HashMap<String, u64>>>,
     pub graph_profile_elapsed_nanos: Arc<Mutex<HashMap<String, u64>>>,
+    pub graph_profile_runtime_text: Arc<Mutex<HashMap<String, String>>>,
     pub udf_depth: Arc<AtomicU32>,
     /// Counts how deeply trigger invocations are nested in the current
     /// statement. Triggers that fire DML which fires triggers can recurse
@@ -301,6 +302,7 @@ impl ExecutionContext {
             statement_tuple_writes: Arc::new(Mutex::new(HashSet::new())),
             graph_profile_actual_rows: Arc::new(Mutex::new(HashMap::new())),
             graph_profile_elapsed_nanos: Arc::new(Mutex::new(HashMap::new())),
+            graph_profile_runtime_text: Arc::new(Mutex::new(HashMap::new())),
             udf_depth: Arc::new(AtomicU32::new(0)),
             trigger_depth: Arc::new(AtomicU32::new(0)),
             fk_cascade_depth: Arc::new(AtomicU32::new(0)),
@@ -451,6 +453,27 @@ impl ExecutionContext {
                 ))
             })
             .map(|counters| counters.clone())
+    }
+
+    pub fn record_graph_profile_runtime_text(&self, key: &str, value: &str) -> DbResult<()> {
+        let mut values = self.graph_profile_runtime_text.lock().map_err(|e| {
+            DbError::internal(format!(
+                "execution context graph profile runtime text lock poisoned: {e}"
+            ))
+        })?;
+        values.insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    pub fn snapshot_graph_profile_runtime_text(&self) -> DbResult<HashMap<String, String>> {
+        self.graph_profile_runtime_text
+            .lock()
+            .map_err(|e| {
+                DbError::internal(format!(
+                    "execution context graph profile runtime text lock poisoned: {e}"
+                ))
+            })
+            .map(|values| values.clone())
     }
 
     pub fn current_session_setting(
@@ -929,6 +952,7 @@ impl Default for ExecutionContext {
             statement_tuple_writes: Arc::new(Mutex::new(HashSet::new())),
             graph_profile_actual_rows: Arc::new(Mutex::new(HashMap::new())),
             graph_profile_elapsed_nanos: Arc::new(Mutex::new(HashMap::new())),
+            graph_profile_runtime_text: Arc::new(Mutex::new(HashMap::new())),
             udf_depth: Arc::new(AtomicU32::new(0)),
             trigger_depth: Arc::new(AtomicU32::new(0)),
             fk_cascade_depth: Arc::new(AtomicU32::new(0)),

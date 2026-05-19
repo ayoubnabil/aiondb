@@ -167,6 +167,89 @@ impl<'a> GraphRowProvider for ExecutorGraphRowProvider<'a> {
 }
 
 impl<'a> ExecutorGraphRowProvider<'a> {
+    fn collect_indexed_adjacent_edges(
+        &self,
+        edge_table_id: RelationId,
+        endpoint_idx: usize,
+        node_id: &Value,
+        seen: &mut HashSet<TupleId>,
+        result: &mut Vec<GraphAdjacentEdge>,
+    ) -> DbResult<bool> {
+        let Some(index_id) = self.executor.find_btree_index_for_column_ordinal(
+            self.context,
+            edge_table_id,
+            endpoint_idx,
+        )? else {
+            return Ok(false);
+        };
+        let mut stream = self.executor.scan_index_locked(
+            self.context,
+            edge_table_id,
+            index_id,
+            exact_lookup_key_range(node_id),
+            None,
+        )?;
+        while let Some(record) = stream.next()? {
+            self.context.check_deadline()?;
+            if !seen.insert(record.tuple_id) {
+                continue;
+            }
+            let compat = self.executor.compat_scan_row_for_table_id(
+                self.context,
+                edge_table_id,
+                &record,
+            )?;
+            if compat.values.get(endpoint_idx) != Some(node_id) {
+                continue;
+            }
+            result.push(GraphAdjacentEdge {
+                row: compat,
+                tuple_id: record.tuple_id,
+            });
+        }
+        Ok(true)
+    }
+
+    fn collect_scanned_adjacent_edges(
+        &self,
+        edge_table_id: RelationId,
+        src_idx: usize,
+        tgt_idx: usize,
+        node_id: &Value,
+        direction: aiondb_graph::traversal::TraversalDirection,
+        seen: &mut HashSet<TupleId>,
+        result: &mut Vec<GraphAdjacentEdge>,
+    ) -> DbResult<()> {
+        let mut stream = self
+            .executor
+            .scan_table_locked(self.context, edge_table_id, None)?;
+        while let Some(record) = stream.next()? {
+            self.context.check_deadline()?;
+            if !seen.insert(record.tuple_id) {
+                continue;
+            }
+            let compat =
+                self.executor
+                    .compat_scan_row_for_table_id(self.context, edge_table_id, &record)?;
+            let src = compat.values.get(src_idx).unwrap_or(&Value::Null);
+            let tgt = compat.values.get(tgt_idx).unwrap_or(&Value::Null);
+            let matches = match direction {
+                aiondb_graph::traversal::TraversalDirection::Outgoing => src == node_id,
+                aiondb_graph::traversal::TraversalDirection::Incoming => tgt == node_id,
+                aiondb_graph::traversal::TraversalDirection::Both => {
+                    src == node_id || tgt == node_id
+                }
+            };
+            if matches {
+                result.push(GraphAdjacentEdge {
+                    row: compat,
+                    tuple_id: record.tuple_id,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn fallback_adjacency_lookup_edges(
         &self,
         edge_table_id: RelationId,
@@ -187,28 +270,72 @@ impl<'a> ExecutorGraphRowProvider<'a> {
             };
 
         let mut result = Vec::new();
-        let mut stream = self
-            .executor
-            .scan_table_locked(self.context, edge_table_id, None)?;
-        while let Some(record) = stream.next()? {
-            self.context.check_deadline()?;
-            let compat =
-                self.executor
-                    .compat_scan_row_for_table_id(self.context, edge_table_id, &record)?;
-            let src = compat.values.get(src_idx).unwrap_or(&Value::Null);
-            let tgt = compat.values.get(tgt_idx).unwrap_or(&Value::Null);
-            let matches = match direction {
-                aiondb_graph::traversal::TraversalDirection::Outgoing => src == node_id,
-                aiondb_graph::traversal::TraversalDirection::Incoming => tgt == node_id,
-                aiondb_graph::traversal::TraversalDirection::Both => {
-                    src == node_id || tgt == node_id
+        let mut seen = HashSet::new();
+        match direction {
+            aiondb_graph::traversal::TraversalDirection::Outgoing => {
+                if !self.collect_indexed_adjacent_edges(
+                    edge_table_id,
+                    src_idx,
+                    node_id,
+                    &mut seen,
+                    &mut result,
+                )? {
+                    self.collect_scanned_adjacent_edges(
+                        edge_table_id,
+                        src_idx,
+                        tgt_idx,
+                        node_id,
+                        direction,
+                        &mut seen,
+                        &mut result,
+                    )?;
                 }
-            };
-            if matches {
-                result.push(GraphAdjacentEdge {
-                    row: compat,
-                    tuple_id: record.tuple_id,
-                });
+            }
+            aiondb_graph::traversal::TraversalDirection::Incoming => {
+                if !self.collect_indexed_adjacent_edges(
+                    edge_table_id,
+                    tgt_idx,
+                    node_id,
+                    &mut seen,
+                    &mut result,
+                )? {
+                    self.collect_scanned_adjacent_edges(
+                        edge_table_id,
+                        src_idx,
+                        tgt_idx,
+                        node_id,
+                        direction,
+                        &mut seen,
+                        &mut result,
+                    )?;
+                }
+            }
+            aiondb_graph::traversal::TraversalDirection::Both => {
+                let used_source_index = self.collect_indexed_adjacent_edges(
+                    edge_table_id,
+                    src_idx,
+                    node_id,
+                    &mut seen,
+                    &mut result,
+                )?;
+                let used_target_index = self.collect_indexed_adjacent_edges(
+                    edge_table_id,
+                    tgt_idx,
+                    node_id,
+                    &mut seen,
+                    &mut result,
+                )?;
+                if !(used_source_index || used_target_index) {
+                    self.collect_scanned_adjacent_edges(
+                        edge_table_id,
+                        src_idx,
+                        tgt_idx,
+                        node_id,
+                        direction,
+                        &mut seen,
+                        &mut result,
+                    )?;
+                }
             }
         }
         Ok(result)
@@ -254,6 +381,8 @@ impl Executor {
             )?;
 
         let mut runtime_cache = GraphMatchRuntimeCache::default();
+        let mut shortest_path_node_row_cache: HashMap<(RelationId, String), Arc<Row>> =
+            HashMap::new();
         let start_bindings =
             self.match_node(context, start_node_pat, input_bindings, &mut runtime_cache)?;
         let start_and_end_bindings =
@@ -471,6 +600,7 @@ impl Executor {
                             end_table_id,
                             &end_id,
                             Arc::clone(&end_row_arc),
+                            &mut shortest_path_node_row_cache,
                         )?;
                         Executor::bind_full_shortest_path(
                             self,
@@ -511,6 +641,7 @@ impl Executor {
         end_table_id: RelationId,
         end_id: &Value,
         end_row: Arc<Row>,
+        node_row_cache: &mut HashMap<(RelationId, String), Arc<Row>>,
     ) -> DbResult<Vec<GraphPathElement>> {
         let mut path = Vec::with_capacity(path_edges.len().saturating_mul(2).saturating_add(1));
         path.push(GraphPathElement::Node {
@@ -550,10 +681,19 @@ impl Executor {
             let node_row = if is_last && target_id == *end_id {
                 (*end_row).clone()
             } else {
-                self.fetch_shortest_path_node_row(context, start_table_id, &target_id)?
-                    .unwrap_or_else(|| Row {
-                        values: vec![target_id.clone()],
-                    })
+                let cache_key = (start_table_id, format!("{target_id:?}"));
+                if let Some(cached) = node_row_cache.get(&cache_key) {
+                    (**cached).clone()
+                } else {
+                    let fetched = Arc::new(
+                        self.fetch_shortest_path_node_row(context, start_table_id, &target_id)?
+                            .unwrap_or_else(|| Row {
+                                values: vec![target_id.clone()],
+                            }),
+                    );
+                    node_row_cache.insert(cache_key, Arc::clone(&fetched));
+                    (*fetched).clone()
+                }
             };
             path.push(GraphPathElement::Node {
                 table_id: if is_last {
@@ -617,7 +757,8 @@ impl Executor {
     ) -> DbResult<()> {
         let mut node_vars: Vec<String> = Vec::new();
         let mut rel_vars: Vec<String> = Vec::new();
-        let mut node_rows_by_table: HashMap<RelationId, HashMap<String, Arc<Row>>> = HashMap::new();
+        let mut node_rows_by_table: HashMap<RelationId, HashMap<String, Arc<Row>>> =
+            HashMap::new();
 
         for element in path {
             match element {
@@ -647,22 +788,19 @@ impl Executor {
                     let full_row: Arc<Row> = if row.values.len() > 1 {
                         Arc::new(row.clone())
                     } else {
-                        if !node_rows_by_table.contains_key(table_id) {
-                            let mut index = HashMap::new();
-                            let mut stream = self.scan_table_locked(context, *table_id, None)?;
-                            while let Some(record) = stream.next()? {
-                                context.check_deadline()?;
-                                if let Some(key) = record.row.values.first() {
-                                    index.insert(format!("{key:?}"), Arc::new(record.row.clone()));
-                                }
-                            }
-                            node_rows_by_table.insert(*table_id, index);
+                        let table_cache =
+                            node_rows_by_table.entry(*table_id).or_default();
+                        let cache_key = format!("{id_value:?}");
+                        if let Some(cached) = table_cache.get(&cache_key) {
+                            Arc::clone(cached)
+                        } else {
+                            let fetched = self
+                                .fetch_shortest_path_node_row(context, *table_id, &id_value)?
+                                .map(Arc::new)
+                                .unwrap_or_else(|| Arc::new(row.clone()));
+                            table_cache.insert(cache_key, Arc::clone(&fetched));
+                            fetched
                         }
-                        node_rows_by_table
-                            .get(table_id)
-                            .and_then(|idx| idx.get(&format!("{id_value:?}")))
-                            .map(Arc::clone)
-                            .unwrap_or_else(|| Arc::new(row.clone()))
                     };
                     let shared_row: SharedRow = full_row;
                     binding.insert_binding(

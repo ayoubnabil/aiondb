@@ -278,6 +278,501 @@ fn explain_match_includes_graph_access_lines() {
             .any(|line| line.contains("fallback=Some(RowStore)")),
         "explain lines: {lines:?}"
     );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access Summary:")
+                && line.contains("row_store_source=0")
+                && line.contains("traversal_store_source=1")
+                && line.contains("row_fallback_patterns=1")
+                && line.contains("row_store_traversal_patterns=0")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access Warning:")
+                && line.contains("0 relationship patterns are row-store only")
+                && line.contains("1 patterns still keep a row-store fallback")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_one_hop_id_lookup_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_runtime (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_runtime (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_fast_runtime VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_runtime VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_fast_runtime ON people_explain_fast_runtime; \
+             CREATE EDGE LABEL knows_explain_fast_runtime ON knows_explain_fast_runtime SOURCE person_explain_fast_runtime TARGET person_explain_fast_runtime",
+        )
+        .expect("setup explain fast runtime tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_runtime {id: 1})-[:knows_explain_fast_runtime]->(b:person_explain_fast_runtime) RETURN b.id",
+        )
+        .expect("execute explain fast runtime match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_one_hop_id_lookup")
+                && line.contains("reason=anchored_start_id_to_target_id")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_one_hop_endpoint_id_lookup_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_endpoint (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_endpoint (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_fast_endpoint VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_endpoint VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_fast_endpoint ON people_explain_fast_endpoint; \
+             CREATE EDGE LABEL knows_explain_fast_endpoint ON knows_explain_fast_endpoint SOURCE person_explain_fast_endpoint TARGET person_explain_fast_endpoint",
+        )
+        .expect("setup explain fast endpoint tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_endpoint)-[:knows_explain_fast_endpoint]->(b:person_explain_fast_endpoint {id: 2}) RETURN a.id ORDER BY a.id",
+        )
+        .expect("execute explain fast endpoint match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_one_hop_endpoint_id_lookup")
+                && line.contains("reason=anchored_endpoint_id_lookup")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_unanchored_edge_filter_limit_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_edge_filter (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_edge_filter (source_id INT NOT NULL, target_id INT NOT NULL, weight INT); \
+             INSERT INTO people_explain_fast_edge_filter VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_edge_filter VALUES (1, 2, 10); \
+             CREATE NODE LABEL person_explain_fast_edge_filter ON people_explain_fast_edge_filter; \
+             CREATE EDGE LABEL knows_explain_fast_edge_filter ON knows_explain_fast_edge_filter SOURCE person_explain_fast_edge_filter TARGET person_explain_fast_edge_filter",
+        )
+        .expect("setup explain fast edge-filter tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_edge_filter)-[r:knows_explain_fast_edge_filter]->(b:person_explain_fast_edge_filter) WHERE r.weight > 5 RETURN b.id LIMIT 10",
+        )
+        .expect("execute explain fast edge-filter match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_edge_filter_limit")
+                && line.contains("reason=unanchored_edge_weight_gt_limit")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_unanchored_edge_eq_filter_limit_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_edge_eq (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_edge_eq (source_id INT NOT NULL, target_id INT NOT NULL, weight INT); \
+             INSERT INTO people_explain_fast_edge_eq VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_edge_eq VALUES (1, 2, 10); \
+             CREATE NODE LABEL person_explain_fast_edge_eq ON people_explain_fast_edge_eq; \
+             CREATE EDGE LABEL knows_explain_fast_edge_eq ON knows_explain_fast_edge_eq SOURCE person_explain_fast_edge_eq TARGET person_explain_fast_edge_eq",
+        )
+        .expect("setup explain fast edge-eq tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_edge_eq)-[:knows_explain_fast_edge_eq {weight: 10}]->(b:person_explain_fast_edge_eq) RETURN b.id LIMIT 10",
+        )
+        .expect("execute explain fast edge-eq match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_edge_eq_filter_limit")
+                && line.contains("reason=unanchored_edge_weight_eq_limit")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_unanchored_one_hop_limit_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_one_hop_limit (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_one_hop_limit (source_id INT NOT NULL, target_id INT NOT NULL); \
+             INSERT INTO people_explain_fast_one_hop_limit VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_one_hop_limit VALUES (1, 2); \
+             CREATE NODE LABEL person_explain_fast_one_hop_limit ON people_explain_fast_one_hop_limit; \
+             CREATE EDGE LABEL knows_explain_fast_one_hop_limit ON knows_explain_fast_one_hop_limit SOURCE person_explain_fast_one_hop_limit TARGET person_explain_fast_one_hop_limit",
+        )
+        .expect("setup explain fast one-hop limit tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_one_hop_limit)-[:knows_explain_fast_one_hop_limit]->(b:person_explain_fast_one_hop_limit) RETURN b.name LIMIT 10",
+        )
+        .expect("execute explain fast one-hop limit match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_one_hop_limit")
+                && line.contains("reason=single_hop_projection_limit")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_fast_multi_out_limit_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_multi (id INT NOT NULL, number INT); \
+             CREATE TABLE knows_explain_fast_multi_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_fast_multi ON people_explain_fast_multi; \
+             CREATE EDGE LABEL knows_explain_fast_multi ON knows_explain_fast_multi_edges SOURCE person_explain_fast_multi TARGET person_explain_fast_multi; \
+             INSERT INTO people_explain_fast_multi VALUES (1, 0), (2, 30), (3, 10), (4, 40); \
+             INSERT INTO knows_explain_fast_multi_edges VALUES (1, 2), (1, 3), (1, 4)",
+        )
+        .expect("setup explain fast multi-out tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_fast_multi)-[:knows_explain_fast_multi]->(b:person_explain_fast_multi), \
+                    (a)-[:knows_explain_fast_multi]->(c:person_explain_fast_multi) \
+             RETURN b.id, c.id LIMIT 4",
+        )
+        .expect("execute explain analyze fast multi-out match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_multi_out_limit")
+                && line.contains("reason=shared_source_dual_expand_limit")
+                && line.contains("source=observed")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_fast_unanchored_two_hop_limit_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_two_hop_limit (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_explain_fast_two_hop_limit_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_fast_two_hop_limit ON people_explain_fast_two_hop_limit; \
+             CREATE EDGE LABEL knows_explain_fast_two_hop_limit ON knows_explain_fast_two_hop_limit_edges SOURCE person_explain_fast_two_hop_limit TARGET person_explain_fast_two_hop_limit; \
+             INSERT INTO people_explain_fast_two_hop_limit VALUES (1, 0), (2, 0), (3, 0), (4, 70), (5, 80), (6, 10); \
+             INSERT INTO knows_explain_fast_two_hop_limit_edges VALUES (1, 2), (1, 3), (2, 4), (3, 4), (3, 5), (6, 3)",
+        )
+        .expect("setup explain fast two-hop limit tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_fast_two_hop_limit)-[:knows_explain_fast_two_hop_limit]->(b:person_explain_fast_two_hop_limit)-[:knows_explain_fast_two_hop_limit]->(c:person_explain_fast_two_hop_limit) \
+             RETURN c.id LIMIT 4",
+        )
+        .expect("execute explain analyze fast two-hop limit match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_two_hop_limit")
+                && line.contains("reason=two_hop_projection_limit")
+                && line.contains("source=observed")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_fast_hybrid_graph_vector_rel_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE users_explain_hybrid (id INT NOT NULL, name TEXT, tenant_id INT); \
+             CREATE TABLE docs_explain_hybrid (id INT NOT NULL, title TEXT, embedding VECTOR(3), tenant_id INT); \
+             CREATE TABLE wrote_explain_hybrid (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE TABLE cites_explain_hybrid (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE INDEX idx_users_explain_hybrid_id ON users_explain_hybrid(id); \
+             CREATE INDEX idx_users_explain_hybrid_tenant ON users_explain_hybrid(tenant_id); \
+             CREATE INDEX idx_docs_explain_hybrid_id ON docs_explain_hybrid(id); \
+             CREATE NODE LABEL UserHybrid ON users_explain_hybrid; \
+             CREATE NODE LABEL DocumentHybrid ON docs_explain_hybrid; \
+             CREATE EDGE LABEL WROTE_HYBRID ON wrote_explain_hybrid SOURCE UserHybrid TARGET DocumentHybrid; \
+             CREATE EDGE LABEL CITES_HYBRID ON cites_explain_hybrid SOURCE DocumentHybrid TARGET DocumentHybrid; \
+             INSERT INTO users_explain_hybrid VALUES (1, 'Alice', 100), (2, 'Bob', 100), (3, 'Cara', 200); \
+             INSERT INTO docs_explain_hybrid VALUES \
+                 (10, 'AionDB Guide', '[0.1,0.9,0.2]', 100), \
+                 (11, 'Postgres vs AionDB', '[0.2,0.8,0.1]', 100), \
+                 (12, 'Secret Project X', '[0.9,0.1,0.1]', 200), \
+                 (13, 'Graph Vector DBs', '[0.15,0.85,0.2]', 100); \
+             INSERT INTO wrote_explain_hybrid VALUES (1, 11), (1, 13), (2, 10), (3, 12); \
+             INSERT INTO cites_explain_hybrid VALUES (11, 10), (13, 10), (12, 13)",
+        )
+        .expect("setup explain hybrid graph-vector tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (u:UserHybrid)-[:WROTE_HYBRID]->(s:DocumentHybrid)-[:CITES_HYBRID]->(t:DocumentHybrid) \
+             WHERE u.tenant_id = 100 \
+               AND t.tenant_id = 100 \
+               AND l2_distance(t.embedding, '[0.1,0.8,0.2]') < 0.5 \
+             RETURN u.name, s.title, t.title \
+             ORDER BY u.name LIMIT 10",
+        )
+        .expect("execute explain analyze hybrid graph-vector match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_hybrid_graph_vector_rel")
+                && line.contains("reason=graph_vector_distance_threshold")
+                && line.contains("source=observed")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_fast_hybrid_deep_graph_vector_rel_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE users_explain_hybrid_deep (id INT NOT NULL, name TEXT, tenant_id INT); \
+             CREATE TABLE docs_explain_hybrid_deep (id INT NOT NULL, title TEXT, embedding VECTOR(3), tenant_id INT, popularity INT); \
+             CREATE TABLE follows_explain_hybrid_deep (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE TABLE wrote_explain_hybrid_deep (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE TABLE cites_explain_hybrid_deep (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE INDEX idx_users_explain_hybrid_deep_id ON users_explain_hybrid_deep(id); \
+             CREATE INDEX idx_docs_explain_hybrid_deep_id ON docs_explain_hybrid_deep(id); \
+             CREATE NODE LABEL UserHybridDeep ON users_explain_hybrid_deep; \
+             CREATE NODE LABEL DocumentHybridDeep ON docs_explain_hybrid_deep; \
+             CREATE EDGE LABEL FOLLOWS_HYBRID_DEEP ON follows_explain_hybrid_deep SOURCE UserHybridDeep TARGET UserHybridDeep; \
+             CREATE EDGE LABEL WROTE_HYBRID_DEEP ON wrote_explain_hybrid_deep SOURCE UserHybridDeep TARGET DocumentHybridDeep; \
+             CREATE EDGE LABEL CITES_HYBRID_DEEP ON cites_explain_hybrid_deep SOURCE DocumentHybridDeep TARGET DocumentHybridDeep; \
+             INSERT INTO users_explain_hybrid_deep VALUES (1, 'Alice', 100), (2, 'Bob', 100), (3, 'Cara', 200); \
+             INSERT INTO docs_explain_hybrid_deep VALUES \
+                 (10, 'AionDB Guide', '[0.1,0.9,0.2]', 100, 80), \
+                 (11, 'Postgres vs AionDB', '[0.2,0.8,0.1]', 100, 70), \
+                 (12, 'Secret Project X', '[0.9,0.1,0.1]', 200, 20), \
+                 (13, 'Graph Vector DBs', '[0.15,0.85,0.2]', 100, 95); \
+             INSERT INTO follows_explain_hybrid_deep VALUES (1, 2), (1, 3); \
+             INSERT INTO wrote_explain_hybrid_deep VALUES (2, 11), (3, 12); \
+             INSERT INTO cites_explain_hybrid_deep VALUES (11, 10), (12, 13)",
+        )
+        .expect("setup explain deep hybrid graph-vector tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (u:UserHybridDeep)-[:FOLLOWS_HYBRID_DEEP]->(f:UserHybridDeep)-[:WROTE_HYBRID_DEEP]->(s:DocumentHybridDeep)-[:CITES_HYBRID_DEEP]->(t:DocumentHybridDeep) \
+             WHERE u.id = 1 \
+               AND f.tenant_id = u.tenant_id \
+               AND t.tenant_id = u.tenant_id \
+               AND t.popularity > 50 \
+               AND l2_distance(t.embedding, '[0.1,0.8,0.2]') < 0.5 \
+             RETURN f.id, s.title, t.title, t.popularity, l2_distance(t.embedding, '[0.1,0.8,0.2]') AS dist \
+             ORDER BY dist, t.popularity DESC LIMIT 10",
+        )
+        .expect("execute explain analyze deep hybrid graph-vector match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_hybrid_deep_graph_vector_rel")
+                && line.contains("reason=deep_graph_vector_distance_threshold")
+                && line.contains("source=observed")
+        }),
+        "explain lines: {lines:?}"
+    );
 }
 
 #[test]
@@ -322,6 +817,7 @@ fn explain_analyze_match_includes_graph_actual_rows() {
             line.contains("Graph Summary Severity:")
                 && line.contains("severity=watch")
                 && line.contains("fragile_pivots=1")
+                && line.contains("source=mixed")
         }),
         "explain analyze lines: {lines:?}"
     );
@@ -330,6 +826,8 @@ fn explain_analyze_match_includes_graph_actual_rows() {
             line.contains("Graph Summary JSON:")
                 && line.contains("\"severity\":\"watch\"")
                 && line.contains("\"fragile_pivots\":1")
+                && line.contains("\"drift_metrics_source\":\"observed\"")
+                && line.contains("\"join_risk_metrics_source\":\"observed\"")
                 && line.contains("\"risky_join_clauses\":0")
                 && line.contains("\"max_fanout\":0.0")
         }),
@@ -337,8 +835,17 @@ fn explain_analyze_match_includes_graph_actual_rows() {
     );
     assert!(
         lines.iter().any(|line| {
+            line.contains("Graph Drift Summary:")
+                && line.contains("source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
             line.contains("Graph Detail JSON:")
-                && line.contains("\"summary\":{\"severity\":\"watch\"")
+                && line.contains("\"summary\":{\"query_runtime_strategy\":\"general_graph_runtime\"")
+                && line.contains("\"query_runtime_source\":\"observed\"")
+                && line.contains("\"severity\":\"watch\"")
                 && line.contains("\"clauses\":[{\"kind\":\"PipelineMatch\"")
                 && line.contains("\"actual_rows\":1")
         }),
@@ -402,9 +909,107 @@ fn query_engine_explain_graph_json_helpers_return_structured_payloads() {
 
     assert_eq!(summary_json["severity"], "watch");
     assert_eq!(summary_json["fragile_pivots"], 1);
+    assert_eq!(summary_json["row_store_source"], 0);
+    assert_eq!(summary_json["traversal_store_source"], 1);
+    assert_eq!(summary_json["row_fallback_patterns"], 1);
+    assert_eq!(summary_json["row_store_traversal_patterns"], 0);
     assert_eq!(detail_json["summary"]["severity"], "watch");
+    assert_eq!(detail_json["summary"]["row_store_source"], 0);
+    assert_eq!(detail_json["summary"]["traversal_store_source"], 1);
+    assert_eq!(detail_json["summary"]["row_fallback_patterns"], 1);
+    assert_eq!(detail_json["summary"]["row_store_traversal_patterns"], 0);
     assert_eq!(detail_json["clauses"][0]["kind"], "PipelineMatch");
     assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["actual_rows"], 1);
+}
+
+#[test]
+fn query_engine_explain_graph_json_helpers_surface_cbo_selected_seed_end_to_end() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+    let query_engine: &dyn crate::engine::api::QueryEngine = &engine;
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_cbo_pivot (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_cbo_pivot (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE INDEX people_explain_cbo_pivot_name_idx ON people_explain_cbo_pivot (name); \
+             INSERT INTO people_explain_cbo_pivot VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_cbo_pivot VALUES (1, 2); \
+             ANALYZE people_explain_cbo_pivot; \
+             ANALYZE knows_explain_cbo_pivot; \
+             CREATE NODE LABEL person_explain_cbo_pivot ON people_explain_cbo_pivot; \
+             CREATE EDGE LABEL knows_explain_cbo_pivot ON knows_explain_cbo_pivot SOURCE person_explain_cbo_pivot TARGET person_explain_cbo_pivot",
+        )
+        .expect("setup graph explain cbo pivot tables");
+
+    let detail_json = query_engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_cbo_pivot)-[:knows_explain_cbo_pivot]->(b:person_explain_cbo_pivot {name: 'Bob'}) RETURN b.id",
+            true,
+        )
+        .expect("detail json");
+
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_mode"], "indexed");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["seed_mode_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["seed_constraints_source"],
+        "inferred"
+    );
+    assert!(
+        detail_json["clauses"][0]["pattern_details"][0]["seed"]
+            .as_str()
+            .is_some_and(|seed| seed.contains("{name}")),
+        "detail_json={detail_json:?}"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "left_to_right_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "retained_leftmost"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["seed_binding_state_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["correlated_vars_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["first_rel_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["first_rel_mode_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["first_rel_constraints_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["bound_vars_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["flags_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["shape_source"],
+        "inferred"
+    );
 }
 
 #[test]
@@ -441,7 +1046,11 @@ fn explain_format_json_returns_single_json_payload_row() {
     assert_eq!(payload["schema_version"], 1);
     assert_eq!(payload["format_kind"], "aiondb.explain_json");
     assert_eq!(payload["graph_summary"]["severity"], "watch");
+    assert_eq!(payload["graph_summary"]["row_store_source"], 0);
+    assert_eq!(payload["graph_summary"]["traversal_store_source"], 1);
     assert_eq!(payload["graph_detail"]["summary"]["severity"], "watch");
+    assert_eq!(payload["graph_detail"]["summary"]["row_store_source"], 0);
+    assert_eq!(payload["graph_detail"]["summary"]["traversal_store_source"], 1);
     assert_eq!(payload["graph_detail"]["clauses"][0]["kind"], "PipelineMatch");
     assert!(
         payload["query_plan_lines"]
@@ -496,7 +1105,11 @@ fn explain_analyze_format_json_returns_actual_graph_metrics() {
     assert_eq!(payload["schema_version"], 1);
     assert_eq!(payload["format_kind"], "aiondb.explain_json");
     assert_eq!(payload["graph_summary"]["severity"], "watch");
+    assert_eq!(payload["graph_summary"]["drift_metrics_source"], "observed");
+    assert_eq!(payload["graph_summary"]["join_risk_metrics_source"], "observed");
     assert_eq!(payload["graph_detail"]["summary"]["severity"], "watch");
+    assert_eq!(payload["graph_detail"]["summary"]["drift_metrics_source"], "observed");
+    assert_eq!(payload["graph_detail"]["summary"]["join_risk_metrics_source"], "observed");
     assert_eq!(
         payload["graph_detail"]["clauses"][0]["actual_input_rows"],
         1
@@ -558,6 +1171,19 @@ fn explain_analyze_shared_anchor_star_includes_per_pattern_actual_rows() {
 
     assert!(
         lines.iter().any(|line| {
+            line.contains("Graph Clause [PipelineMatch 0]:")
+                && line.contains("patterns=2")
+                && line.contains("runtime_strategy=pattern_by_pattern")
+                && line.contains("runtime_strategy_reason=general_multi_pattern_clause")
+                && line.contains("runtime_strategy_reason_source=observed")
+                && line.contains("runtime_strategy_blocker=anchor_not_shared")
+                && line.contains("runtime_strategy_blocker_source=observed")
+                && line.contains("runtime_strategy_source=observed")
+        }),
+        "explain analyze star lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
             line.contains("Graph Access [PipelineMatch 0 pattern 0]")
                 && line.contains("actual_rows=2")
                 && line.contains("actual_time_ms=")
@@ -571,6 +1197,38 @@ fn explain_analyze_shared_anchor_star_includes_per_pattern_actual_rows() {
                 && line.contains("actual_time_ms=")
         }),
         "explain analyze star lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_star)-[:knows_explain_star]->(b:person_explain_star), (a)-[:knows_explain_star]->(c:person_explain_star) RETURN a.id, b.id, c.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy"],
+        "pattern_by_pattern"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_reason"],
+        "general_multi_pattern_clause"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_blocker"],
+        "anchor_not_shared"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_blocker_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_source"],
+        "observed"
     );
 }
 
@@ -631,10 +1289,38 @@ fn explain_analyze_independent_multi_scan_reports_risk_severity() {
         lines.iter().any(|line| {
             line.contains("Graph Join Risk [PipelineMatch 0]:")
                 && line.contains("severity=high")
+                && line.contains("join_risk_source=observed")
+                && line.contains("correlated_source=inferred")
+                && line.contains("shared_anchor_source=inferred")
+                && line.contains("join_shape_source=inferred")
                 && line.contains("correlated=false")
                 && line.contains("join_shape=independent_multi_scan")
         }),
         "explain analyze independent lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_independent), (b:person_explain_independent) RETURN a.id, b.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["join_risk_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["correlated_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["shared_anchor_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["join_shape_source"],
+        "inferred"
     );
 }
 
@@ -700,6 +1386,7 @@ fn explain_analyze_distinct_star_semijoin_includes_per_pattern_actual_rows() {
 fn explain_graph_procedure_includes_projection_lines() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
+    let query_engine: &dyn crate::engine::api::QueryEngine = &engine;
 
     let results = engine
         .execute_sql(
@@ -720,6 +1407,21 @@ fn explain_graph_procedure_includes_projection_lines() {
             line.as_str()
         })
         .collect();
+
+    let summary_json = query_engine
+        .execute_explain_graph_summary_json(
+            &session,
+            "CALL graph.pageRank() YIELD nodeId, score RETURN nodeId, score",
+            false,
+        )
+        .expect("procedure summary json");
+    let detail_json = query_engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "CALL graph.pageRank() YIELD nodeId, score RETURN nodeId, score",
+            false,
+        )
+        .expect("procedure detail json");
 
     assert!(
         lines
@@ -751,6 +1453,25 @@ fn explain_graph_procedure_includes_projection_lines() {
             .any(|line| line.contains("node_count=unknown") && line.contains("edge_count=unknown")),
         "explain lines: {lines:?}"
     );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Procedure Summary:")
+                && line.contains("total_procedures=1")
+                && line.contains("projection_store_source=1")
+                && line.contains("row_fallback_procedures=1")
+                && line.contains("weighted_projection=0")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+    assert_eq!(summary_json["total_procedures"], 1);
+    assert_eq!(summary_json["procedure_projection_store_source"], 1);
+    assert_eq!(summary_json["row_fallback_procedures"], 1);
+    assert_eq!(summary_json["weighted_projection_procedures"], 0);
+    assert_eq!(detail_json["summary"]["total_procedures"], 1);
+    assert_eq!(detail_json["summary"]["procedure_projection_store_source"], 1);
+    assert_eq!(detail_json["summary"]["row_fallback_procedures"], 1);
+    assert_eq!(detail_json["summary"]["weighted_projection_procedures"], 0);
 }
 
 #[test]
@@ -2818,6 +3539,566 @@ fn cypher_unanchored_edge_property_count_uses_projected_edge_scan() {
              WHERE e.weight > 10 RETURN count(b)",
         ),
         2,
+    );
+}
+
+#[test]
+fn cypher_unanchored_incoming_edge_property_count_uses_projected_edge_scan() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_incoming_edge_count_fast (id INT NOT NULL); \
+             CREATE TABLE knows_incoming_edge_count_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_incoming_edge_count_fast ON people_incoming_edge_count_fast; \
+             CREATE EDGE LABEL knows_incoming_edge_count_fast ON knows_incoming_edge_count_fast_edges SOURCE person_incoming_edge_count_fast TARGET person_incoming_edge_count_fast; \
+             CREATE INDEX knows_incoming_edge_count_fast_weight_idx ON knows_incoming_edge_count_fast_edges (weight); \
+             INSERT INTO people_incoming_edge_count_fast VALUES (1), (2), (3), (4); \
+             INSERT INTO knows_incoming_edge_count_fast_edges VALUES \
+                (1, 2, 5), (1, 3, 15), (2, 3, 20), (3, 4, 1)",
+        )
+        .expect("seed incoming edge filter count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_incoming_edge_count_fast)<-[e:knows_incoming_edge_count_fast]-(:person_incoming_edge_count_fast) \
+             WHERE e.weight >= 15 RETURN count(a)",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn cypher_unanchored_edge_property_and_endpoint_filter_count_uses_projected_edge_scan() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_edge_endpoint_filter_fast (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_edge_endpoint_filter_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_edge_endpoint_filter_fast ON people_edge_endpoint_filter_fast; \
+             CREATE EDGE LABEL knows_edge_endpoint_filter_fast ON knows_edge_endpoint_filter_fast_edges SOURCE person_edge_endpoint_filter_fast TARGET person_edge_endpoint_filter_fast; \
+             CREATE INDEX knows_edge_endpoint_filter_fast_weight_idx ON knows_edge_endpoint_filter_fast_edges (weight); \
+             INSERT INTO people_edge_endpoint_filter_fast VALUES (1, 10), (2, 20), (3, 80), (4, 90), (5, 15); \
+             INSERT INTO knows_edge_endpoint_filter_fast_edges VALUES \
+                (1, 2, 5), (1, 3, 15), (2, 3, 20), (3, 4, 1), (5, 4, 30)",
+        )
+        .expect("seed edge and endpoint filter graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (:person_edge_endpoint_filter_fast)-[e:knows_edge_endpoint_filter_fast]->(b:person_edge_endpoint_filter_fast) \
+             WHERE e.weight >= 15 AND b.number >= 80 RETURN count(b)",
+        ),
+        3,
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_relation_seeded_pattern_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_relation_seeded (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_explain_relation_seeded_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_explain_relation_seeded ON people_explain_relation_seeded; \
+             CREATE EDGE LABEL knows_explain_relation_seeded ON knows_explain_relation_seeded_edges SOURCE person_explain_relation_seeded TARGET person_explain_relation_seeded; \
+             CREATE INDEX knows_explain_relation_seeded_weight_idx ON knows_explain_relation_seeded_edges (weight); \
+             INSERT INTO people_explain_relation_seeded VALUES (1, 10), (2, 20), (3, 80), (4, 90), (5, 15); \
+             INSERT INTO knows_explain_relation_seeded_edges VALUES \
+                (1, 2, 5), (1, 3, 15), (2, 3, 20), (3, 4, 1), (5, 4, 30)",
+        )
+        .expect("seed relation-seeded explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_relation_seeded)-[e:knows_explain_relation_seeded]->(b:person_explain_relation_seeded) \
+             WHERE e.weight >= 15 AND b.number >= 80 \
+             RETURN a.id, b.id ORDER BY a.id, b.id",
+        )
+        .expect("execute explain analyze relation-seeded match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=relation_seeded")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=relationship_filter_seed")
+                && line.contains("pattern_runtime_reason_source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_relation_seeded)-[e:knows_explain_relation_seeded]->(b:person_explain_relation_seeded) \
+             WHERE e.weight >= 15 AND b.number >= 80 \
+             RETURN a.id, b.id ORDER BY a.id, b.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "relation_seeded"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "relationship_filter_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_path_function_pattern_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_path_function (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_path_function_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_explain_path_function ON people_explain_path_function; \
+             CREATE EDGE LABEL knows_explain_path_function ON knows_explain_path_function_edges SOURCE person_explain_path_function TARGET person_explain_path_function; \
+             INSERT INTO people_explain_path_function VALUES (10, 'Alice'), (20, 'Bob'), (30, 'Carol'); \
+             INSERT INTO knows_explain_path_function_edges VALUES (10, 20, 1), (20, 30, 1)",
+        )
+        .expect("seed path-function explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH shortestPath((a:person_explain_path_function {id: 10})-[:knows_explain_path_function*1..3]->(b:person_explain_path_function {id: 30})) RETURN 1",
+        )
+        .expect("execute explain analyze path-function match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=path_function")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=path_function_dispatch")
+                && line.contains("pattern_runtime_reason_source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH shortestPath((a:person_explain_path_function {id: 10})-[:knows_explain_path_function*1..3]->(b:person_explain_path_function {id: 30})) RETURN 1",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "path_function"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "path_function_dispatch"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_left_to_right_pattern_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_left_to_right (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_left_to_right_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_left_to_right ON people_explain_left_to_right; \
+             CREATE EDGE LABEL knows_explain_left_to_right ON knows_explain_left_to_right_edges SOURCE person_explain_left_to_right TARGET person_explain_left_to_right; \
+             INSERT INTO people_explain_left_to_right VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_left_to_right_edges VALUES (1, 2)",
+        )
+        .expect("seed left-to-right explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_left_to_right)-[:knows_explain_left_to_right]->(b:person_explain_left_to_right) RETURN a.id, b.id ORDER BY a.id, b.id",
+        )
+        .expect("execute explain analyze left-to-right match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=left_to_right_node_seed")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=left_to_right_walk")
+                && line.contains("pattern_runtime_reason_source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_left_to_right)-[:knows_explain_left_to_right]->(b:person_explain_left_to_right) RETURN a.id, b.id ORDER BY a.id, b.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "left_to_right_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "left_to_right_walk"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+}
+
+#[test]
+fn explain_analyze_match_reports_pivoted_node_seed_pattern_runtime() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_pivoted_runtime (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_pivoted_runtime_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_pivoted_runtime ON people_explain_pivoted_runtime; \
+             CREATE EDGE LABEL knows_explain_pivoted_runtime ON knows_explain_pivoted_runtime_edges SOURCE person_explain_pivoted_runtime TARGET person_explain_pivoted_runtime; \
+             INSERT INTO people_explain_pivoted_runtime VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'); \
+             INSERT INTO knows_explain_pivoted_runtime_edges VALUES (1, 2), (2, 3)",
+        )
+        .expect("seed pivoted-runtime explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_pivoted_runtime)-[:knows_explain_pivoted_runtime]->(b:person_explain_pivoted_runtime {name: 'Bob'})-[:knows_explain_pivoted_runtime]->(c:person_explain_pivoted_runtime) RETURN a.id, b.id, c.id",
+        )
+        .expect("execute explain analyze pivoted-runtime match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=pivoted_node_seed")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=pivot_seed")
+                && line.contains("pattern_runtime_reason_source=observed")
+                && line.contains("pivot_driver=cbo")
+                && line.contains("pivot_driver_source=observed")
+                && line.contains("pivot_reason=pivot_to_node_1:label_scan")
+                && line.contains("pivot_reason_source=observed")
+                && line.contains("pivot_decision=selected_node_1")
+                && line.contains("pivot_decision_source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_pivoted_runtime)-[:knows_explain_pivoted_runtime]->(b:person_explain_pivoted_runtime {name: 'Bob'})-[:knows_explain_pivoted_runtime]->(c:person_explain_pivoted_runtime) RETURN a.id, b.id, c.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "pivoted_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "pivot_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver"],
+        "cbo"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason"],
+        "pivot_to_node_1:label_scan"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "selected_node_1"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision_source"],
+        "observed"
+    );
+    let summary_json = engine
+        .execute_explain_graph_summary_json(
+            &session,
+            "MATCH (a:person_explain_pivoted_runtime)-[:knows_explain_pivoted_runtime]->(b:person_explain_pivoted_runtime {name: 'Bob'})-[:knows_explain_pivoted_runtime]->(c:person_explain_pivoted_runtime) RETURN a.id, b.id, c.id",
+            true,
+        )
+        .expect("graph summary json");
+    assert_eq!(summary_json["cbo_pivoted"], 1);
+    assert_eq!(summary_json["heuristic_pivoted"], 0);
+    assert_eq!(summary_json["selected_non_leftmost_source"], "observed");
+    assert_eq!(summary_json["pivot_driver_metrics_source"], "observed");
+}
+
+#[test]
+fn explain_analyze_match_reports_heuristic_pivot_driver() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_heuristic_pivot (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_heuristic_pivot_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_explain_heuristic_pivot ON people_explain_heuristic_pivot; \
+             CREATE EDGE LABEL knows_explain_heuristic_pivot ON knows_explain_heuristic_pivot_edges SOURCE person_explain_heuristic_pivot TARGET person_explain_heuristic_pivot; \
+             INSERT INTO people_explain_heuristic_pivot VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol'); \
+             INSERT INTO knows_explain_heuristic_pivot_edges VALUES (1, 2), (2, 3)",
+        )
+        .expect("seed heuristic-pivot explain graph");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN ANALYZE MATCH (a:person_explain_heuristic_pivot)-[:knows_explain_heuristic_pivot]-(b:person_explain_heuristic_pivot {name: 'Bob'})-[:knows_explain_heuristic_pivot]-(c:person_explain_heuristic_pivot) RETURN a.id, b.id, c.id",
+        )
+        .expect("execute explain analyze heuristic-pivot match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain analyze query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [PipelineMatch 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=pivoted_node_seed")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pivot_driver=heuristic")
+                && line.contains("pivot_driver_source=observed")
+                && line.contains("pivot_reason=pivot_to_node_1:label_scan")
+                && line.contains("pivot_reason_source=observed")
+                && line.contains("pivot_decision=selected_node_1")
+                && line.contains("pivot_decision_source=observed")
+        }),
+        "explain analyze lines: {lines:?}"
+    );
+
+    let detail_json = engine
+        .execute_explain_graph_detail_json(
+            &session,
+            "MATCH (a:person_explain_heuristic_pivot)-[:knows_explain_heuristic_pivot]-(b:person_explain_heuristic_pivot {name: 'Bob'})-[:knows_explain_heuristic_pivot]-(c:person_explain_heuristic_pivot) RETURN a.id, b.id, c.id",
+            true,
+        )
+        .expect("graph detail json");
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "pivoted_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver"],
+        "heuristic"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason"],
+        "pivot_to_node_1:label_scan"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "selected_node_1"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision_source"],
+        "observed"
+    );
+    let summary_json = engine
+        .execute_explain_graph_summary_json(
+            &session,
+            "MATCH (a:person_explain_heuristic_pivot)-[:knows_explain_heuristic_pivot]-(b:person_explain_heuristic_pivot {name: 'Bob'})-[:knows_explain_heuristic_pivot]-(c:person_explain_heuristic_pivot) RETURN a.id, b.id, c.id",
+            true,
+        )
+        .expect("graph summary json");
+    assert_eq!(summary_json["cbo_pivoted"], 0);
+    assert_eq!(summary_json["heuristic_pivoted"], 1);
+    assert_eq!(summary_json["selected_non_leftmost_source"], "observed");
+    assert_eq!(summary_json["pivot_driver_metrics_source"], "observed");
+}
+
+#[test]
+fn cypher_edge_property_filter_with_exact_endpoint_id_remains_correct() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_edge_exact_endpoint_fast (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_edge_exact_endpoint_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_edge_exact_endpoint_fast ON people_edge_exact_endpoint_fast; \
+             CREATE EDGE LABEL knows_edge_exact_endpoint_fast ON knows_edge_exact_endpoint_fast_edges SOURCE person_edge_exact_endpoint_fast TARGET person_edge_exact_endpoint_fast; \
+             CREATE INDEX knows_edge_exact_endpoint_fast_weight_idx ON knows_edge_exact_endpoint_fast_edges (weight); \
+             INSERT INTO people_edge_exact_endpoint_fast VALUES (1, 10), (2, 20), (3, 80), (4, 90), (5, 15); \
+             INSERT INTO knows_edge_exact_endpoint_fast_edges VALUES \
+                (1, 2, 5), (1, 3, 15), (2, 3, 20), (3, 4, 1), (5, 4, 30)",
+        )
+        .expect("seed edge exact endpoint graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (:person_edge_exact_endpoint_fast)-[e:knows_edge_exact_endpoint_fast]->(b:person_edge_exact_endpoint_fast {id: 3}) \
+             WHERE e.weight >= 15 RETURN count(b)",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn cypher_edge_property_filter_with_small_endpoint_candidate_set_remains_correct() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_edge_small_endpoint_fast (id INT NOT NULL, grp INT NOT NULL); \
+             CREATE TABLE knows_edge_small_endpoint_fast_edges (source_id INT NOT NULL, target_id INT NOT NULL, weight INT NOT NULL); \
+             CREATE NODE LABEL person_edge_small_endpoint_fast ON people_edge_small_endpoint_fast; \
+             CREATE EDGE LABEL knows_edge_small_endpoint_fast ON knows_edge_small_endpoint_fast_edges SOURCE person_edge_small_endpoint_fast TARGET person_edge_small_endpoint_fast; \
+             CREATE INDEX knows_edge_small_endpoint_fast_weight_idx ON knows_edge_small_endpoint_fast_edges (weight); \
+             INSERT INTO people_edge_small_endpoint_fast VALUES \
+                (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 3), (7, 3), (8, 3), (9, 3), (10, 3); \
+             INSERT INTO knows_edge_small_endpoint_fast_edges VALUES \
+                (1, 4, 50), (2, 4, 60), (3, 5, 70), (6, 4, 80), (7, 5, 5), (8, 9, 90)",
+        )
+        .expect("seed edge small endpoint graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (:person_edge_small_endpoint_fast)-[e:knows_edge_small_endpoint_fast]->(b:person_edge_small_endpoint_fast {grp: 2}) \
+             WHERE e.weight >= 50 RETURN count(b)",
+        ),
+        4,
     );
 }
 

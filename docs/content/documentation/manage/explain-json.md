@@ -96,6 +96,8 @@ Important fields include:
 - `fragile_pivots`
 - `blocked_pivots`
 - `selected_non_leftmost`
+- `selected_non_leftmost_source`
+- `pivot_driver_metrics_source`
 - `multi_pattern_clauses`
 - `correlated_clauses`
 - `shared_anchor_clauses`
@@ -105,8 +107,10 @@ Important fields include:
 - `independent_multi_scan`
 - `drift_patterns`
 - `high_drift_patterns`
+- `drift_metrics_source`
 - `risky_join_clauses`
 - `high_risk_join_clauses`
+- `join_risk_metrics_source`
 - `max_fanout`
 
 Current `severity` values are:
@@ -135,6 +139,20 @@ Each clause can expose:
 - `join_risk`
 - `pattern_details[]`
 
+`join_risk` can expose:
+
+- `severity`
+- `fanout`
+- `basis`
+- `join_risk_source`
+- `correlated`
+- `correlated_source`
+- `shared_anchor`
+- `shared_anchor_source`
+- `join_shape`
+- `join_shape_source`
+- `patterns`
+
 Each pattern detail can expose:
 
 - `estimated_rows`
@@ -145,16 +163,88 @@ Each pattern detail can expose:
 - `actual_time_ms`
 - `seed`
 - `seed_mode`
+- `seed_mode_source`
 - `seed_binding_state`
+- `seed_binding_state_source`
 - `correlated_vars`
+- `correlated_vars_source`
+ - `seed_constraints`
+ - `seed_constraints_source`
+- `pattern_runtime_strategy`
+- `pattern_runtime_strategy_source`
+- `pattern_runtime_reason`
+- `pattern_runtime_reason_source`
+- `pivot_driver`
+- `pivot_driver_source`
 - `pivot_reason`
+- `pivot_reason_source`
 - `pivot_decision`
+- `pivot_decision_source`
 - `pivot_margin`
 - `pivot_competition`
 - `pivot_scores`
+ - `first_rel`
+ - `first_rel_source`
+ - `first_rel_mode`
+ - `first_rel_mode_source`
+ - `first_rel_constraints`
+ - `first_rel_constraints_source`
+ - `bound_vars`
+ - `bound_vars_source`
 - `shape`
+- `shape_source`
 - `flags`
+- `flags_source`
 - `warning_severity`
+
+## Provenance fields
+
+The graph payload carries explicit provenance for the most important runtime-facing values.
+
+Common summary-level provenance fields:
+
+- `query_runtime_source`
+- `selected_non_leftmost_source`
+- `pivot_driver_metrics_source`
+- `drift_metrics_source`
+- `join_risk_metrics_source`
+
+Common clause and pattern provenance fields:
+
+- `runtime_strategy_source`
+- `join_risk.join_risk_source`
+- `join_risk.correlated_source`
+- `join_risk.shared_anchor_source`
+- `join_risk.join_shape_source`
+- `pattern_runtime_strategy_source`
+- `pattern_runtime_reason_source`
+- `seed_mode_source`
+- `seed_binding_state_source`
+- `correlated_vars_source`
+- `seed_constraints_source`
+- `pivot_driver_source`
+- `pivot_reason_source`
+- `pivot_decision_source`
+- `first_rel_source`
+- `first_rel_mode_source`
+- `first_rel_constraints_source`
+- `bound_vars_source`
+- `flags_source`
+- `shape_source`
+
+Current values are:
+
+- `observed`
+- `inferred`
+- `mixed`
+- `unavailable`
+
+Practical reading:
+
+- plain `EXPLAIN (FORMAT JSON)` mostly yields `inferred` or `unavailable`
+- `EXPLAIN (ANALYZE, FORMAT JSON)` can yield `observed` or `mixed`
+
+`observed` means the engine saw the behavior at runtime. `inferred` means the value was derived from static plan shape or planner metadata. `mixed` means the final summary combines both static and runtime signals. `unavailable` means the metric is only meaningful under `ANALYZE` and no runtime evidence exists.
 
 ## `execution_summary`
 
@@ -208,6 +298,32 @@ For UI or telemetry work:
 - use `plan_overview` for quick SQL plan labeling;
 - keep `query_plan_lines` only for raw rendering or debugging.
 
+Prefer the provenance companions when deciding how strongly to present a signal:
+
+- treat `observed` as runtime evidence;
+- treat `inferred` as planner guidance;
+- treat `mixed` as a combined summary, not a pure runtime fact;
+- treat `unavailable` as absence of runtime evidence rather than a negative result.
+
+## Text `EXPLAIN` provenance
+
+The plain multi-line text `EXPLAIN` surface now also exposes provenance on the most important human-readable lines.
+
+Typical examples:
+
+- `Graph Summary Severity: ... source=inferred|observed|mixed`
+- `Graph Planner Warning: ... source=inferred|observed`
+- `Graph Pivot Hint: ... source=inferred|observed`
+- `Graph Pivot Note: ... source=inferred|observed`
+- `Graph Join Hint: ... source=inferred`
+- `Graph Access Summary: ... source=inferred`
+- `Graph Access Warning: ... source=inferred`
+- `Graph Procedure Summary: ... source=inferred`
+- `Graph Drift Summary: ... source=observed`
+- `Graph Join Fanout Summary: ... source=observed`
+
+Use the text form for ad hoc debugging and operator review. Use the JSON form for product logic, telemetry ingestion, or UI state.
+
 ## Example
 
 Abbreviated payload:
@@ -225,7 +341,10 @@ Abbreviated payload:
   "graph_summary": {
     "severity": "watch",
     "fragile_pivots": 1,
+    "pivot_driver_metrics_source": "inferred",
+    "drift_metrics_source": "unavailable",
     "risky_join_clauses": 0,
+    "join_risk_metrics_source": "unavailable",
     "max_fanout": null
   },
   "graph_detail": {
@@ -237,8 +356,11 @@ Abbreviated payload:
         "kind": "PipelineMatch",
         "pattern_details": [
           {
+            "pattern_runtime_strategy": "left_to_right_node_seed",
+            "pattern_runtime_strategy_source": "observed",
             "seed_mode": "label_scan",
-            "pivot_decision": "retained_leftmost"
+            "pivot_decision": "retained_leftmost",
+            "pivot_decision_source": "inferred"
           }
         ]
       }

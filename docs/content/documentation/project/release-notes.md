@@ -28,7 +28,7 @@ The release should be judged as a technical preview. It is useful if a reader ca
 - Offline storage doctor and upgrade command.
 - Canonical SQL dump/restore command path.
 - Observability endpoints: `/livez`, `/healthz`, `/readyz`, `/metrics`, `/info`.
-- Structured query explain output through `EXPLAIN (FORMAT JSON)` and `EXPLAIN (ANALYZE, FORMAT JSON)`, including graph summary and graph detail payloads.
+- Structured query explain output through `EXPLAIN (FORMAT JSON)` and `EXPLAIN (ANALYZE, FORMAT JSON)`, including graph summary and graph detail payloads plus explicit provenance for observed, inferred, mixed, and unavailable graph signals.
 - Experimental Neo4j Query API compatibility wrapper with grouped `neo4j-http-p1` smoke evidence.
 - Experimental Neo4j-oriented Bolt compatibility listener with grouped `neo4j-p0` review evidence.
 - Security and governance policy documents.
@@ -48,7 +48,7 @@ The release should be judged as a technical preview. It is useful if a reader ca
 | Storage compatibility | Storage v1 manifest, doctor, and upgrade tooling are available. |
 | Logical backup | SQL dump/restore path is available for v0.1 evaluation. |
 | Observability | Local HTTP health, readiness, metrics, and product info endpoints are available. |
-| Explain JSON | Available for AionDB-native tooling and evaluation; treat the payload as versioned AionDB-specific contract, not a cross-database format. |
+| Explain JSON | Available for AionDB-native tooling and evaluation; the payload now carries explicit provenance for graph signals (`observed`, `inferred`, `mixed`, `unavailable`). Treat it as a versioned AionDB-specific contract, not a cross-database format. |
 | Neo4j Query API wrapper | Experimental HTTP compatibility surface with grouped smoke evidence; not a Bolt or official Neo4j driver claim. |
 | Neo4j Bolt compatibility | Experimental read-only compatibility listener with grouped review evidence; the current P0 tool wave can pass end-to-end when the local JavaScript, Java, and `cypher-shell` clients are provisioned, and `make product-smoke` will run that optional wave automatically in that environment. |
 | Neo4j Browser preflight | Browser-oriented Bolt procedure preflight evidence is available as a separate grouped smoke; treat it as server-side readiness evidence, not Browser UI validation. |

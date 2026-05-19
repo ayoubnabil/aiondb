@@ -35,6 +35,7 @@ struct MockCatalog {
     schemas: Mutex<Vec<SchemaDescriptor>>,
     tables: Mutex<Vec<TableDescriptor>>,
     indexes: Mutex<Vec<IndexDescriptor>>,
+    statistics: Mutex<Vec<TableStatistics>>,
     sequences: Mutex<Vec<aiondb_catalog::SequenceDescriptor>>,
     node_labels: Mutex<Vec<aiondb_catalog::NodeLabelDescriptor>>,
     edge_labels: Mutex<Vec<aiondb_catalog::EdgeLabelDescriptor>>,
@@ -56,6 +57,7 @@ impl MockCatalog {
             }]),
             tables: Mutex::new(Vec::new()),
             indexes: Mutex::new(Vec::new()),
+            statistics: Mutex::new(Vec::new()),
             sequences: Mutex::new(Vec::new()),
             node_labels: Mutex::new(Vec::new()),
             edge_labels: Mutex::new(Vec::new()),
@@ -136,9 +138,15 @@ impl CatalogReader for MockCatalog {
     fn get_statistics(
         &self,
         _txn: TxnId,
-        _table_id: RelationId,
+        table_id: RelationId,
     ) -> DbResult<Option<TableStatistics>> {
-        Ok(None)
+        Ok(self
+            .statistics
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|stats| stats.table_id == table_id)
+            .cloned())
     }
 
     fn get_view(
@@ -424,7 +432,10 @@ impl CatalogWriter for MockCatalog {
         Ok(())
     }
 
-    fn update_statistics(&self, _txn: TxnId, _stats: TableStatistics) -> DbResult<()> {
+    fn update_statistics(&self, _txn: TxnId, stats: TableStatistics) -> DbResult<()> {
+        let mut all_stats = self.statistics.lock().unwrap();
+        all_stats.retain(|entry| entry.table_id != stats.table_id);
+        all_stats.push(stats);
         Ok(())
     }
 

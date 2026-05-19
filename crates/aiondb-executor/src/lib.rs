@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(
     clippy::needless_continue,
     clippy::used_underscore_binding,

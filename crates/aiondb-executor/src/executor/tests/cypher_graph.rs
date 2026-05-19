@@ -3,7 +3,9 @@ use crate::executor::graph_plans::CypherGraphAccessClauseKind;
 use crate::executor::graph_plans::{
     explain_graph_drift_suggestion_line, explain_graph_pattern_hint_line,
     explain_graph_plan_hint_line, graph_access_clause_profile_input_key,
-    graph_access_clause_profile_output_key, graph_access_profile_key,
+    graph_access_clause_profile_output_key, graph_access_pattern_runtime_reason_key,
+    graph_access_pattern_pivot_driver_key,
+    graph_access_pattern_runtime_strategy_key, graph_access_profile_key,
     graph_estimate_warning_severity, BindingRow, BoundValue,
 };
 use aiondb_core::IndexId;
@@ -338,6 +340,104 @@ fn cypher_pattern_graph_plan_uses_row_store_without_native_relationship_table() 
 }
 
 #[test]
+fn cypher_query_graph_access_summary_counts_row_store_patterns() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                }],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+        None,
+    );
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None, None);
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access Summary:")
+                && line.contains("total_patterns=1")
+                && line.contains("row_store_source=1")
+                && line.contains("traversal_store_source=0")
+                && line.contains("projection_store_source=0")
+                && line.contains("hybrid_source=0")
+                && line.contains("row_fallback_patterns=0")
+                && line.contains("row_store_traversal_patterns=1")
+                && line.contains("source=inferred")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access Warning:")
+                && line.contains("1 relationship patterns are row-store only")
+                && line.contains("0 patterns still keep a row-store fallback")
+                && line.contains("source=inferred")
+        }),
+        "lines: {lines:?}"
+    );
+    assert_eq!(summary_json["row_store_source"], 1);
+    assert_eq!(summary_json["traversal_store_source"], 0);
+    assert_eq!(summary_json["projection_store_source"], 0);
+    assert_eq!(summary_json["hybrid_source"], 0);
+    assert_eq!(summary_json["row_fallback_patterns"], 0);
+    assert_eq!(summary_json["row_store_traversal_patterns"], 1);
+}
+
+#[test]
 fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
     let (executor, _, _) = make_executor();
     let query = CypherQueryPlan {
@@ -359,9 +459,12 @@ fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
         union: None,
     };
 
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None, None);
     let lines = executor.explain_cypher_query_graph_access_lines(
         default_context().txn_id,
         &query,
+        None,
         None,
         None,
     );
@@ -408,6 +511,17 @@ fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
         "lines: {lines:?}"
     );
     assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Procedure Summary:")
+                && line.contains("total_procedures=1")
+                && line.contains("projection_store_source=1")
+                && line.contains("row_fallback_procedures=1")
+                && line.contains("weighted_projection=0")
+                && line.contains("source=inferred")
+        }),
+        "lines: {lines:?}"
+    );
+    assert!(
         lines.iter().any(|line| line.contains("node_count=unknown")),
         "lines: {lines:?}"
     );
@@ -415,6 +529,10 @@ fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
         lines.iter().any(|line| line.contains("edge_count=unknown")),
         "lines: {lines:?}"
     );
+    assert_eq!(summary_json["total_procedures"], 1);
+    assert_eq!(summary_json["procedure_projection_store_source"], 1);
+    assert_eq!(summary_json["row_fallback_procedures"], 1);
+    assert_eq!(summary_json["weighted_projection_procedures"], 0);
 }
 
 #[test]
@@ -574,6 +692,7 @@ fn cypher_query_graph_access_lines_include_drift_summary() {
         &query,
         Some(&actual_rows),
         None,
+            None,
     );
 
     assert!(
@@ -582,6 +701,7 @@ fn cypher_query_graph_access_lines_include_drift_summary() {
                 && line.contains("compared_patterns=0")
                 && line.contains("warnings=0")
                 && line.contains("high_warnings=0")
+                && line.contains("source=observed")
         }),
         "lines: {lines:?}"
     );
@@ -661,12 +781,14 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
         &query,
         None,
         None,
+        None,
     );
     let summary_json =
-        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None);
+        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None, None);
     let detail_json = executor.explain_cypher_query_graph_detail_json(
         default_context().txn_id,
         &query,
+        None,
         None,
         None,
     );
@@ -694,6 +816,7 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
             line.contains("Graph Summary Severity:")
                 && line.contains("severity=ok")
                 && line.contains("no elevated graph planning signals")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -702,6 +825,8 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
             line.contains("Graph Summary Metrics:")
                 && line.contains("severity=ok")
                 && line.contains("fragile_pivots=0")
+                && line.contains("row_store_source=1")
+                && line.contains("traversal_store_source=0")
                 && line.contains("risky_join_clauses=0")
                 && line.contains("max_fanout=unknown")
         }),
@@ -720,17 +845,29 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
     assert!(
         lines.iter().any(|line| {
             line.contains("Graph Detail JSON:")
-                && line.contains("\"summary\":{\"severity\":\"ok\"")
+                && line.contains("\"summary\":{\"query_runtime_strategy\":\"general_graph_runtime\"")
+                && line.contains("\"query_runtime_source\":\"inferred\"")
+                && line.contains("\"severity\":\"ok\"")
                 && line.contains("\"clauses\":[{\"kind\":\"PipelineMatch\"")
                 && line.contains("\"pivot_decision\":\"var_length_blocks_pivot\"")
         }),
         "lines: {lines:?}"
     );
     assert_eq!(summary_json["severity"], "ok");
+    assert_eq!(summary_json["query_runtime_source"], "inferred");
     assert_eq!(summary_json["fragile_pivots"], 0);
+    assert_eq!(summary_json["row_store_source"], 1);
+    assert_eq!(summary_json["traversal_store_source"], 0);
     assert_eq!(summary_json["risky_join_clauses"], 0);
     assert!(summary_json["max_fanout"].is_null());
+    assert_eq!(summary_json["drift_metrics_source"], "unavailable");
+    assert_eq!(summary_json["join_risk_metrics_source"], "unavailable");
     assert_eq!(detail_json["summary"]["severity"], "ok");
+    assert_eq!(detail_json["summary"]["query_runtime_source"], "inferred");
+    assert_eq!(detail_json["summary"]["drift_metrics_source"], "unavailable");
+    assert_eq!(detail_json["summary"]["join_risk_metrics_source"], "unavailable");
+    assert_eq!(detail_json["summary"]["row_store_source"], 1);
+    assert_eq!(detail_json["summary"]["traversal_store_source"], 0);
     assert_eq!(detail_json["clauses"].as_array().map(|v| v.len()), Some(1));
     assert_eq!(detail_json["clauses"][0]["kind"], "PipelineMatch");
     assert_eq!(detail_json["clauses"][0]["pattern_details"].as_array().map(|v| v.len()), Some(1));
@@ -791,25 +928,25 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("seed_binding_state=fresh")),
+            .any(|line| line.contains("seed_binding_state=fresh") && line.contains("seed_binding_state_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("correlated_vars=none")),
+            .any(|line| line.contains("correlated_vars=none") && line.contains("correlated_vars_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("seed_mode=label_scan")),
+            .any(|line| line.contains("seed_mode=label_scan") && line.contains("seed_mode_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("seed_constraints=label=Person")),
+            .any(|line| line.contains("seed_constraints=label=Person") && line.contains("seed_constraints_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
@@ -845,25 +982,25 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("first_rel=[r:KNOWS*1..2]")),
+            .any(|line| line.contains("first_rel=[r:KNOWS*1..2]") && line.contains("first_rel_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("first_rel_mode=var_length")),
+            .any(|line| line.contains("first_rel_mode=var_length") && line.contains("first_rel_mode_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("first_rel_constraints=type=KNOWS")),
+            .any(|line| line.contains("first_rel_constraints=type=KNOWS") && line.contains("first_rel_constraints_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("bound_vars=p,a,b,r")),
+            .any(|line| line.contains("bound_vars=p,a,b,r") && line.contains("bound_vars_source=inferred")),
         "lines: {lines:?}"
     );
     assert!(
@@ -875,9 +1012,19 @@ fn cypher_query_graph_access_lines_include_query_summary_and_pattern_shape() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("shape=p = (a:Person)-[r:KNOWS*1..2]->(b:Person)")),
+            .any(|line| line.contains("flags_source=inferred") && line.contains("shape=p = (a:Person)-[r:KNOWS*1..2]->(b:Person)") && line.contains("shape_source=inferred")),
         "lines: {lines:?}"
     );
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_binding_state_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["correlated_vars_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_mode_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_constraints_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["flags_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["shape_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["first_rel_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["first_rel_mode_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["first_rel_constraints_source"], "inferred");
+    assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["bound_vars_source"], "inferred");
 }
 
 #[test]
@@ -957,8 +1104,53 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
         &query,
         None,
         None,
+        None,
+    );
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+        None,
     );
 
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Clause [PipelineMatch 0]:")
+                && line.contains("patterns=2")
+                && line.contains("runtime_strategy=shared_anchor_star")
+                && line.contains("runtime_strategy_reason=all_patterns_single_hop_same_anchor")
+                && line.contains("runtime_strategy_reason_source=inferred")
+                && line.contains("runtime_strategy_blocker=none")
+                && line.contains("runtime_strategy_blocker_source=inferred")
+                && line.contains("runtime_strategy_source=inferred")
+        }),
+        "lines: {lines:?}"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy"],
+        "shared_anchor_star"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_reason"],
+        "all_patterns_single_hop_same_anchor"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_reason_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_blocker"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_blocker_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["runtime_strategy_source"],
+        "inferred"
+    );
     assert!(
         lines.iter().any(|line| {
             line.contains("Graph Query Summary:")
@@ -985,6 +1177,8 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
                 && line.contains("severity=watch")
                 && line.contains("fragile_pivots=1")
                 && line.contains("correlated_clauses=1")
+                && line.contains("drift_metrics_source=unavailable")
+                && line.contains("join_risk_metrics_source=unavailable")
                 && line.contains("risky_join_clauses=0")
         }),
         "lines: {lines:?}"
@@ -995,6 +1189,8 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
                 && line.contains("\"severity\":\"watch\"")
                 && line.contains("\"fragile_pivots\":1")
                 && line.contains("\"correlated_clauses\":1")
+                && line.contains("\"drift_metrics_source\":\"unavailable\"")
+                && line.contains("\"join_risk_metrics_source\":\"unavailable\"")
                 && line.contains("\"risky_join_clauses\":0")
         }),
         "lines: {lines:?}"
@@ -1054,6 +1250,7 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
                 && line.contains("label_scan_fragile=1")
                 && line.contains("PipelineMatch0.1")
                 && line.contains("selected_non_leftmost=0")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -1065,6 +1262,7 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
                 && line.contains("shared_anchor_clauses=1")
                 && line.contains("max_correlated_vars_per_pattern=1")
                 && line.contains("PipelineMatch0.1")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -1074,6 +1272,10 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
                 && line.contains("severity=unknown")
                 && line.contains("fanout=unknown")
                 && line.contains("basis=unavailable")
+                && line.contains("join_risk_source=unavailable")
+                && line.contains("correlated_source=inferred")
+                && line.contains("shared_anchor_source=inferred")
+                && line.contains("join_shape_source=inferred")
                 && line.contains("shared_anchor=true")
         }),
         "lines: {lines:?}"
@@ -1086,6 +1288,7 @@ fn cypher_query_graph_access_lines_report_prebound_seed_state() {
         lines.iter().any(|line| {
             line.contains("Graph Planner Warning:")
                 && line.contains("pivot stability is weak on 1 of 1 pivotable patterns")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -1186,6 +1389,7 @@ fn cypher_query_graph_access_lines_include_join_fanout_summary() {
         &query,
         Some(&actual_rows),
         None,
+        None,
     );
     assert!(
         lines.iter().any(|line| {
@@ -1194,6 +1398,7 @@ fn cypher_query_graph_access_lines_include_join_fanout_summary() {
                 && line.contains("risky_clauses=1")
                 && line.contains("high_risk_clauses=1")
                 && line.contains("max_fanout=5.000")
+                && line.contains("source=observed")
         }),
         "lines: {lines:?}"
     );
@@ -1203,6 +1408,7 @@ fn cypher_query_graph_access_lines_include_join_fanout_summary() {
                 && line.contains("severity=high")
                 && line.contains("fanout=5.000")
                 && line.contains("basis=actual")
+                && line.contains("join_risk_source=observed")
                 && line.contains("correlated=true")
                 && line.contains("shared_anchor=true")
                 && line.contains("join_shape=correlated_shared_anchor")
@@ -1272,16 +1478,19 @@ fn cypher_query_graph_access_lines_include_non_correlated_join_risk() {
         &query,
         Some(&actual_rows),
         None,
+            None,
     );
     let summary_json = executor.explain_cypher_query_graph_summary_json(
         default_context().txn_id,
         &query,
         Some(&actual_rows),
+        None,
     );
     let detail_json = executor.explain_cypher_query_graph_detail_json(
         default_context().txn_id,
         &query,
         Some(&actual_rows),
+        None,
         None,
     );
 
@@ -1302,6 +1511,7 @@ fn cypher_query_graph_access_lines_include_non_correlated_join_risk() {
         lines.iter().any(|line| {
             line.contains("Graph Join Hint:")
                 && line.contains("1 of 1 multi-pattern clauses are independent multi-scans")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -1311,6 +1521,10 @@ fn cypher_query_graph_access_lines_include_non_correlated_join_risk() {
                 && line.contains("severity=medium")
                 && line.contains("fanout=3.000")
                 && line.contains("basis=actual")
+                && line.contains("join_risk_source=observed")
+                && line.contains("correlated_source=inferred")
+                && line.contains("shared_anchor_source=inferred")
+                && line.contains("join_shape_source=inferred")
                 && line.contains("correlated=false")
                 && line.contains("shared_anchor=false")
                 && line.contains("join_shape=independent_multi_scan")
@@ -1337,6 +1551,22 @@ fn cypher_query_graph_access_lines_include_non_correlated_join_risk() {
     assert_eq!(detail_json["clauses"][0]["join_risk"]["join_shape"], "independent_multi_scan");
     assert_eq!(detail_json["clauses"][0]["join_risk"]["severity"], "medium");
     assert_eq!(detail_json["clauses"][0]["join_risk"]["fanout"].as_f64(), Some(3.0));
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["join_risk_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["correlated_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["shared_anchor_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["join_risk"]["join_shape_source"],
+        "inferred"
+    );
     assert_eq!(detail_json["clauses"][0]["pattern_details"].as_array().map(|v| v.len()), Some(2));
     assert_eq!(detail_json["clauses"][0]["pattern_details"][0]["seed_mode"], "label_scan");
     assert_eq!(detail_json["clauses"][0]["pattern_details"][1]["seed_mode"], "label_scan");
@@ -1384,6 +1614,7 @@ fn cypher_query_graph_access_lines_report_id_constrained_seed_mode() {
     let lines = executor.explain_cypher_query_graph_access_lines(
         default_context().txn_id,
         &query,
+        None,
         None,
         None,
     );
@@ -1498,6 +1729,7 @@ fn cypher_query_graph_access_lines_report_non_leftmost_pivot_reason() {
         &query,
         None,
         None,
+        None,
     );
 
     assert!(
@@ -1527,6 +1759,7 @@ fn cypher_query_graph_access_lines_report_non_leftmost_pivot_reason() {
         lines.iter().any(|line| {
             line.contains("Graph Pivot Note:")
                 && line.contains("non-leftmost seed in 1 of 1 pivotable patterns")
+                && line.contains("source=inferred")
         }),
         "lines: {lines:?}"
     );
@@ -1570,6 +1803,112 @@ fn cypher_query_graph_access_lines_report_non_leftmost_pivot_reason() {
             .any(|line| line.contains("pivot_scores=0:label_scan:2,1:indexed:0")),
         "lines: {lines:?}"
     );
+}
+
+#[test]
+fn cypher_query_graph_access_lines_report_cbo_pivot_driver() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let query = CypherQueryPlan {
+        pipeline: vec![CypherPipelineOp::Match(CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: None,
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: Some(IndexScanInfo {
+                            index_id: IndexId::new(7),
+                            column_index: 1,
+                            scan_value: Value::Text("Bob".to_owned()),
+                        }),
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![
+                    CypherRelPattern {
+                        variable: None,
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    },
+                ],
+            }],
+            filter: None,
+        })],
+        matches: vec![],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+        None,
+    );
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(default_context().txn_id, &query, None, None);
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        default_context().txn_id,
+        &query,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| {
+                line.contains("pivot_driver=cbo")
+                    && line.contains("pivot_driver_source=inferred")
+                    && line.contains("pivot_decision=selected_node_1")
+            }),
+        "lines: {lines:?}"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver"],
+        "cbo"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver_source"],
+        "inferred"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "selected_node_1"
+    );
+    assert_eq!(summary_json["cbo_pivoted"], 1);
+    assert_eq!(summary_json["heuristic_pivoted"], 0);
 }
 
 #[test]
@@ -1664,13 +2003,13 @@ fn cypher_query_graph_access_lines_include_real_projection_refresh_time_when_war
         union: None,
     };
 
-    let lines =
-        executor.explain_cypher_query_graph_access_lines(
-            default_context().txn_id,
-            &explain_query,
-            None,
-            None,
-        );
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        default_context().txn_id,
+        &explain_query,
+        None,
+        None,
+        None,
+    );
 
     assert!(
         lines
@@ -4313,6 +4652,615 @@ fn prebound_match_pattern_keeps_current_node_correlation() {
         Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(2)),
         other => panic!("expected bound node m, got {other:?}"),
     }
+}
+
+#[test]
+fn execute_cypher_match_records_pivoted_node_seed_pattern_runtime() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+    insert_person(&executor, person_id, 3, "Carol");
+    insert_knows(&executor, knows_id, 1, 2, 10);
+    insert_knows(&executor, knows_id, 2, 3, 20);
+
+    let clause = CypherMatchClause {
+        optional: false,
+        patterns: vec![CypherPattern {
+            path_function: None,
+            path_variable: None,
+            nodes: vec![
+                CypherNodePattern {
+                    variable: Some("a".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("b".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![CypherPropertyExpr {
+                        key: "name".to_owned(),
+                        value: lit_text("Bob"),
+                    }],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("c".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+            ],
+            relationships: vec![
+                CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                },
+                CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Outgoing,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                },
+            ],
+        }],
+        filter: None,
+    };
+
+    let ctx = default_context();
+    let rows = executor
+        .execute_cypher_match(&ctx, &clause, "Match", 0, vec![BindingRow::new()], None, None)
+        .expect("three-node match should execute");
+
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    match rows[0].get("b") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(2)),
+        other => panic!("expected bound node b, got {other:?}"),
+    }
+
+    let runtime_text = ctx
+        .snapshot_graph_profile_runtime_text()
+        .expect("snapshot runtime text");
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_strategy_key("Match", 0, 0)),
+        Some(&"pivoted_node_seed".to_owned())
+    );
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_reason_key("Match", 0, 0)),
+        Some(&"pivot_seed".to_owned())
+    );
+
+    let query = CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![clause.clone()],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [Match 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=pivoted_node_seed")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=pivot_seed")
+                && line.contains("pattern_runtime_reason_source=observed")
+                && line.contains("pivot_driver=cbo")
+                && line.contains("pivot_driver_source=observed")
+                && line.contains("pivot_reason=pivot_to_node_1:label_scan")
+                && line.contains("pivot_reason_source=observed")
+                && line.contains("pivot_decision=selected_node_1")
+                && line.contains("pivot_decision_source=observed")
+        }),
+        "lines: {lines:?}"
+    );
+
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "pivoted_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "pivot_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver"],
+        "cbo"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason"],
+        "pivot_to_node_1:label_scan"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "selected_node_1"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision_source"],
+        "observed"
+    );
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(ctx.txn_id, &query, None, Some(&runtime_text));
+    assert_eq!(summary_json["cbo_pivoted"], 1);
+    assert_eq!(summary_json["heuristic_pivoted"], 0);
+    assert_eq!(summary_json["selected_non_leftmost_source"], "observed");
+    assert_eq!(summary_json["pivot_driver_metrics_source"], "observed");
+}
+
+#[test]
+fn execute_cypher_match_records_left_to_right_pattern_runtime() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+    insert_knows(&executor, knows_id, 1, 2, 10);
+
+    let clause = CypherMatchClause {
+        optional: false,
+        patterns: vec![CypherPattern {
+            path_function: None,
+            path_variable: None,
+            nodes: vec![
+                CypherNodePattern {
+                    variable: Some("a".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("b".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+            ],
+            relationships: vec![CypherRelPattern {
+                variable: None,
+                rel_type: Some("KNOWS".to_owned()),
+                rel_type_alternatives: Vec::new(),
+                table_id: Some(knows_id),
+                direction: CypherRelDirection::Outgoing,
+                properties: vec![],
+                min_hops: None,
+                max_hops: None,
+                index_scan: None,
+            }],
+        }],
+        filter: None,
+    };
+
+    let ctx = default_context();
+    let rows = executor
+        .execute_cypher_match(&ctx, &clause, "Match", 0, vec![BindingRow::new()], None, None)
+        .expect("two-node match should execute");
+
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    match rows[0].get("a") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(1)),
+        other => panic!("expected bound node a, got {other:?}"),
+    }
+    match rows[0].get("b") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(2)),
+        other => panic!("expected bound node b, got {other:?}"),
+    }
+
+    let runtime_text = ctx
+        .snapshot_graph_profile_runtime_text()
+        .expect("snapshot runtime text");
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_strategy_key("Match", 0, 0)),
+        Some(&"left_to_right_node_seed".to_owned())
+    );
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_reason_key("Match", 0, 0)),
+        Some(&"left_to_right_walk".to_owned())
+    );
+
+    let query = CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![clause.clone()],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [Match 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=left_to_right_node_seed")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=left_to_right_walk")
+                && line.contains("pattern_runtime_reason_source=observed")
+        }),
+        "lines: {lines:?}"
+    );
+
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "left_to_right_node_seed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "left_to_right_walk"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+}
+
+#[test]
+fn execute_cypher_match_records_path_function_pattern_runtime() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 10, "Alice");
+    insert_person(&executor, person_id, 20, "Bob");
+    insert_person(&executor, person_id, 30, "Carol");
+    insert_knows(&executor, knows_id, 10, 20, 1);
+    insert_knows(&executor, knows_id, 20, 30, 1);
+
+    let clause = CypherMatchClause {
+        optional: false,
+        patterns: vec![CypherPattern {
+            path_function: Some(CypherPathFunction::ShortestPath),
+            path_variable: Some("p".to_owned()),
+            nodes: vec![
+                CypherNodePattern {
+                    variable: Some("a".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![CypherPropertyExpr {
+                        key: "id".to_owned(),
+                        value: lit_int(10),
+                    }],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("b".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![CypherPropertyExpr {
+                        key: "id".to_owned(),
+                        value: lit_int(30),
+                    }],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+            ],
+            relationships: vec![CypherRelPattern {
+                variable: Some("r".to_owned()),
+                rel_type: Some("KNOWS".to_owned()),
+                rel_type_alternatives: Vec::new(),
+                table_id: Some(knows_id),
+                direction: CypherRelDirection::Outgoing,
+                properties: vec![],
+                min_hops: Some(1),
+                max_hops: Some(3),
+                index_scan: None,
+            }],
+        }],
+        filter: None,
+    };
+
+    let ctx = default_context();
+    let rows = executor
+        .execute_cypher_match(&ctx, &clause, "Match", 0, vec![BindingRow::new()], None, None)
+        .expect("shortest path match should execute");
+
+    assert_eq!(rows.len(), 1, "rows={rows:#?}");
+    match rows[0].get("a") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(10)),
+        other => panic!("expected bound node a, got {other:?}"),
+    }
+    match rows[0].get("b") {
+        Some(BoundValue::Node { id_value, .. }) => assert_eq!(id_value, &Value::Int(30)),
+        other => panic!("expected bound node b, got {other:?}"),
+    }
+    assert!(matches!(rows[0].get("p"), Some(BoundValue::Path { .. })));
+
+    let runtime_text = ctx
+        .snapshot_graph_profile_runtime_text()
+        .expect("snapshot runtime text");
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_strategy_key("Match", 0, 0)),
+        Some(&"path_function".to_owned())
+    );
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_reason_key("Match", 0, 0)),
+        Some(&"path_function_dispatch".to_owned())
+    );
+
+    let query = CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![clause.clone()],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+    let lines = executor.explain_cypher_query_graph_access_lines(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Access [Match 0 pattern 0]")
+                && line.contains("pattern_runtime_strategy=path_function")
+                && line.contains("pattern_runtime_strategy_source=observed")
+                && line.contains("pattern_runtime_reason=path_function_dispatch")
+                && line.contains("pattern_runtime_reason_source=observed")
+        }),
+        "lines: {lines:?}"
+    );
+
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy"],
+        "path_function"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_strategy_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason"],
+        "path_function_dispatch"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pattern_runtime_reason_source"],
+        "observed"
+    );
+}
+
+#[test]
+fn execute_cypher_match_records_heuristic_pivot_driver() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+    insert_person(&executor, person_id, 1, "Alice");
+    insert_person(&executor, person_id, 2, "Bob");
+    insert_person(&executor, person_id, 3, "Carol");
+    insert_knows(&executor, knows_id, 1, 2, 10);
+    insert_knows(&executor, knows_id, 2, 3, 20);
+
+    let clause = CypherMatchClause {
+        optional: false,
+        patterns: vec![CypherPattern {
+            path_function: None,
+            path_variable: None,
+            nodes: vec![
+                CypherNodePattern {
+                    variable: Some("a".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("b".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![CypherPropertyExpr {
+                        key: "name".to_owned(),
+                        value: lit_text("Bob"),
+                    }],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+                CypherNodePattern {
+                    variable: Some("c".to_owned()),
+                    label: Some("Person".to_owned()),
+                    table_id: Some(person_id),
+                    properties: vec![],
+                    index_scan: None,
+                    range_pushdown: Vec::new(),
+                },
+            ],
+            relationships: vec![
+                CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Both,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                },
+                CypherRelPattern {
+                    variable: None,
+                    rel_type: Some("KNOWS".to_owned()),
+                    rel_type_alternatives: Vec::new(),
+                    table_id: Some(knows_id),
+                    direction: CypherRelDirection::Both,
+                    properties: vec![],
+                    min_hops: None,
+                    max_hops: None,
+                    index_scan: None,
+                },
+            ],
+        }],
+        filter: None,
+    };
+
+    let ctx = default_context();
+    let rows = executor
+        .execute_cypher_match(&ctx, &clause, "Match", 0, vec![BindingRow::new()], None, None)
+        .expect("heuristic pivot match should execute");
+
+    assert_eq!(rows.len(), 4, "rows={rows:#?}");
+
+    let runtime_text = ctx
+        .snapshot_graph_profile_runtime_text()
+        .expect("snapshot runtime text");
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_strategy_key("Match", 0, 0)),
+        Some(&"pivoted_node_seed".to_owned())
+    );
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_runtime_reason_key("Match", 0, 0)),
+        Some(&"pivot_seed".to_owned())
+    );
+    assert_eq!(
+        runtime_text.get(&graph_access_pattern_pivot_driver_key("Match", 0, 0)),
+        Some(&"heuristic".to_owned())
+    );
+
+    let query = CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![clause.clone()],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    };
+    let detail_json = executor.explain_cypher_query_graph_detail_json(
+        ctx.txn_id,
+        &query,
+        None,
+        None,
+        Some(&runtime_text),
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver"],
+        "heuristic"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_driver_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason"],
+        "pivot_to_node_1:label_scan"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_reason_source"],
+        "observed"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision"],
+        "selected_node_1"
+    );
+    assert_eq!(
+        detail_json["clauses"][0]["pattern_details"][0]["pivot_decision_source"],
+        "observed"
+    );
+    let summary_json =
+        executor.explain_cypher_query_graph_summary_json(ctx.txn_id, &query, None, Some(&runtime_text));
+    assert_eq!(summary_json["cbo_pivoted"], 0);
+    assert_eq!(summary_json["heuristic_pivoted"], 1);
+    assert_eq!(summary_json["selected_non_leftmost_source"], "observed");
+    assert_eq!(summary_json["pivot_driver_metrics_source"], "observed");
 }
 
 fn int_array_literal(values: &[i32]) -> TypedExpr {
