@@ -889,79 +889,75 @@ impl Executor {
             }
 
             if !used_adjacency {
-                if !use_table_adjacency {
-                    if let Some(node_id) = current_id.as_ref() {
-                        if let Some(edge_records) = self.collect_indexed_adjacent_edges(
-                            context,
-                            table_id,
-                            node_id,
-                            rel.direction,
-                            src_col_idx,
-                            tgt_col_idx,
-                            include_oid_system_column,
-                            projected_scan.as_ref(),
-                        )? {
-                            for (compat_row, raw_row, tuple_id, source_id, target_id) in
-                                edge_records
-                            {
-                                if has_interrupts {
-                                    tid_counter = tid_counter.wrapping_add(1);
-                                    if tid_counter.trailing_zeros() >= 10 {
-                                        context.check_deadline()?;
-                                    }
+                if let Some(node_id) = current_id.as_ref() {
+                    if let Some(edge_records) = self.collect_indexed_adjacent_edges(
+                        context,
+                        table_id,
+                        node_id,
+                        rel.direction,
+                        src_col_idx,
+                        tgt_col_idx,
+                        include_oid_system_column,
+                        projected_scan.as_ref(),
+                    )? {
+                        for (compat_row, raw_row, tuple_id, source_id, target_id) in edge_records {
+                            if has_interrupts {
+                                tid_counter = tid_counter.wrapping_add(1);
+                                if tid_counter.trailing_zeros() >= 10 {
+                                    context.check_deadline()?;
                                 }
-                                if !self.check_property_filters(
-                                    context,
-                                    &rel.properties,
-                                    projected_scan
-                                        .as_ref()
-                                        .map_or(edge_col_names.as_ref(), |value| {
-                                            value.column_names.as_ref()
-                                        }),
-                                    compat_row.as_ref(),
-                                    binding,
-                                )? {
-                                    continue;
-                                }
-
-                                let next_node_id = match rel.direction {
-                                    CypherRelDirection::Outgoing => target_id.clone(),
-                                    CypherRelDirection::Incoming => source_id.clone(),
-                                    CypherRelDirection::Both => {
-                                        if current_id
-                                            .as_ref()
-                                            .is_some_and(|current| *current == source_id)
-                                        {
-                                            target_id.clone()
-                                        } else {
-                                            source_id.clone()
-                                        }
-                                    }
-                                };
-                                if excluded_next_node_id_match(
-                                    &excluded_next_node_id_keys,
-                                    &next_node_id,
-                                ) {
-                                    continue;
-                                }
-
-                                let new_binding = build_traversed_edge_binding(
-                                    binding,
-                                    rel,
-                                    table_id,
-                                    Arc::clone(&compat_row),
-                                    Arc::clone(&raw_row),
-                                    tuple_id,
-                                    &edge_rel_type,
-                                    &edge_col_names,
-                                    current_id.as_ref(),
-                                    &source_id,
-                                    &target_id,
-                                );
-                                push_graph_binding(context, &mut output, new_binding)?;
                             }
-                            continue;
+                            if !self.check_property_filters(
+                                context,
+                                &rel.properties,
+                                projected_scan
+                                    .as_ref()
+                                    .map_or(edge_col_names.as_ref(), |value| {
+                                        value.column_names.as_ref()
+                                    }),
+                                compat_row.as_ref(),
+                                binding,
+                            )? {
+                                continue;
+                            }
+
+                            let next_node_id = match rel.direction {
+                                CypherRelDirection::Outgoing => target_id.clone(),
+                                CypherRelDirection::Incoming => source_id.clone(),
+                                CypherRelDirection::Both => {
+                                    if current_id
+                                        .as_ref()
+                                        .is_some_and(|current| *current == source_id)
+                                    {
+                                        target_id.clone()
+                                    } else {
+                                        source_id.clone()
+                                    }
+                                }
+                            };
+                            if excluded_next_node_id_match(
+                                &excluded_next_node_id_keys,
+                                &next_node_id,
+                            ) {
+                                continue;
+                            }
+
+                            let new_binding = build_traversed_edge_binding(
+                                binding,
+                                rel,
+                                table_id,
+                                Arc::clone(&compat_row),
+                                Arc::clone(&raw_row),
+                                tuple_id,
+                                &edge_rel_type,
+                                &edge_col_names,
+                                current_id.as_ref(),
+                                &source_id,
+                                &target_id,
+                            );
+                            push_graph_binding(context, &mut output, new_binding)?;
                         }
+                        continue;
                     }
                 }
 

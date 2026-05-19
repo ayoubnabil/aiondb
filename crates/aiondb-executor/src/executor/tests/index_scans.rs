@@ -2215,3 +2215,427 @@ fn shortest_path_fallback_uses_endpoint_index_before_edge_table_scan() {
     assert_eq!(storage.scan_index_count_for(source_index_id), 1);
     assert_eq!(storage.scan_table_count_for(knows_id), 0);
 }
+
+#[test]
+fn collect_adjacent_edges_uses_endpoint_index_before_edge_table_scan_when_native_adjacency_is_unavailable() {
+    use aiondb_catalog::{IndexKeyColumn, IndexKind, SortOrder};
+
+    let (executor, catalog, storage) = make_executor_with_index_storage();
+    let ctx = default_context();
+
+    let knows_id = create_test_table(
+        &executor,
+        &catalog,
+        "knows_match_idx",
+        vec![
+            ColumnPlan {
+                name: "source_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "target_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "weight".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+
+    let edge_tid = storage
+        .insert(
+            ctx.txn_id,
+            knows_id,
+            Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        )
+        .expect("insert edge");
+
+    let edge_table = catalog
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|table| table.table_id == knows_id)
+        .cloned()
+        .expect("edge table descriptor");
+    let source_column_id = edge_table.columns[0].column_id;
+    let source_index_id = IndexId::new(9902);
+    catalog.indexes.lock().unwrap().push(IndexDescriptor {
+        index_id: source_index_id,
+        schema_id: SchemaId::new(1),
+        table_id: knows_id,
+        name: QualifiedName::qualified("public", "idx_knows_match_idx_source"),
+        unique: false,
+        nulls_not_distinct: false,
+        kind: IndexKind::BTree,
+        key_columns: vec![IndexKeyColumn {
+            column_id: source_column_id,
+            sort_order: SortOrder::Ascending,
+            nulls_first: false,
+        }],
+        include_columns: Vec::new(),
+        constraint_name: None,
+        hnsw_params: None,
+    });
+    storage.set_index_rows(
+        source_index_id,
+        vec![TupleRecord {
+            tuple_id: edge_tid,
+            heap_position: edge_tid.get(),
+            row: Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        }],
+    );
+
+    let adjacent = executor
+        .collect_adjacent_edges(
+            &ctx,
+            knows_id,
+            &Value::Int(1),
+            aiondb_plan::graph::CypherRelDirection::Outgoing,
+            0,
+            1,
+            true,
+            None,
+            None,
+        )
+        .expect("collect adjacent edges");
+
+    assert_eq!(adjacent.len(), 1);
+    assert_eq!(adjacent[0].tuple_id, edge_tid);
+    assert_eq!(adjacent[0].source_id, Value::Int(1));
+    assert_eq!(adjacent[0].target_id, Value::Int(2));
+
+    assert_eq!(storage.scan_index_count_for(source_index_id), 1);
+    assert_eq!(storage.scan_table_count_for(knows_id), 0);
+}
+
+#[test]
+fn adjacency_match_relationship_uses_endpoint_index_before_edge_table_scan_when_native_adjacency_is_unavailable() {
+    use std::sync::Arc;
+
+    use aiondb_catalog::{IndexKeyColumn, IndexKind, SortOrder};
+    use aiondb_plan::graph::{CypherNodePattern, CypherRelDirection, CypherRelPattern};
+
+    let (executor, catalog, storage) = make_executor_with_index_storage();
+    let ctx = default_context();
+
+    let person_id = create_test_table(
+        &executor,
+        &catalog,
+        "person_adj_idx",
+        vec![
+            ColumnPlan {
+                name: "id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+    let knows_id = create_test_table(
+        &executor,
+        &catalog,
+        "knows_adj_idx",
+        vec![
+            ColumnPlan {
+                name: "source_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "target_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "weight".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+
+    let edge_tid = storage
+        .insert(
+            ctx.txn_id,
+            knows_id,
+            Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        )
+        .expect("insert edge");
+
+    let edge_table = catalog
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|table| table.table_id == knows_id)
+        .cloned()
+        .expect("edge table descriptor");
+    let source_column_id = edge_table.columns[0].column_id;
+    let source_index_id = IndexId::new(9904);
+    catalog.indexes.lock().unwrap().push(IndexDescriptor {
+        index_id: source_index_id,
+        schema_id: SchemaId::new(1),
+        table_id: knows_id,
+        name: QualifiedName::qualified("public", "idx_knows_adj_idx_source"),
+        unique: false,
+        nulls_not_distinct: false,
+        kind: IndexKind::BTree,
+        key_columns: vec![IndexKeyColumn {
+            column_id: source_column_id,
+            sort_order: SortOrder::Ascending,
+            nulls_first: false,
+        }],
+        include_columns: Vec::new(),
+        constraint_name: None,
+        hnsw_params: None,
+    });
+    storage.set_index_rows(
+        source_index_id,
+        vec![TupleRecord {
+            tuple_id: edge_tid,
+            heap_position: edge_tid.get(),
+            row: Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        }],
+    );
+
+    let current_node = CypherNodePattern {
+        variable: Some("a".to_owned()),
+        label: None,
+        table_id: Some(person_id),
+        properties: vec![],
+        index_scan: None,
+        range_pushdown: Vec::new(),
+    };
+    let rel = CypherRelPattern {
+        variable: Some("r".to_owned()),
+        rel_type: None,
+        rel_type_alternatives: Vec::new(),
+        table_id: Some(knows_id),
+        direction: CypherRelDirection::Outgoing,
+        properties: vec![],
+        min_hops: None,
+        max_hops: None,
+        index_scan: None,
+    };
+    let binding = crate::executor::graph_plans::BindingRow::new().with_binding(
+        "a".to_owned(),
+        crate::executor::graph_plans::BoundValue::Node {
+            table_id: person_id,
+            row: Arc::new(Row::new(vec![Value::Int(1), Value::Text("A".to_owned())])),
+            raw_row: Arc::new(Row::new(vec![Value::Int(1), Value::Text("A".to_owned())])),
+            id_value: Value::Int(1),
+            tuple_id: TupleId::new(1),
+            labels: Arc::new(Vec::new()),
+            column_names: Arc::new(vec!["id".to_owned(), "name".to_owned()]),
+        },
+    );
+
+    let mut runtime_cache = crate::executor::graph_plans::GraphMatchRuntimeCache::default();
+    let rows = executor
+        .adjacency_match_relationship(
+            &ctx,
+            &current_node,
+            &rel,
+            None,
+            vec![binding],
+            &[],
+            None,
+            &[],
+            &mut runtime_cache,
+        )
+        .expect("adjacency match relationship");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(storage.scan_index_count_for(source_index_id), 1);
+    assert_eq!(storage.scan_table_count_for(knows_id), 0);
+}
+
+#[test]
+fn variable_length_relationship_uses_endpoint_index_before_edge_table_scan_when_native_adjacency_is_unavailable() {
+    use std::sync::Arc;
+
+    use aiondb_catalog::{IndexKeyColumn, IndexKind, SortOrder};
+    use aiondb_plan::graph::{CypherNodePattern, CypherRelDirection, CypherRelPattern};
+
+    let (executor, catalog, storage) = make_executor_with_index_storage();
+    let ctx = default_context();
+
+    let person_id = create_test_table(
+        &executor,
+        &catalog,
+        "person_var_idx",
+        vec![
+            ColumnPlan {
+                name: "id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+    let knows_id = create_test_table(
+        &executor,
+        &catalog,
+        "knows_var_idx",
+        vec![
+            ColumnPlan {
+                name: "source_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "target_id".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+            ColumnPlan {
+                name: "weight".to_string(),
+                data_type: DataType::Int,
+                raw_type_name: None,
+                text_type_modifier: None,
+                nullable: false,
+                has_default: false,
+            },
+        ],
+    );
+
+    let edge_tid = storage
+        .insert(
+            ctx.txn_id,
+            knows_id,
+            Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        )
+        .expect("insert edge");
+
+    let edge_table = catalog
+        .tables
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|table| table.table_id == knows_id)
+        .cloned()
+        .expect("edge table descriptor");
+    let source_column_id = edge_table.columns[0].column_id;
+    let source_index_id = IndexId::new(9903);
+    catalog.indexes.lock().unwrap().push(IndexDescriptor {
+        index_id: source_index_id,
+        schema_id: SchemaId::new(1),
+        table_id: knows_id,
+        name: QualifiedName::qualified("public", "idx_knows_var_idx_source"),
+        unique: false,
+        nulls_not_distinct: false,
+        kind: IndexKind::BTree,
+        key_columns: vec![IndexKeyColumn {
+            column_id: source_column_id,
+            sort_order: SortOrder::Ascending,
+            nulls_first: false,
+        }],
+        include_columns: Vec::new(),
+        constraint_name: None,
+        hnsw_params: None,
+    });
+    storage.set_index_rows(
+        source_index_id,
+        vec![TupleRecord {
+            tuple_id: edge_tid,
+            heap_position: edge_tid.get(),
+            row: Row::new(vec![Value::Int(1), Value::Int(2), Value::Int(10)]),
+        }],
+    );
+
+    let current_node = CypherNodePattern {
+        variable: Some("a".to_owned()),
+        label: None,
+        table_id: Some(person_id),
+        properties: vec![],
+        index_scan: None,
+        range_pushdown: Vec::new(),
+    };
+    let rel = CypherRelPattern {
+        variable: Some("r".to_owned()),
+        rel_type: None,
+        rel_type_alternatives: Vec::new(),
+        table_id: Some(knows_id),
+        direction: CypherRelDirection::Outgoing,
+        properties: vec![],
+        min_hops: Some(1),
+        max_hops: Some(2),
+        index_scan: None,
+    };
+    let binding = crate::executor::graph_plans::BindingRow::new().with_binding(
+        "a".to_owned(),
+        crate::executor::graph_plans::BoundValue::Node {
+            table_id: person_id,
+            row: Arc::new(Row::new(vec![Value::Int(1), Value::Text("A".to_owned())])),
+            raw_row: Arc::new(Row::new(vec![Value::Int(1), Value::Text("A".to_owned())])),
+            id_value: Value::Int(1),
+            tuple_id: TupleId::new(1),
+            labels: Arc::new(Vec::new()),
+            column_names: Arc::new(vec!["id".to_owned(), "name".to_owned()]),
+        },
+    );
+
+    let rows = executor
+        .match_variable_length_relationship(
+            &ctx,
+            &current_node,
+            &[rel],
+            None,
+            vec![binding],
+            None,
+        )
+        .expect("match variable-length relationship");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(storage.scan_index_count_for(source_index_id), 2);
+    assert_eq!(storage.scan_table_count_for(knows_id), 0);
+}

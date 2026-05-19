@@ -570,7 +570,7 @@ impl Executor {
             }
         }
 
-        if !used_adjacency && !use_table_adjacency {
+        if !used_adjacency {
             if let Some(edge_records) = self.collect_indexed_adjacent_edges(
                 context,
                 table_id,

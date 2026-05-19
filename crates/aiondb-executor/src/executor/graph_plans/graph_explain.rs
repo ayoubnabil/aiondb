@@ -2931,6 +2931,117 @@ impl Executor {
         }
     }
 
+    fn describe_cypher_pattern_graph_plan_with_context(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+    ) -> HybridGraphPlan {
+        if pattern.relationships.is_empty() {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::RowStore),
+                fallback_source: None,
+                estimated_rows: None,
+                projection_name: None,
+                reason: Some("node-only Cypher pattern uses row-store scans".to_owned()),
+            };
+        }
+
+        let mut native_edges = 0usize;
+        let mut indexed_edges = 0usize;
+        let mut row_store_only_edges = 0usize;
+        let mut estimated_rows = 0u64;
+
+        for rel in &pattern.relationships {
+            let Some(table_id) = rel.table_id else {
+                row_store_only_edges = row_store_only_edges.saturating_add(1);
+                continue;
+            };
+            if self.storage_dml.adjacency_index_available(context.txn_id, table_id)
+                && self
+                    .resolve_edge_endpoint_columns_for_rel(
+                        context,
+                        table_id,
+                        rel.rel_type.as_deref(),
+                    )
+                    .is_ok_and(|(_, use_table_adjacency)| use_table_adjacency)
+            {
+                native_edges = native_edges.saturating_add(1);
+            } else {
+                let indexed = self
+                    .resolve_edge_endpoint_columns_for_rel(context, table_id, rel.rel_type.as_deref())
+                    .ok()
+                    .and_then(|((src_col_idx, tgt_col_idx), _)| {
+                        self.endpoint_indexes_for_direction(
+                            context,
+                            table_id,
+                            rel.direction,
+                            src_col_idx,
+                            tgt_col_idx,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .is_some();
+                if indexed {
+                    indexed_edges = indexed_edges.saturating_add(1);
+                } else {
+                    row_store_only_edges = row_store_only_edges.saturating_add(1);
+                }
+            }
+            if let Some(stats) = self.catalog_reader.get_statistics(context.txn_id, table_id).ok().flatten()
+            {
+                estimated_rows = estimated_rows.saturating_add(stats.row_count);
+            }
+        }
+
+        let estimated_rows = (estimated_rows > 0).then_some(estimated_rows);
+        if native_edges == 0 && indexed_edges == 0 {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::RowStore),
+                fallback_source: None,
+                estimated_rows,
+                projection_name: None,
+                reason: Some(
+                    "relationship pattern has no native traversal store; row-store fallback only"
+                        .to_owned(),
+                ),
+            };
+        }
+        if row_store_only_edges == 0 && indexed_edges == 0 {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::TraversalStore),
+                fallback_source: Some(HybridGraphSource::RowStore),
+                estimated_rows,
+                projection_name: None,
+                reason: Some(
+                    "all relationship tables expose native adjacency traversal".to_owned(),
+                ),
+            };
+        }
+        if row_store_only_edges == 0 && native_edges == 0 {
+            return HybridGraphPlan {
+                source: Some(HybridGraphSource::Hybrid),
+                fallback_source: Some(HybridGraphSource::RowStore),
+                estimated_rows,
+                projection_name: None,
+                reason: Some(
+                    "relationship pattern can use endpoint B-tree lookups but lacks native adjacency traversal"
+                        .to_owned(),
+                ),
+            };
+        }
+        HybridGraphPlan {
+            source: Some(HybridGraphSource::Hybrid),
+            fallback_source: Some(HybridGraphSource::RowStore),
+            estimated_rows,
+            projection_name: None,
+            reason: Some(
+                "some relationship tables expose native adjacency traversal or endpoint B-tree lookups and others fall back to row-store scans"
+                    .to_owned(),
+            ),
+        }
+    }
+
     pub(in crate::executor) fn describe_cypher_match_graph_plans(
         &self,
         context: &ExecutionContext,
@@ -2946,7 +3057,7 @@ impl Executor {
                 clause_kind: clause_kind.clone(),
                 clause_index,
                 pattern_index,
-                plan: self.describe_cypher_pattern_graph_plan_for_txn(context.txn_id, pattern),
+                plan: self.describe_cypher_pattern_graph_plan_with_context(context, pattern),
             })
             .collect()
     }
@@ -2983,7 +3094,7 @@ impl Executor {
         context: &ExecutionContext,
         pattern: &CypherPattern,
     ) -> HybridGraphPlan {
-        self.describe_cypher_pattern_graph_plan_for_txn(context.txn_id, pattern)
+        self.describe_cypher_pattern_graph_plan_with_context(context, pattern)
     }
 
     pub fn explain_cypher_query_graph_access_lines(

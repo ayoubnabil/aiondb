@@ -438,6 +438,112 @@ fn cypher_query_graph_access_summary_counts_row_store_patterns() {
 }
 
 #[test]
+fn cypher_pattern_graph_plan_uses_endpoint_indexed_fallback_before_row_store_only() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    catalog
+        .create_node_label(
+            default_context().txn_id,
+            aiondb_catalog::NodeLabelDescriptor {
+                label: "Person".to_owned(),
+                table_id: person_id,
+            },
+        )
+        .expect("register node label");
+    catalog
+        .create_edge_label(
+            default_context().txn_id,
+            aiondb_catalog::EdgeLabelDescriptor {
+                label: "KNOWS".to_owned(),
+                table_id: knows_id,
+                source_label: "Person".to_owned(),
+                target_label: "Person".to_owned(),
+                endpoints: None,
+            },
+        )
+        .expect("register edge label");
+
+    let knows_table = catalog
+        .get_table_by_id(default_context().txn_id, knows_id)
+        .expect("lookup knows table")
+        .expect("knows table exists");
+    let source_column_id = knows_table.columns[0].column_id;
+    let target_column_id = knows_table.columns[1].column_id;
+
+    for (name, column_id) in [
+        ("knows_source_idx", source_column_id),
+        ("knows_target_idx", target_column_id),
+    ] {
+        catalog
+            .create_index(
+                default_context().txn_id,
+                aiondb_catalog::IndexDescriptor {
+                    index_id: IndexId::new(0),
+                    schema_id: knows_table.schema_id,
+                    table_id: knows_id,
+                    name: aiondb_catalog::QualifiedName::qualified("public", name),
+                    unique: false,
+                    nulls_not_distinct: false,
+                    kind: aiondb_catalog::IndexKind::BTree,
+                    key_columns: vec![aiondb_catalog::IndexKeyColumn {
+                        column_id,
+                        sort_order: aiondb_catalog::SortOrder::Ascending,
+                        nulls_first: false,
+                    }],
+                    include_columns: vec![],
+                    constraint_name: None,
+                    hnsw_params: None,
+                },
+            )
+            .expect("create endpoint index");
+    }
+
+    let pattern = CypherPattern {
+        path_function: None,
+        path_variable: None,
+        nodes: vec![
+            CypherNodePattern {
+                variable: Some("a".to_owned()),
+                label: Some("Person".to_owned()),
+                table_id: Some(person_id),
+                properties: vec![],
+                index_scan: None,
+                range_pushdown: Vec::new(),
+            },
+            CypherNodePattern {
+                variable: Some("b".to_owned()),
+                label: Some("Person".to_owned()),
+                table_id: Some(person_id),
+                properties: vec![],
+                index_scan: None,
+                range_pushdown: Vec::new(),
+            },
+        ],
+        relationships: vec![CypherRelPattern {
+            variable: None,
+            rel_type: Some("KNOWS".to_owned()),
+            rel_type_alternatives: Vec::new(),
+            table_id: Some(knows_id),
+            direction: CypherRelDirection::Outgoing,
+            properties: vec![],
+            min_hops: None,
+            max_hops: None,
+            index_scan: None,
+        }],
+    };
+
+    let graph_plan = executor.describe_cypher_pattern_graph_plan(&default_context(), &pattern);
+    assert_eq!(graph_plan.source, Some(HybridGraphSource::Hybrid));
+    assert_eq!(graph_plan.fallback_source, Some(HybridGraphSource::RowStore));
+    assert!(graph_plan
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("endpoint B-tree lookups")));
+}
+
+#[test]
 fn cypher_query_graph_access_lines_include_procedure_projection_metadata() {
     let (executor, _, _) = make_executor();
     let query = CypherQueryPlan {
