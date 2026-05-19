@@ -406,12 +406,6 @@ impl Executor {
         func: CypherPathFunction,
         input_bindings: Vec<BindingRow>,
     ) -> DbResult<Vec<BindingRow>> {
-        if matches!(func, CypherPathFunction::AllShortestPaths) {
-            return Err(DbError::feature_not_supported(
-                "allShortestPaths multi-segment patterns are not supported yet",
-            ));
-        }
-
         if pattern.relationships.iter().any(|rel| rel.table_id.is_none()) {
             return Err(DbError::feature_not_supported(
                 "shortestPath requires typed relationship patterns (e.g. [:KNOWS] / [:KNOWS*])",

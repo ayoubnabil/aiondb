@@ -357,19 +357,15 @@ fn shortest_path_fixed_multi_segment_shape_returns_result() {
 }
 
 #[test]
-fn all_shortest_paths_fixed_multi_segment_shape_is_rejected_explicitly() {
+fn all_shortest_paths_fixed_multi_segment_shape_returns_result() {
     let (engine, session) = social();
-    let err = engine
-        .execute_sql(
-            &session,
-            "MATCH allShortestPaths((a:Person {id: 1})-[:KNOWS]->(:Person)-[:KNOWS]->(b:Person {id: 4})) RETURN 1",
-        )
-        .expect_err("multi-segment allShortestPaths should fail explicitly");
-    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
-    assert!(
-        format!("{err}").contains("allShortestPaths multi-segment patterns are not supported yet"),
-        "{err}"
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH allShortestPaths((a:Person {id: 1})-[:KNOWS]->(:Person)-[:KNOWS]->(b:Person {id: 4})) RETURN 1",
     );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::BigInt(1));
 }
 
 #[test]
@@ -379,6 +375,23 @@ fn named_shortest_path_fixed_multi_segment_shape_renders_full_path() {
         &engine,
         &session,
         "MATCH p = shortestPath((:Person {id: 1})-[:KNOWS]->(:Person)-[:KNOWS]->(:Person {id: 4})) RETURN length(p), p",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::BigInt(2));
+    let Value::Text(path) = &rows[0].values[1] else {
+        panic!("expected rendered path, got {:?}", rows[0].values[1]);
+    };
+    assert_eq!(path.matches("(:Person").count(), 3, "path: {path}");
+    assert_eq!(path.matches("[:KNOWS").count(), 2, "path: {path}");
+}
+
+#[test]
+fn named_all_shortest_paths_fixed_multi_segment_shape_renders_full_path() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH p = allShortestPaths((:Person {id: 1})-[:KNOWS]->(:Person)-[:KNOWS]->(:Person {id: 4})) RETURN length(p), p",
     );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::BigInt(2));
