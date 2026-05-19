@@ -88,6 +88,16 @@ SURREAL_SUITE_ROWS=2000 \
 benchmarks/run.sh surreal-suite
 ```
 
+Run the composite AionDB / Neo4j / SurrealDB benchmark:
+
+```bash
+benchmarks/run.sh ultra-compare
+```
+
+Keep the entire `target/benchmarks/ultra-compare/<run-id>/` directory. It is a
+manifest that points to the nested benchmark family artifacts and marks which
+parts are directly comparable.
+
 Keep the entire `benchmarks/.state/surreal-suite/<run-id>/` directory with the result. It contains per-engine warmup logs, measured iteration logs, run metadata, raw CSV, and summaries.
 
 ## Durability disclosure
@@ -114,6 +124,16 @@ Disclose how the query reached the engine:
 Protocol overhead can dominate tiny queries. A fair comparison should measure comparable paths or clearly explain why the paths differ.
 
 For `surreal-suite`, disclose that SurrealDB uses WebSocket JSON-RPC, AionDB uses PostgreSQL wire, and PostgreSQL stack uses PostgreSQL wire with `pgvector` and Apache AGE when those extensions are installed.
+
+For `ultra-compare`, disclose that the run is composite:
+
+- `neo4j-graph` compares AionDB vs Neo4j only;
+- `surreal-graph` compares AionDB vs SurrealDB only;
+- `surreal-suite` compares AionDB, SurrealDB, and optionally pgstack on the
+  existing matrix workload.
+
+That distinction matters. A public claim should cite the relevant sub-benchmark,
+not only the top-level orchestrator.
 
 ## Comparison rule
 

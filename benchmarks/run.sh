@@ -7,6 +7,7 @@
 # Benchmarks:
 #   pgbench   — OLTP micro (native pgbench). Ready to run.
 #   surreal-suite — SurrealDB 3 article-style tests against SurrealDB WS, AionDB, PostgreSQL stack.
+#   ultra-compare — long composite run across Neo4j graph, Surreal graph, and Surreal suite.
 #   crud-bench-official — official SurrealDB crud-bench Rust workload.
 #   tpch      — TPC-H SF=1 analytical (needs external tpch-kit, auto-fetched).
 #   job       — Join Order Benchmark (needs IMDb dump ~3.6 GB, auto-fetched).
@@ -47,6 +48,7 @@ case "$1" in
     -h|--help|help) usage; exit 0 ;;
     pgbench) bench_script="$BENCH_ROOT/pgbench/run.sh" ;;
     surreal-suite|surrealsuite) bench_script="$BENCH_ROOT/surreal-suite/run.sh" ;;
+    ultra-compare|ultracompare|tri-engine) bench_script="$BENCH_ROOT/ultra-compare/run.sh" ;;
     crud-bench-official|crudbench-official|crud-bench) bench_script="$BENCH_ROOT/crud-bench-official/run.sh" ;;
     tpch)    bench_script="$BENCH_ROOT/tpch/run.sh" ;;
     job)     bench_script="$BENCH_ROOT/job/run.sh" ;;
@@ -87,8 +89,13 @@ if [[ ("$BENCH_AUTO_CLEAN" == "1" || "$BENCH_AUTO_CLEAN" == "true") \
 fi
 
 set +e
-"$bench_script" "$@"
-status=$?
+if [[ "$bench_script" == *.sh ]]; then
+    bash "$bench_script" "$@"
+    status=$?
+else
+    "$bench_script" "$@"
+    status=$?
+fi
 set -e
 
 if [[ ("$BENCH_AUTO_CLEAN" == "1" || "$BENCH_AUTO_CLEAN" == "true") \

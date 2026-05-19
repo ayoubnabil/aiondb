@@ -19,6 +19,7 @@ Current benchmark families:
 
 - `pgbench` for OLTP microbenchmarks.
 - `surreal-suite` for SurrealDB 3 article-style CRUD, scan, graph, index, full-text, and vector tests against SurrealDB WS, AionDB pgwire, and PostgreSQL with pgvector/AGE.
+- `ultra-compare` for a long composite run that stitches together `neo4j-graph`, `surreal-graph`, and `surreal-suite` under one run id and one consolidated report.
 - `tpch` for analytical SQL workloads.
 - `tpcds` for analytical SQL workloads.
 - `job` for join-heavy workloads based on the Join Order Benchmark.
@@ -53,6 +54,17 @@ SURREAL_SUITE_DURATION_SECONDS=20 \
 SURREAL_SUITE_ROWS=2000 \
 benchmarks/run.sh surreal-suite
 ```
+
+Run the long tri-engine composite comparison:
+
+```bash
+benchmarks/run.sh ultra-compare
+```
+
+This composite harness is intentionally strict about comparability. Its report
+keeps separate workload families instead of pretending that one giant number can
+fairly summarize AionDB vs Neo4j vs SurrealDB across graph, CRUD, scans, and
+hybrid/vector shapes.
 
 This wrapper runs each test as warmup across all selected engines first, then one measured 20-second pass across all engines, and writes raw traces, metadata, per-iteration CSV, and summaries under `benchmarks/.state/surreal-suite/<run-id>/`.
 
@@ -91,11 +103,16 @@ The heavier benchmarks may require external tools or datasets. Read the output b
 | Connection and transaction smoke | small `pgbench` run |
 | Write-path comparison | `pgbench` with disclosed WAL policy |
 | SurrealDB 3 article-style comparison | `surreal-suite` with raw output retained |
+| Long AionDB / Neo4j / SurrealDB comparison | `ultra-compare` with a consolidated report |
 | Analytical scans | TPC-H or TPC-DS subset |
 | Join optimizer pressure | Join Order Benchmark |
 | Hybrid graph/vector claim | custom schema with published SQL |
 
 For hybrid claims, standard SQL benchmarks are not enough. Publish a small workload that includes relational filters, relationship tables, and vector ranking so readers can inspect the model.
+
+For three-engine claims, do not collapse every workload into one winner number.
+Use a composite report that keeps the graph-vs-graph, graph-protocol, and
+broader matrix workloads separate.
 
 ## SurrealDB Suite Comparison
 
