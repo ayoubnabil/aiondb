@@ -22,7 +22,7 @@ SURREAL_USER="${SURREAL_USER:-root}"
 SURREAL_PASS="${SURREAL_PASS:-root}"
 SURREAL_NS="${SURREAL_NS:-bench}"
 SURREAL_DB="${SURREAL_DB:-bench}"
-SURREAL_PATH="${SURREAL_PATH:-memory}"
+SURREAL_PATH="${SURREAL_PATH:-surrealkv:$STATE_DIR/surreal-suite-surrealdb}"
 SURREAL_LOG="${SURREAL_LOG:-$STATE_DIR/surreal-suite-surrealdb.log}"
 SURREAL_PIDFILE="${SURREAL_PIDFILE:-$STATE_DIR/surreal-suite-surrealdb.pid}"
 
@@ -45,6 +45,14 @@ SURREAL_SUITE_TESTS="${SURREAL_SUITE_TESTS:-all}"
 SURREAL_SUITE_UPDATE_DOCS="${SURREAL_SUITE_UPDATE_DOCS:-1}"
 
 mkdir -p "$RUN_DIR"
+
+surreal_storage_mode() {
+    if [[ "$SURREAL_PATH" == "memory" ]]; then
+        printf 'memory'
+    else
+        printf 'durable'
+    fi
+}
 
 surreal_is_running() {
     [[ -f "$SURREAL_PIDFILE" ]] && kill -0 "$(cat "$SURREAL_PIDFILE" 2>/dev/null)" 2>/dev/null
@@ -69,6 +77,11 @@ surreal_start() {
         return 0
     fi
     mkdir -p "$(dirname "$SURREAL_LOG")"
+    if [[ "$(surreal_storage_mode)" == "durable" ]]; then
+        local surreal_fs_path="${SURREAL_PATH#*:}"
+        rm -rf "$surreal_fs_path"
+        mkdir -p "$(dirname "$surreal_fs_path")"
+    fi
     log "starting surrealdb ws://$SURREAL_HOST:$SURREAL_PORT path=$SURREAL_PATH"
     nohup "$SURREAL_BIN" start \
         --no-banner \
@@ -122,6 +135,8 @@ for engine in $SURREAL_SUITE_ENGINES; do
     esac
 done
 
+SURREAL_PATH="$SURREAL_PATH" \
+AIONDB_STORAGE="$AIONDB_STORAGE" \
 python3 "$BENCH_ROOT/surreal-suite/runner.py" \
     --run-id "$RUN_ID" \
     --run-dir "$RUN_DIR" \

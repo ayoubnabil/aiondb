@@ -571,7 +571,7 @@ impl Engine {
         let storage_autocommit_candidate = insert_values_storage_autocommit_candidate(statement);
         let mut include_catalog_participant = false;
         let mut include_storage_participant = false;
-        let storage_autocommit_fast_path = false;
+        let storage_autocommit_fast_path = storage_autocommit_candidate;
         if uses_implicit_txn {
             let active_txn =
                 self.with_session(session, |record| Ok(record.active_txn.is_some()))?;

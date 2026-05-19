@@ -724,10 +724,15 @@ impl Executor {
         table_id: RelationId,
         on_conflict: Option<&InsertOnConflict>,
         has_returning: bool,
-        _row_count: usize,
+        row_count: usize,
         context: &ExecutionContext,
     ) -> DbResult<Option<TableDescriptor>> {
-        if on_conflict.is_some() || has_returning {
+        let on_conflict_compatible = match on_conflict.map(|conflict| &conflict.action) {
+            None => true,
+            Some(OnConflictActionPlan::DoNothing) => row_count == 1,
+            Some(OnConflictActionPlan::DoUpdate { .. }) => false,
+        };
+        if !on_conflict_compatible || has_returning {
             return Ok(None);
         }
 

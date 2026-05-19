@@ -366,11 +366,21 @@ impl Executor {
                         let row = direct_rows
                             .pop()
                             .ok_or_else(|| DbError::internal("direct insert row missing"))?;
-                        let tuple_id =
-                            self.storage_dml
-                                .insert(direct_insert_txn_id, *table_id, row)?;
-                        context.record_tuple_write(*table_id, tuple_id)?;
-                        inserted = 1;
+                        match self.storage_dml.insert(direct_insert_txn_id, *table_id, row) {
+                            Ok(tuple_id) => {
+                                context.record_tuple_write(*table_id, tuple_id)?;
+                                inserted = 1;
+                            }
+                            Err(err)
+                                if matches!(
+                                    on_conflict.as_ref().map(|conflict| &conflict.action),
+                                    Some(OnConflictActionPlan::DoNothing)
+                                ) && err.sqlstate() == SqlState::UniqueViolation =>
+                            {
+                                inserted = 0;
+                            }
+                            Err(err) => return Err(err),
+                        }
                     } else {
                         let tuple_ids = self.storage_dml.insert_batch(
                             direct_insert_txn_id,
@@ -1950,6 +1960,20 @@ impl Executor {
                 };
                 let update_policies =
                     self.compile_compat_rls_policies(&table, CompatRlsAction::Update, context)?;
+                let storage_autocommit_update_safe = context.implicit_transaction
+                    && context.isolation == aiondb_tx::IsolationLevel::ReadCommitted
+                    && !has_returning
+                    && from_table_ids.is_empty()
+                    && !needs_compat_row
+                    && update_policies.is_none()
+                    && !has_before_update_row_triggers
+                    && !has_after_update_row_triggers
+                    && !has_before_update_statement_triggers
+                    && !has_after_update_statement_triggers
+                    && !has_referencing_update_fks
+                    && !has_fk_constraints
+                    && !has_check_constraints
+                    && !may_affect_unique_indexes;
                 if !from_table_ids.is_empty() && from_rows.iter().any(Vec::is_empty) {
                     if has_after_update_statement_triggers {
                         self.fire_statement_triggers(
@@ -2052,7 +2076,7 @@ impl Executor {
                 self.lock_table(context, *table_id, LockMode::RowExclusive)?;
                 context.record_relation_write(*table_id)?;
 
-                let apply_ctx = UpdateApplyCtx {
+                let mut apply_ctx = UpdateApplyCtx {
                     table: &table,
                     table_id: *table_id,
                     filter: filter.as_ref(),
@@ -2079,6 +2103,7 @@ impl Executor {
                     has_returning,
                     returning,
                     returning_direct_column_ordinals: returning_direct_column_ordinals.as_deref(),
+                    storage_autocommit_update: false,
                 };
 
                 if from_table_ids.is_empty()
@@ -2367,6 +2392,8 @@ impl Executor {
                                 matching_tuple_ids.sort_unstable_by_key(|tid| tid.get());
                                 matching_tuple_ids.dedup();
                             }
+                            apply_ctx.storage_autocommit_update =
+                                storage_autocommit_update_safe && matching_tuple_ids.len() == 1;
                             let case_lookup_assignments: Vec<Option<DmlCaseLookupAssignment>> =
                                 assignments
                                     .iter()
@@ -4330,13 +4357,24 @@ impl Executor {
                 context,
             )?;
         } else {
-            self.update_after_table_locked(
-                context,
-                ctx.table_id,
-                tuple_id,
-                Some(old_row),
-                updated_row,
-            )?;
+            if ctx.storage_autocommit_update {
+                self.update_after_table_locked_with_storage_txn(
+                    context,
+                    TxnId::default(),
+                    ctx.table_id,
+                    tuple_id,
+                    Some(old_row),
+                    updated_row,
+                )?;
+            } else {
+                self.update_after_table_locked(
+                    context,
+                    ctx.table_id,
+                    tuple_id,
+                    Some(old_row),
+                    updated_row,
+                )?;
+            }
         }
         // Suppress unused-variable lints for the EPQ-only fields kept
         // on `UpdateApplyCtx` for the future opt-in path.
@@ -4396,6 +4434,7 @@ pub(super) struct UpdateApplyCtx<'a> {
     pub has_returning: bool,
     pub returning: &'a [ProjectionExpr],
     pub returning_direct_column_ordinals: Option<&'a [usize]>,
+    pub storage_autocommit_update: bool,
 }
 
 fn dml_expr_requires_special_resolution(expr: &TypedExpr) -> bool {

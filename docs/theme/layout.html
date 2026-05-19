@@ -1,9 +1,19 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ lang }}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ title }} - aiondb</title>
+  <title>{{ seo_title }}</title>
+  <meta name="description" content="{{ description }}" />
+  <link rel="canonical" href="{{ canonical_url }}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="AionDB" />
+  <meta property="og:title" content="{{ seo_title }}" />
+  <meta property="og:description" content="{{ description }}" />
+  <meta property="og:url" content="{{ canonical_url }}" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="{{ seo_title }}" />
+  <meta name="twitter:description" content="{{ description }}" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400&family=JetBrains+Mono:wght@400&display=swap" />
@@ -11,6 +21,9 @@
   <link rel="icon" media="(prefers-color-scheme: dark)" type="image/png" href="/aiondb-logo-dark.png" />
   <link rel="icon" type="image/png" href="/aiondb-logo-light.png" />
   <link rel="stylesheet" href="/style.css?v=bench-ui-20260512-soft" />
+  <script type="application/ld+json">
+{{ structured_data }}
+  </script>
 </head>
 <body>
   <canvas id="bg-canvas" aria-hidden="true"></canvas>
@@ -22,13 +35,24 @@
           <img src="/aiondb-logo-light.png" alt="AionDB logo" />
         </picture>
         aiondb
-        <span class="brand-tag">v0.1 alpha</span>
+        <span class="brand-tag">v0.2 graph update</span>
       </a>
       <nav class="top-nav">
         {{ top_nav }}
       </nav>
     </div>
   </header>
+
+  <section class="site-notice" aria-label="v0.2 update notice">
+    <div class="site-notice-inner">
+      <strong>Check the v0.2 graph update:</strong>
+      broader Cypher path coverage, multi-segment `shortestPath` and `allShortestPaths`,
+      named paths across multiple variable-length segments, stronger undirected fast paths,
+      runtime-observed graph `EXPLAIN`, Neo4j-oriented compatibility evidence, and a current
+      benchmark snapshot vs Neo4j, SurrealDB, and pgstack.
+      <a href="/documentation/project/whats-new-v0-2.html">Read the full v0.2 breakdown</a>.
+    </div>
+  </section>
 
   <main class="layout {{ body_class }}">
     {{ sidebar }}

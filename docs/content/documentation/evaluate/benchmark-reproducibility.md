@@ -123,7 +123,11 @@ Disclose how the query reached the engine:
 
 Protocol overhead can dominate tiny queries. A fair comparison should measure comparable paths or clearly explain why the paths differ.
 
-For `surreal-suite`, disclose that SurrealDB uses WebSocket JSON-RPC, AionDB uses PostgreSQL wire, and PostgreSQL stack uses PostgreSQL wire with `pgvector` and Apache AGE when those extensions are installed.
+For `surreal-suite`, disclose that SurrealDB uses WebSocket JSON-RPC, AionDB uses PostgreSQL wire, and PostgreSQL stack uses PostgreSQL wire with `pgvector` and Apache AGE when those extensions are installed. Also disclose the storage mode for each engine. The default harness should be read as:
+
+- AionDB: durable local storage + WAL
+- SurrealDB: durable local file-backed store
+- pgstack: durable local PostgreSQL cluster storage
 
 For `ultra-compare`, disclose that the run is composite:
 

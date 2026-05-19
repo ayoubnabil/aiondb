@@ -140,8 +140,14 @@ SURREAL_SUITE_WARMUP_SECONDS=3
 SURREAL_SUITE_ITERATIONS=1
 SURREAL_SUITE_DURATION_SECONDS=20
 SURREAL_SUITE_TESTS=all
-SURREAL_PATH=memory
+SURREAL_PATH=surrealkv:benchmarks/.state/surreal-suite-surrealdb
 ```
+
+The default `surreal-suite` comparison should be read as an all-durable local run:
+
+- AionDB: durable storage + WAL
+- SurrealDB: durable `surrealkv:` local store
+- pgstack: durable local PostgreSQL cluster storage
 
 The run directory contains:
 

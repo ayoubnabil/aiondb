@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import html
 import http.server
+import json
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ CONTENT = ROOT / "content"
 THEME = ROOT / "theme"
 DEFAULT_OUT = ROOT / "_site"
 THEME_STYLE_MARKER = "AIONDB_STUDIO_THEME_LOCK:v2"
+SITE_URL = os.environ.get("AIONDB_SITE_URL", "https://aiondb.xyz").rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +290,36 @@ def slugify(text: str) -> str:
 
 
 class Page:
-    __slots__ = ("source", "rel_url", "title", "order", "html_body", "section")
+    __slots__ = (
+        "source",
+        "rel_url",
+        "title",
+        "seo_title",
+        "description",
+        "lang",
+        "order",
+        "html_body",
+        "section",
+    )
 
-    def __init__(self, source: Path, rel_url: str, title: str, order: int, body: str, section: str):
+    def __init__(
+        self,
+        source: Path,
+        rel_url: str,
+        title: str,
+        seo_title: str,
+        description: str,
+        lang: str,
+        order: int,
+        body: str,
+        section: str,
+    ):
         self.source = source
         self.rel_url = rel_url
         self.title = title
+        self.seo_title = seo_title
+        self.description = description
+        self.lang = lang
         self.order = order
         self.html_body = body
         self.section = section
@@ -310,11 +336,21 @@ def collect_pages() -> list[Page]:
         else:
             url = "/" + rel.with_suffix(".html").as_posix()
         title = meta.get("title") or first_heading(body) or rel.stem.replace("-", " ").title()
+        seo_title = meta.get("seo_title") or f"{title} | AionDB"
+        description = meta.get("description") or default_description(title)
+        lang = meta.get("lang") or "en"
         order = int(meta.get("order", "100"))
         section = rel.parts[0] if len(rel.parts) > 1 else ""
         rendered = render_markdown(body)
-        pages.append(Page(md, url, title, order, rendered, section))
+        pages.append(Page(md, url, title, seo_title, description, lang, order, rendered, section))
     return pages
+
+
+def default_description(title: str) -> str:
+    return (
+        f"{title} in the AionDB documentation: PostgreSQL-compatible SQL, "
+        "graph queries, and vector search in one Rust database engine."
+    )
 
 
 def first_heading(body: str) -> str | None:
@@ -460,10 +496,38 @@ def build_sidebar(pages: list[Page], current: Page) -> str:
     )
 
 
+def canonical_url(page: Page) -> str:
+    if page.rel_url == "/":
+        return f"{SITE_URL}/"
+    return f"{SITE_URL}{page.rel_url}"
+
+
+def structured_data(page: Page) -> str:
+    data = {
+        "@context": "https://schema.org",
+        "@type": "WebPage",
+        "name": page.title,
+        "headline": page.seo_title,
+        "description": page.description,
+        "url": canonical_url(page),
+        "isPartOf": {
+            "@type": "WebSite",
+            "name": "AionDB",
+            "url": f"{SITE_URL}/",
+        },
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2).replace("</", "<\\/")
+
+
 def render_layout(template: str, page: Page, top_nav: str, sidebar: str) -> str:
     body_class = "has-sidebar" if sidebar else "no-sidebar"
     return (
         template.replace("{{ title }}", html.escape(page.title))
+        .replace("{{ seo_title }}", html.escape(page.seo_title))
+        .replace("{{ description }}", html.escape(page.description, quote=True))
+        .replace("{{ canonical_url }}", html.escape(canonical_url(page), quote=True))
+        .replace("{{ lang }}", html.escape(page.lang, quote=True))
+        .replace("{{ structured_data }}", structured_data(page))
         .replace("{{ top_nav }}", top_nav)
         .replace("{{ sidebar }}", sidebar)
         .replace("{{ content }}", page.html_body)
@@ -513,14 +577,40 @@ def build(out_dir: Path) -> None:
         target.write_text(rendered, encoding="utf-8")
         print(f"  built {page.rel_url}")
 
-    import json
     manifest = sorted({p.rel_url for p in pages})
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    write_sitemap(out_dir, pages)
+    write_robots(out_dir)
 
     print(f"\ndone. {len(pages)} page(s) -> {out_dir}")
+
+
+def write_sitemap(out_dir: Path, pages: list[Page]) -> None:
+    urls = "\n".join(
+        "  <url><loc>"
+        + html.escape(canonical_url(page), quote=True)
+        + "</loc></url>"
+        for page in sorted(pages, key=lambda p: p.rel_url)
+    )
+    sitemap = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{urls}\n"
+        "</urlset>\n"
+    )
+    (out_dir / "sitemap.xml").write_text(sitemap, encoding="utf-8")
+
+
+def write_robots(out_dir: Path) -> None:
+    robots = (
+        "User-agent: *\n"
+        "Allow: /\n\n"
+        f"Sitemap: {SITE_URL}/sitemap.xml\n"
+    )
+    (out_dir / "robots.txt").write_text(robots, encoding="utf-8")
 
 
 def read_validated_layout() -> str:

@@ -23,9 +23,9 @@ It keeps tables as the source of truth, exposes a PostgreSQL wire surface for
 existing tools, and adds graph and vector capabilities in the same engine and
 catalog.
 
-Status: **v0.1 alpha**. AionDB is intended for evaluation, local experiments,
-driver compatibility work, benchmarks, and architecture review. It is not yet
-a production replacement for mature database systems.
+Status: **v0.2 graph update**. AionDB is intended for evaluation, local
+experiments, driver compatibility work, benchmarks, and architecture review.
+It is not yet a production replacement for mature database systems.
 
 ## What It Provides
 
@@ -139,7 +139,7 @@ python3 docs/build.py --serve
 
 ## Operations Surface
 
-The v0.1 local operations surface includes:
+The v0.2 local operations surface includes:
 
 - `GET /livez`, `GET /healthz`, `GET /readyz`, `GET /metrics`, and `GET /info`
 - `aiondb doctor --data-dir <path>`

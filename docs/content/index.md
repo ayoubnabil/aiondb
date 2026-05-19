@@ -1,5 +1,7 @@
 ---
 title: Home
+seo_title: AionDB - multimodal database for SQL, graph, and vector search
+description: AionDB is a PostgreSQL-compatible multimodal database in Rust that combines relational records, graph relationships, and vector search in one engine.
 order: 0
 ---
 
@@ -11,6 +13,7 @@ order: 0
 <p class="hero-actions">
   <a class="button" href="/documentation/">Read the docs</a>
   <a class="button secondary" href="/presentation.html">Project overview</a>
+  <a class="button secondary" href="/multimodal-database.html">Multimodal database</a>
 </p>
 </div>
 

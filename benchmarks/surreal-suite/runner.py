@@ -1218,6 +1218,21 @@ def main() -> int:
             "operation_timeout_seconds": args.operation_timeout_seconds,
             "engines": selected_engines,
             "tests": [s.name for s in all_specs],
+            "storage": {
+                "surrealdb": {
+                    "mode": "memory"
+                    if os.getenv("SURREAL_PATH", "memory") == "memory"
+                    else "durable",
+                    "path": os.getenv("SURREAL_PATH", "memory"),
+                },
+                "aiondb": {
+                    "mode": os.getenv("AIONDB_STORAGE", "durable"),
+                },
+                "pgstack": {
+                    "mode": "durable",
+                    "backend": "local PostgreSQL cluster",
+                },
+            },
             "protocols": {
                 "surrealdb": "WebSocket JSON-RPC",
                 "aiondb": "PostgreSQL wire",

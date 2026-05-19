@@ -248,6 +248,49 @@ fn on_conflict_nested_wcte_second_update_returns_no_rows() {
     assert!(rows.is_empty(), "expected no RETURNING rows, got {rows:?}");
 }
 
+#[test]
+fn on_conflict_do_nothing_single_row_reports_skip() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE fast_conflict (id INT PRIMARY KEY, note TEXT); \
+             INSERT INTO fast_conflict VALUES (1, 'seed')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "INSERT INTO fast_conflict VALUES (1, 'ignored') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .expect("on conflict do nothing");
+
+    assert_eq!(
+        results,
+        vec![StatementResult::Command {
+            tag: "INSERT".to_owned(),
+            rows_affected: 0,
+        }]
+    );
+
+    let rows = query_rows(
+        &engine,
+        &session,
+        "SELECT id, note FROM fast_conflict ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![Row::new(vec![
+            Value::Int(1),
+            Value::Text("seed".to_owned()),
+        ])]
+    );
+}
+
 // ===================================================================
 // UPDATE that would violate uniqueness
 // ===================================================================

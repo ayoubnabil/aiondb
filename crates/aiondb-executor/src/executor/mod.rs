@@ -2906,6 +2906,30 @@ impl Executor {
         Ok(updated_tuple_id)
     }
 
+    pub(super) fn update_after_table_locked_with_storage_txn(
+        &self,
+        context: &ExecutionContext,
+        storage_txn_id: TxnId,
+        table_id: RelationId,
+        tuple_id: aiondb_core::TupleId,
+        expected_row: Option<&Row>,
+        row: Row,
+    ) -> DbResult<aiondb_core::TupleId> {
+        let was_prelocked =
+            context.acquire_tuple_lock_returning_was_held(table_id, tuple_id, LockMode::Update)?;
+        if !was_prelocked {
+            self.ensure_tuple_matches_expected(context, table_id, tuple_id, expected_row)?;
+        }
+        let updated_tuple_id = self
+            .storage_dml
+            .update(storage_txn_id, table_id, tuple_id, row)?;
+        context.record_tuple_write(table_id, tuple_id)?;
+        if updated_tuple_id != tuple_id {
+            context.record_tuple_write(table_id, updated_tuple_id)?;
+        }
+        Ok(updated_tuple_id)
+    }
+
     /// EvalPlanQual-aware variant of `update_after_table_locked`.
     ///
     /// PostgreSQL's `ExecUpdate` deals with concurrent updates at

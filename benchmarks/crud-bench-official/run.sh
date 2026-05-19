@@ -25,7 +25,7 @@ SURREAL_HOST="${SURREAL_HOST:-127.0.0.1}"
 SURREAL_PORT="${SURREAL_PORT:-18000}"
 SURREAL_USER="${SURREAL_USER:-root}"
 SURREAL_PASS="${SURREAL_PASS:-root}"
-SURREAL_PATH="${SURREAL_PATH:-memory}"
+SURREAL_PATH="${SURREAL_PATH:-surrealkv:$STATE_DIR/crud-bench-official-surrealdb}"
 SURREAL_LOG="${SURREAL_LOG:-$STATE_DIR/crud-bench-official-surrealdb.log}"
 SURREAL_PIDFILE="${SURREAL_PIDFILE:-$STATE_DIR/crud-bench-official-surrealdb.pid}"
 
@@ -38,6 +38,14 @@ RUN_ID="${RUN_ID:-crudbench-official-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_DIR="${RUN_DIR:-$STATE_DIR/crud-bench-official/$RUN_ID}"
 
 mkdir -p "$RUN_DIR"
+
+surreal_storage_mode() {
+    if [[ "$SURREAL_PATH" == "memory" ]]; then
+        printf 'memory'
+    else
+        printf 'durable'
+    fi
+}
 
 surreal_is_running() {
     [[ -f "$SURREAL_PIDFILE" ]] && kill -0 "$(cat "$SURREAL_PIDFILE" 2>/dev/null)" 2>/dev/null
@@ -63,6 +71,11 @@ surreal_start() {
         return 0
     fi
     mkdir -p "$(dirname "$SURREAL_LOG")"
+    if [[ "$(surreal_storage_mode)" == "durable" ]]; then
+        local surreal_fs_path="${SURREAL_PATH#*:}"
+        rm -rf "$surreal_fs_path"
+        mkdir -p "$(dirname "$surreal_fs_path")"
+    fi
     log "starting surrealdb ws://$SURREAL_HOST:$SURREAL_PORT path=$SURREAL_PATH"
     nohup "$SURREAL_BIN" start \
         --no-banner \
@@ -131,6 +144,9 @@ record_metadata() {
         printf 'operation_timeout=%s\n' "$CRUD_BENCH_OPERATION_TIMEOUT"
         printf 'engines=%s\n' "$CRUD_BENCH_ENGINES"
         printf 'aiondb_storage=%s\n' "$AIONDB_STORAGE"
+        printf 'surreal_storage=%s\n' "$(surreal_storage_mode)"
+        printf 'surreal_path=%s\n' "$SURREAL_PATH"
+        printf 'pgstack_storage=durable\n'
         printf 'surreal_endpoint=ws://%s:%s\n' "$SURREAL_HOST" "$SURREAL_PORT"
         printf 'postgres_endpoint=host=%s port=%s dbname=postgres user=%s sslmode=disable\n' "$PG_LOCAL_HOST" "$PG_LOCAL_PORT" "$PG_LOCAL_USER"
     } > "$RUN_DIR/metadata.env"

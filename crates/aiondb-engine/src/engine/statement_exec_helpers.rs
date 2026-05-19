@@ -1067,10 +1067,15 @@ pub(in crate::engine) fn insert_values_storage_autocommit_candidate(statement: &
     let Statement::Insert(insert) = statement else {
         return false;
     };
-    insert.query.is_none()
-        && !insert.rows.is_empty()
-        && insert.on_conflict.is_none()
-        && insert.returning.is_empty()
+    if insert.query.is_some() || insert.rows.is_empty() || !insert.returning.is_empty() {
+        return false;
+    }
+
+    match insert.on_conflict.as_ref().map(|conflict| &conflict.action) {
+        None => true,
+        Some(aiondb_parser::OnConflictAction::DoNothing) => insert.rows.len() == 1,
+        Some(aiondb_parser::OnConflictAction::DoUpdate { .. }) => false,
+    }
 }
 
 pub(in crate::engine) fn statement_needs_explicit_txn_participant_enrollment(statement: &Statement) -> bool {

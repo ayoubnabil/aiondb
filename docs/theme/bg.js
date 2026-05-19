@@ -1,10 +1,163 @@
 (function () {
   var c = document.getElementById('bg-canvas');
   if (!c) return;
+
+  var rootStyle = document.documentElement.style;
+  var THEME_KEY = 'aionThemePhaseV1';
+  var THEME_MINUTES_PER_BLEND = 14;
+  var THEME_PHASE_MS = THEME_MINUTES_PER_BLEND * 60 * 1000;
+  var THEME_SAVE_MS = 4000;
+  var themeStartAt = Date.now();
+  var themeStartPhase = 0;
+  var lastThemeSave = 0;
+  var currentShaderTheme = null;
+  var palette = [
+    {
+      bg: [3, 3, 5],
+      bg2: [8, 5, 10],
+      deep: [5, 7, 4],
+      mid: [10, 77, 46],
+      glow: [33, 116, 72],
+      haze: [185, 198, 178],
+      accent: [255, 141, 85],
+      accent2: [54, 184, 117],
+      accent3: [215, 244, 207],
+      shaderDeep: [3, 8, 5],
+      shaderMoss: [14, 78, 45],
+      shaderSage: [112, 142, 116],
+      shaderMilk: [220, 232, 207]
+    },
+    {
+      bg: [2, 8, 10],
+      bg2: [3, 15, 18],
+      deep: [2, 12, 14],
+      mid: [0, 88, 103],
+      glow: [30, 144, 150],
+      haze: [142, 190, 184],
+      accent: [99, 220, 205],
+      accent2: [255, 177, 112],
+      accent3: [214, 245, 236],
+      shaderDeep: [2, 13, 16],
+      shaderMoss: [0, 92, 104],
+      shaderSage: [105, 160, 156],
+      shaderMilk: [214, 242, 236]
+    },
+    {
+      bg: [5, 7, 18],
+      bg2: [8, 11, 28],
+      deep: [4, 8, 24],
+      mid: [31, 70, 132],
+      glow: [69, 102, 176],
+      haze: [147, 166, 210],
+      accent: [114, 188, 255],
+      accent2: [235, 184, 116],
+      accent3: [224, 235, 255],
+      shaderDeep: [5, 9, 24],
+      shaderMoss: [30, 73, 130],
+      shaderSage: [110, 132, 184],
+      shaderMilk: [221, 232, 255]
+    },
+    {
+      bg: [10, 7, 6],
+      bg2: [17, 11, 9],
+      deep: [14, 9, 7],
+      mid: [96, 57, 36],
+      glow: [142, 84, 48],
+      haze: [198, 159, 123],
+      accent: [255, 174, 99],
+      accent2: [117, 205, 152],
+      accent3: [255, 232, 198],
+      shaderDeep: [15, 9, 7],
+      shaderMoss: [95, 55, 35],
+      shaderSage: [158, 119, 84],
+      shaderMilk: [255, 232, 202]
+    }
+  ];
+
+  function readThemePhase() {
+    try {
+      var stored = window.localStorage.getItem(THEME_KEY);
+      var parsed = stored ? parseFloat(stored) : NaN;
+      if (!isNaN(parsed) && isFinite(parsed)) return parsed % palette.length;
+    } catch (e) {}
+    return 0;
+  }
+
+  function saveThemePhase(phase) {
+    try {
+      window.localStorage.setItem(THEME_KEY, String(phase % palette.length));
+    } catch (e) {}
+  }
+
+  function mix(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function mixRgb(a, b, t) {
+    return [
+      Math.round(mix(a[0], b[0], t)),
+      Math.round(mix(a[1], b[1], t)),
+      Math.round(mix(a[2], b[2], t))
+    ];
+  }
+
+  function cssRgb(rgb) {
+    return rgb[0] + ', ' + rgb[1] + ', ' + rgb[2];
+  }
+
+  function shaderRgb(rgb) {
+    return [rgb[0] / 255, rgb[1] / 255, rgb[2] / 255];
+  }
+
+  function currentThemePhase(nowMs) {
+    return (themeStartPhase + (nowMs - themeStartAt) / THEME_PHASE_MS) % palette.length;
+  }
+
+  function applyTheme(nowMs, forceSave) {
+    var phase = currentThemePhase(nowMs);
+    var i = Math.floor(phase);
+    var j = (i + 1) % palette.length;
+    var t = phase - i;
+    var a = palette[i];
+    var b = palette[j];
+    var vars = {
+      '--theme-bg-rgb': mixRgb(a.bg, b.bg, t),
+      '--theme-bg-2-rgb': mixRgb(a.bg2, b.bg2, t),
+      '--theme-deep-rgb': mixRgb(a.deep, b.deep, t),
+      '--theme-mid-rgb': mixRgb(a.mid, b.mid, t),
+      '--theme-glow-rgb': mixRgb(a.glow, b.glow, t),
+      '--theme-haze-rgb': mixRgb(a.haze, b.haze, t),
+      '--theme-accent-rgb': mixRgb(a.accent, b.accent, t),
+      '--theme-accent-2-rgb': mixRgb(a.accent2, b.accent2, t),
+      '--theme-accent-3-rgb': mixRgb(a.accent3, b.accent3, t)
+    };
+    Object.keys(vars).forEach(function (key) {
+      rootStyle.setProperty(key, cssRgb(vars[key]));
+    });
+    currentShaderTheme = {
+      deep: shaderRgb(mixRgb(a.shaderDeep, b.shaderDeep, t)),
+      moss: shaderRgb(mixRgb(a.shaderMoss, b.shaderMoss, t)),
+      sage: shaderRgb(mixRgb(a.shaderSage, b.shaderSage, t)),
+      milk: shaderRgb(mixRgb(a.shaderMilk, b.shaderMilk, t))
+    };
+    if (forceSave || nowMs - lastThemeSave > THEME_SAVE_MS) {
+      lastThemeSave = nowMs;
+      saveThemePhase(phase);
+    }
+    return phase;
+  }
+
+  themeStartPhase = readThemePhase();
+  applyTheme(Date.now(), false);
+  window.addEventListener('beforeunload', function () {
+    saveThemePhase(currentThemePhase(Date.now()));
+  });
+
   var gl = c.getContext('webgl', { alpha: true, premultipliedAlpha: false, antialias: false })
         || c.getContext('experimental-webgl', { alpha: true, premultipliedAlpha: false, antialias: false });
   if (!gl) {
     c.style.background = 'transparent';
+    window.setInterval(function () { applyTheme(Date.now(), true); }, 1000);
     return;
   }
 
@@ -27,6 +180,10 @@
     + 'precision highp float;'
     + 'uniform vec2 u_res;'
     + 'uniform float u_t;'
+    + 'uniform vec3 u_deep;'
+    + 'uniform vec3 u_moss;'
+    + 'uniform vec3 u_sage;'
+    + 'uniform vec3 u_milk;'
     + 'float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}'
     + 'float vnoise(vec2 p){'
     + ' vec2 i=floor(p),f=fract(p);'
@@ -58,10 +215,10 @@
     /* Slow, large-scale mask - patches grow and fade in / out */
     + ' float mask=fbm(p*0.45+vec2(t*0.4,t*0.25));'
     + ' mask=smoothstep(0.32,0.78,mask);'
-    + ' vec3 deep=vec3(0.012,0.030,0.020);'
-    + ' vec3 moss=vec3(0.055,0.265,0.145);'
-    + ' vec3 sage=vec3(0.44,0.56,0.46);'
-    + ' vec3 milk=vec3(0.86,0.91,0.82);'
+    + ' vec3 deep=u_deep;'
+    + ' vec3 moss=u_moss;'
+    + ' vec3 sage=u_sage;'
+    + ' vec3 milk=u_milk;'
     + ' float beam=smoothstep(0.08,0.72,1.0-abs(uv.x-0.55)*1.65);'
     + ' float lift=smoothstep(0.04,0.82,uv.y);'
     + ' float glow=smoothstep(0.24,0.88,n*mask+beam*0.32+lift*0.18);'
@@ -106,6 +263,10 @@
 
   var uRes = gl.getUniformLocation(prog, 'u_res');
   var uT = gl.getUniformLocation(prog, 'u_t');
+  var uDeep = gl.getUniformLocation(prog, 'u_deep');
+  var uMoss = gl.getUniformLocation(prog, 'u_moss');
+  var uSage = gl.getUniformLocation(prog, 'u_sage');
+  var uMilk = gl.getUniformLocation(prog, 'u_milk');
 
   function resize() {
     var dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -146,6 +307,13 @@
 
   /* Render once synchronously so the first frame is correct before rAF kicks in */
   function render(t) {
+    var theme = currentShaderTheme;
+    if (theme) {
+      gl.uniform3f(uDeep, theme.deep[0], theme.deep[1], theme.deep[2]);
+      gl.uniform3f(uMoss, theme.moss[0], theme.moss[1], theme.moss[2]);
+      gl.uniform3f(uSage, theme.sage[0], theme.sage[1], theme.sage[2]);
+      gl.uniform3f(uMilk, theme.milk[0], theme.milk[1], theme.milk[2]);
+    }
     gl.uniform2f(uRes, c.width, c.height);
     gl.uniform1f(uT, t);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -157,6 +325,7 @@
   function frame(now) {
     if (now - last >= INTERVAL) {
       last = now;
+      applyTheme(Date.now(), false);
       var t = prefersReduced ? 0 : (Date.now() - startMs) / 1000;
       render(t);
     }

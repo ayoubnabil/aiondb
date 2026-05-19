@@ -31,7 +31,17 @@ This page is based on two concrete local benchmark snapshots:
    - iterations: `6`
    - artifact: `target/benchmarks/neo4j-graph-compare/20260519-150230/report.json`
 
-2. **Broader matrix vs SurrealDB and pgstack**
+2. **CRUD refresh vs SurrealDB and pgstack**
+   - harness: `benchmarks/run.sh surreal-suite`
+   - run id: `20260519T135910Z`
+   - engines: `aiondb`, `surrealdb`, `pgstack`
+   - storage: all three engines on durable local storage
+   - tests: `[C]reate`, `[R]ead`, `[U]pdate`
+   - artifacts:
+     - `benchmarks/.state/surreal-suite/20260519T135910Z/summary.tsv`
+     - `benchmarks/.state/surreal-suite/20260519T135910Z/metadata.json`
+
+3. **Broader matrix vs SurrealDB and pgstack**
    - harness: `benchmarks/run.sh surreal-suite`
    - run id: `full-all-20260512T192959Z`
    - engines: `aiondb`, `surrealdb`, `pgstack`
@@ -75,12 +85,18 @@ It is a precise claim:
 
 The broader matrix is mixed, which is exactly why this page keeps it separate.
 
-Representative results from `surreal-suite`:
+Fresh CRUD snapshot from `surreal-suite`:
 
 | Workload | AionDB | SurrealDB | pgstack | Read |
 | --- | ---: | ---: | ---: | --- |
-| `[C]reate` | `109.15 ops/s` | `1553.5 ops/s` | `580.85 ops/s` | AionDB behind |
-| `[R]ead` | `1420.15 ops/s` | `1684.35 ops/s` | `3299.3 ops/s` | AionDB behind |
+| `[C]reate` | `203.8 ops/s` | `197.0 ops/s` | `486.4 ops/s` | near tie with SurrealDB; pgstack ahead |
+| `[R]ead` | `1409.1 ops/s` | `1840.3 ops/s` | `4545.6 ops/s` | AionDB behind both, but same order of magnitude as SurrealDB |
+| `[U]pdate` | `556.1 ops/s` | `520.1 ops/s` | `1128.1 ops/s` | near tie with SurrealDB; pgstack ahead |
+
+Representative broader graph/hybrid results from the full `surreal-suite` snapshot:
+
+| Workload | AionDB | SurrealDB | pgstack | Read |
+| --- | ---: | ---: | ---: | --- |
 | `[S]can::count_all (2000)` | `7819.5 ops/s` | `168.85 ops/s` | `1073.5 ops/s` | AionDB far ahead |
 | `[S]can::graph_edge_filter (2000)` | `1056.55 ops/s` | `219.0 ops/s` | `446.55 ops/s` | AionDB ahead |
 | `[S]can::graph_bidirectional (2000)` | `2874.1 ops/s` | `1322.1 ops/s` | `8.66 ops/s` | AionDB ahead |
@@ -94,7 +110,7 @@ Representative results from `surreal-suite`:
 The broader v0.2 picture is:
 
 - **graph scans and graph-shaped filters** are already a strong area for AionDB;
-- **simple CRUD throughput** is not yet where the best specialized competitors are;
+- **simple CRUD throughput** is now competitive with SurrealDB on this all-durable CRUD refresh, while pgstack remains ahead;
 - **hybrid graph/vector** is real and runnable, but not yet a universal win;
 - some comparison cells are still `UNSUPPORTED` on one side or another, so fairness depends on the exact workload family.
 

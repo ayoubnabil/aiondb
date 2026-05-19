@@ -1168,6 +1168,7 @@ code, pre, kbd, samp { font-family: var(--font-mono); font-weight: 400; }
 /* Responsive */
 @media (max-width: 880px) {
   .site-header-inner { padding: 0 var(--s-20); }
+  .site-notice-inner { padding: 10px var(--s-20); font-size: 12px; }
   .layout { padding: var(--s-32) var(--s-20) var(--s-72); gap: var(--s-32); }
   .layout.has-sidebar { grid-template-columns: 1fr; }
   .sidebar {
@@ -1203,8 +1204,18 @@ code, pre, kbd, samp { font-family: var(--font-mono); font-weight: 400; }
    Keep the public site theme here, not in docs/_site, so rebuilds preserve it. */
 
 :root {
-  --studio-bg: #030305;
-  --studio-bg-2: #08050a;
+  --theme-bg-rgb: 3, 3, 5;
+  --theme-bg-2-rgb: 8, 5, 10;
+  --theme-deep-rgb: 5, 7, 4;
+  --theme-mid-rgb: 10, 77, 46;
+  --theme-glow-rgb: 33, 116, 72;
+  --theme-haze-rgb: 185, 198, 178;
+  --theme-accent-rgb: 255, 112, 82;
+  --theme-accent-2-rgb: 54, 184, 117;
+  --theme-accent-3-rgb: 215, 244, 207;
+
+  --studio-bg: rgb(var(--theme-bg-rgb));
+  --studio-bg-2: rgb(var(--theme-bg-2-rgb));
   --studio-panel: rgba(255, 255, 255, 0.045);
   --studio-panel-strong: rgba(255, 255, 255, 0.075);
   --studio-line: rgba(255, 255, 255, 0.13);
@@ -1212,11 +1223,11 @@ code, pre, kbd, samp { font-family: var(--font-mono); font-weight: 400; }
   --studio-ink: #fff7ef;
   --studio-ink-soft: rgba(255, 247, 239, 0.74);
   --studio-ink-mute: rgba(255, 247, 239, 0.48);
-  --studio-rose: #ff3d8d;
-  --studio-pink: #f00072;
-  --studio-violet: #8b2bff;
-  --studio-orange: #ff8d55;
-  --studio-green: #35ff8b;
+  --studio-rose: rgb(var(--theme-accent-rgb));
+  --studio-pink: rgb(var(--theme-accent-rgb));
+  --studio-violet: rgb(var(--theme-accent-2-rgb));
+  --studio-orange: rgb(var(--theme-accent-rgb));
+  --studio-green: rgb(var(--theme-accent-2-rgb));
 
   --color-page: var(--studio-bg);
   --color-paper: #111014;
@@ -1237,9 +1248,9 @@ body {
   min-height: 100vh;
   overflow-x: hidden;
   background:
-    radial-gradient(circle at 28% 8%, rgba(185, 198, 178, 0.18), transparent 34vw),
-    radial-gradient(circle at 70% 20%, rgba(33, 116, 72, 0.30), transparent 42vw),
-    linear-gradient(180deg, #050704 0%, #030503 42%, #030305 100%);
+    radial-gradient(circle at 28% 8%, rgba(var(--theme-haze-rgb), 0.18), transparent 34vw),
+    radial-gradient(circle at 70% 20%, rgba(var(--theme-glow-rgb), 0.30), transparent 42vw),
+    linear-gradient(180deg, rgb(var(--theme-deep-rgb)) 0%, rgb(var(--theme-bg-rgb)) 42%, rgb(var(--theme-bg-2-rgb)) 100%);
   color: var(--studio-ink);
 }
 
@@ -1295,7 +1306,7 @@ a:hover,
 }
 
 .site-header {
-  background: rgba(7, 3, 8, 0.82);
+  background: rgba(var(--theme-bg-2-rgb), 0.82);
   border-bottom: 1px solid var(--studio-line-soft);
   backdrop-filter: blur(18px) saturate(150%);
   -webkit-backdrop-filter: blur(18px) saturate(150%);
@@ -1304,6 +1315,39 @@ a:hover,
 .site-header-inner {
   max-width: 1240px;
   height: 64px;
+}
+
+.site-notice {
+  position: relative;
+  z-index: 2;
+  border-bottom: 1px solid rgba(var(--theme-accent-rgb), 0.26);
+  background:
+    linear-gradient(90deg, rgba(var(--theme-accent-rgb), 0.10), rgba(var(--theme-accent-2-rgb), 0.08) 40%, rgba(var(--theme-accent-3-rgb), 0.07));
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+
+.site-notice-inner {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 12px 32px;
+  color: var(--studio-ink-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.site-notice-inner strong {
+  color: var(--studio-ink);
+  font-weight: 500;
+}
+
+.site-notice-inner a {
+  color: #ffffff;
+  text-decoration-color: rgba(var(--theme-accent-rgb), 0.7);
+}
+
+.site-notice-inner a:hover {
+  text-decoration-color: var(--studio-rose);
 }
 
 .brand,
@@ -1413,7 +1457,7 @@ a:hover,
 }
 
 .content h1 {
-  font-size: clamp(48px, 7vw, 112px);
+  font-size: clamp(44px, 5.2vw, 78px);
   font-weight: 400;
 }
 
@@ -1605,12 +1649,12 @@ a:hover,
   overflow: hidden;
   isolation: isolate;
   background:
-    radial-gradient(ellipse at 64% 38%, rgba(218, 241, 210, 0.30) 0%, rgba(118, 175, 132, 0.20) 22%, transparent 48%),
-    radial-gradient(ellipse at 44% 52%, rgba(10, 94, 54, 0.72) 0%, rgba(25, 115, 70, 0.58) 26%, transparent 58%),
+    radial-gradient(ellipse at 64% 38%, rgba(var(--theme-accent-3-rgb), 0.30) 0%, rgba(var(--theme-haze-rgb), 0.20) 22%, transparent 48%),
+    radial-gradient(ellipse at 44% 52%, rgba(var(--theme-mid-rgb), 0.72) 0%, rgba(var(--theme-glow-rgb), 0.58) 26%, transparent 58%),
     radial-gradient(ellipse at 14% 8%, rgba(255, 255, 255, 0.18) 0%, transparent 28%),
     repeating-linear-gradient(90deg, transparent 0 calc((100% / 7) - 1px), rgba(255, 255, 255, 0.075) calc((100% / 7) - 1px) calc(100% / 7)),
     linear-gradient(90deg, rgba(0, 0, 0, 0.82) 0 var(--hero-col), transparent var(--hero-col) calc(var(--hero-col) * 6), rgba(0, 0, 0, 0.52) calc(var(--hero-col) * 6)),
-    linear-gradient(105deg, #0b0c09 0%, #405048 23%, #78977e 44%, #145f3a 64%, #294034 100%);
+    linear-gradient(105deg, rgb(var(--theme-bg-rgb)) 0%, rgb(var(--theme-haze-rgb)) 23%, rgb(var(--theme-accent-3-rgb)) 44%, rgb(var(--theme-mid-rgb)) 64%, rgb(var(--theme-bg-2-rgb)) 100%);
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
   box-shadow: inset 0 -130px 120px rgba(0, 0, 0, 0.48);
 }
@@ -1941,11 +1985,11 @@ a:hover,
   overflow: hidden;
   isolation: isolate;
   background:
-    radial-gradient(ellipse at 18% 28%, rgba(140, 174, 130, 0.18), transparent 36%),
-    radial-gradient(ellipse at 66% 34%, rgba(12, 92, 53, 0.46), transparent 48%),
+    radial-gradient(ellipse at 18% 28%, rgba(var(--theme-haze-rgb), 0.18), transparent 36%),
+    radial-gradient(ellipse at 66% 34%, rgba(var(--theme-mid-rgb), 0.46), transparent 48%),
     repeating-linear-gradient(90deg, transparent 0 calc((100% / 7) - 1px), rgba(255,255,255,0.055) calc((100% / 7) - 1px) calc(100% / 7)),
     linear-gradient(90deg, rgba(0, 0, 0, 0.80) 0 calc(100% / 7), transparent calc(100% / 7) calc((100% / 7) * 6), rgba(0, 0, 0, 0.56) calc((100% / 7) * 6)),
-    linear-gradient(105deg, #080a07 0%, #22372b 28%, #0a4d2e 58%, #030806 100%);
+    linear-gradient(105deg, rgb(var(--theme-bg-rgb)) 0%, rgb(var(--theme-bg-2-rgb)) 28%, rgb(var(--theme-mid-rgb)) 58%, rgb(var(--theme-deep-rgb)) 100%);
   border-top: 1px solid rgba(255, 255, 255, 0.10);
   box-shadow: inset 0 120px 100px rgba(0, 0, 0, 0.48);
 }
@@ -2114,11 +2158,11 @@ a:hover,
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(ellipse at 26% 10%, rgba(147, 174, 138, 0.16), transparent 28%),
-    radial-gradient(ellipse at 82% 18%, rgba(0, 120, 66, 0.24), transparent 34%),
+    radial-gradient(ellipse at 26% 10%, rgba(var(--theme-haze-rgb), 0.16), transparent 28%),
+    radial-gradient(ellipse at 82% 18%, rgba(var(--theme-glow-rgb), 0.24), transparent 34%),
     repeating-linear-gradient(90deg, transparent 0 calc((100% / 7) - 1px), rgba(255,255,255,0.035) calc((100% / 7) - 1px) calc(100% / 7)),
     linear-gradient(90deg, rgba(0,0,0,0.72) 0 calc(100% / 7), transparent calc(100% / 7) calc((100% / 7) * 6), rgba(0,0,0,0.62) calc((100% / 7) * 6)),
-    linear-gradient(180deg, #050905 0%, #020503 72%, #030305 100%);
+    linear-gradient(180deg, rgb(var(--theme-deep-rgb)) 0%, rgb(var(--theme-bg-rgb)) 72%, rgb(var(--theme-bg-2-rgb)) 100%);
 }
 
 .layout.has-sidebar .sidebar {
@@ -2227,7 +2271,7 @@ a:hover,
   width: 54px;
   height: 2px;
   margin-bottom: 22px;
-  background: linear-gradient(90deg, #d7f4cf, #36b875 60%, transparent);
+  background: linear-gradient(90deg, rgb(var(--theme-accent-3-rgb)), rgb(var(--theme-accent-2-rgb)) 60%, transparent);
 }
 
 .layout.has-sidebar .content h3 {
@@ -2245,12 +2289,12 @@ a:hover,
 
 .layout.has-sidebar .content a:not(.button) {
   color: rgba(255, 250, 244, 0.94);
-  text-decoration-color: rgba(54, 184, 117, 0.72);
+  text-decoration-color: rgba(var(--theme-accent-2-rgb), 0.72);
 }
 
 .layout.has-sidebar .content a:not(.button):hover {
   color: #ffffff;
-  text-decoration-color: #d7f4cf;
+  text-decoration-color: rgb(var(--theme-accent-3-rgb));
 }
 
 .layout.has-sidebar .content table {
@@ -2767,6 +2811,11 @@ a:hover,
 }
 
 @media (max-width: 520px) {
+  .layout.no-sidebar .content h1 {
+    font-size: clamp(38px, 10vw, 46px);
+    line-height: 1;
+  }
+
   .layout.has-sidebar {
     padding-left: 20px;
     padding-right: 20px;
