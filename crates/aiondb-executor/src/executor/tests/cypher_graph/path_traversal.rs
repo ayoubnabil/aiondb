@@ -954,6 +954,100 @@ fn shortest_path_named_plan(
     }))
 }
 
+fn shortest_path_named_multi_segment_plan(
+    person_id: RelationId,
+    knows_id: RelationId,
+    start: i32,
+    end: i32,
+    func: CypherPathFunction,
+) -> PhysicalPlan {
+    PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: Some(func),
+                path_variable: Some("p".to_owned()),
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(start),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: None,
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(end),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![
+                    CypherRelPattern {
+                        variable: None,
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    },
+                    CypherRelPattern {
+                        variable: None,
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    },
+                ],
+            }],
+            filter: None,
+        }],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: TypedExpr::column_ref("p", 0, DataType::Text, true),
+            field: ResultField {
+                name: "p".to_owned(),
+                data_type: DataType::Text,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }))
+}
+
 // MATCH p = shortestPath((a:Person {id:1})-[:KNOWS*]->(b:Person {id:4})) RETURN p
 // renders the full 2-hop path with all intermediate nodes and edges.
 #[test]
@@ -990,6 +1084,62 @@ fn cypher_named_shortest_path_renders_full_path() {
         }
         other => panic!("expected query result, got {other:?}"),
     }
+}
+
+#[test]
+fn cypher_named_shortest_path_renders_full_multi_segment_path() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    insert_person(&executor, person_id, 1, "A");
+    insert_person(&executor, person_id, 2, "B");
+    insert_person(&executor, person_id, 3, "C");
+    insert_person(&executor, person_id, 4, "D");
+
+    insert_knows(&executor, knows_id, 1, 2, 10);
+    insert_knows(&executor, knows_id, 1, 3, 20);
+    insert_knows(&executor, knows_id, 2, 4, 30);
+    insert_knows(&executor, knows_id, 3, 4, 40);
+
+    let plan =
+        shortest_path_named_multi_segment_plan(person_id, knows_id, 1, 4, CypherPathFunction::ShortestPath);
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute named multi-segment shortestPath");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 1);
+            let Value::Text(path) = &rows[0].values[0] else {
+                panic!("expected path text, got {:?}", rows[0].values[0]);
+            };
+            assert_eq!(path.matches("(:Person").count(), 3, "path: {path}");
+            assert_eq!(path.matches("[:KNOWS").count(), 2, "path: {path}");
+            assert_eq!(path.matches("->").count(), 2, "path: {path}");
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}
+
+#[test]
+fn cypher_named_all_shortest_paths_multi_segment_is_rejected_explicitly() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    let plan =
+        shortest_path_named_multi_segment_plan(person_id, knows_id, 1, 4, CypherPathFunction::AllShortestPaths);
+    let err = executor
+        .execute(&plan, &default_context())
+        .expect_err("execute named multi-segment allShortestPaths");
+    assert_eq!(err.sqlstate(), SqlState::FeatureNotSupported);
+    assert!(
+        err.to_string()
+            .contains("allShortestPaths multi-segment patterns are not supported yet"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -11,11 +11,13 @@ use aiondb_graph::{
 };
 use aiondb_plan::graph::{CypherPathFunction, CypherPattern, CypherRelDirection};
 
+use super::graph_runtime_match::{bind_named_path_variable, materialize_named_path_pattern};
 use super::{ExecutionContext, Executor};
 use crate::executor::graph_plans::GraphMatchRuntimeCache;
 use crate::executor::graph_plans::{
     ensure_graph_result_row_capacity, ensure_graph_workset_capacity, estimate_bfs_path_bytes,
-    estimate_shortest_path_queue_entry_bytes, size_of_u64, usize_to_u32, value_to_bfs_key,
+    estimate_binding_row_bytes, estimate_shortest_path_queue_entry_bytes, graph_bound_edge_literal,
+    graph_bound_node_literal, size_of_u64, usize_to_u32, value_to_bfs_key, BindingRow,
     BoundValue, SharedRow, SharedStrings, SharedText,
 };
 use crate::executor::helpers::exact_lookup_key_range;
@@ -350,6 +352,140 @@ impl<'a> ExecutorGraphRowProvider<'a> {
 }
 
 impl Executor {
+    fn bound_path_hop_count(binding: &BindingRow, path_variable: &str) -> Option<usize> {
+        match binding.get(path_variable)? {
+            BoundValue::Path { relationships, .. }
+            | BoundValue::PathValues { relationships, .. } => Some(relationships.len()),
+            _ => None,
+        }
+    }
+
+    fn materialize_bound_path_value(binding: &BindingRow, path_variable: &str) -> Option<BoundValue> {
+        match binding.get(path_variable)? {
+            BoundValue::PathValues {
+                nodes,
+                relationships,
+                directions,
+            } => Some(BoundValue::PathValues {
+                nodes: Arc::clone(nodes),
+                relationships: Arc::clone(relationships),
+                directions: Arc::clone(directions),
+            }),
+            BoundValue::Path {
+                nodes,
+                relationships,
+                directions,
+            } => Some(BoundValue::PathValues {
+                nodes: Arc::new(
+                    nodes.iter()
+                        .map(|variable| {
+                            graph_bound_node_literal(binding, variable)
+                                .unwrap_or_else(|| "()".to_owned())
+                        })
+                        .collect(),
+                ),
+                relationships: Arc::new(
+                    relationships
+                        .iter()
+                        .map(|variable| {
+                            graph_bound_edge_literal(binding, variable)
+                                .unwrap_or_else(|| "[]".to_owned())
+                        })
+                        .collect(),
+                ),
+                directions: Arc::clone(directions),
+            }),
+            _ => None,
+        }
+    }
+
+    fn match_shortest_path_multi_segment(
+        &self,
+        context: &ExecutionContext,
+        pattern: &CypherPattern,
+        func: CypherPathFunction,
+        input_bindings: Vec<BindingRow>,
+    ) -> DbResult<Vec<BindingRow>> {
+        if matches!(func, CypherPathFunction::AllShortestPaths) {
+            return Err(DbError::feature_not_supported(
+                "allShortestPaths multi-segment patterns are not supported yet",
+            ));
+        }
+
+        if pattern.relationships.iter().any(|rel| rel.table_id.is_none()) {
+            return Err(DbError::feature_not_supported(
+                "shortestPath requires typed relationship patterns (e.g. [:KNOWS] / [:KNOWS*])",
+            ));
+        }
+
+        let variable_length_relationships = pattern
+            .relationships
+            .iter()
+            .filter(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+            .count();
+        if variable_length_relationships > 1 {
+            return Err(DbError::feature_not_supported(
+                "shortestPath/allShortestPaths currently supports at most one variable-length relationship in multi-segment patterns",
+            ));
+        }
+
+        let internal_path_variable = pattern
+            .path_variable
+            .clone()
+            .unwrap_or_else(|| "__shortest_path_internal__".to_owned());
+        let mut internal_pattern = pattern.clone();
+        internal_pattern.path_function = None;
+        internal_pattern.path_variable = Some(internal_path_variable.clone());
+        let internal_pattern = materialize_named_path_pattern(&internal_pattern);
+
+        let mode = PathSearchMode::from_path_function(func);
+        let mut runtime_cache = GraphMatchRuntimeCache::default();
+        let mut output = Vec::new();
+
+        for binding in input_bindings {
+            context.check_deadline()?;
+            let matched = self.match_pattern(
+                context,
+                &internal_pattern,
+                vec![binding],
+                &[],
+                None,
+                &mut runtime_cache,
+            )?;
+            let matched = bind_named_path_variable(&internal_pattern, matched);
+            let min_hops = matched
+                .iter()
+                .filter_map(|binding| Self::bound_path_hop_count(binding, &internal_path_variable))
+                .min();
+            let Some(min_hops) = min_hops else {
+                continue;
+            };
+
+            let mut kept = matched
+                .into_iter()
+                .filter(|binding| {
+                    Self::bound_path_hop_count(binding, &internal_path_variable) == Some(min_hops)
+                })
+                .collect::<Vec<_>>();
+            if !mode.allows_multiple_shortest_paths() {
+                kept.truncate(1);
+            }
+
+            for mut binding in kept {
+                if let Some(materialized_path) =
+                    Self::materialize_bound_path_value(&binding, &internal_path_variable)
+                {
+                    binding.insert_binding(internal_path_variable.clone(), materialized_path);
+                }
+                ensure_graph_result_row_capacity(context, output.len())?;
+                context.track_memory(estimate_binding_row_bytes(&binding))?;
+                output.push(binding);
+            }
+        }
+
+        Ok(output)
+    }
+
     fn reconstruct_shortest_path_from_predecessors(
         &self,
         predecessors: &HashMap<ValueHashKey, ShortestPathPredecessor>,
@@ -378,9 +514,7 @@ impl Executor {
         input_bindings: Vec<crate::executor::graph_plans::BindingRow>,
     ) -> DbResult<Vec<crate::executor::graph_plans::BindingRow>> {
         if pattern.nodes.len() != 2 || pattern.relationships.len() != 1 {
-            return Err(DbError::feature_not_supported(
-                "shortestPath/allShortestPaths requires exactly two nodes and one relationship",
-            ));
+            return self.match_shortest_path_multi_segment(context, pattern, func, input_bindings);
         }
         let start_node_pat = &pattern.nodes[0];
         let end_node_pat = &pattern.nodes[1];

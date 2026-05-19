@@ -86,6 +86,8 @@ RETURN p;
 
 Named paths render as alternating node and relationship values. `shortestPath` returns one path; `allShortestPaths` returns every shortest variant up to the configured result and memory limits.
 
+`shortestPath` also supports multi-segment typed patterns, including combinations of fixed segments with at most one bounded variable-length segment. `allShortestPaths` remains limited to a single typed relationship segment.
+
 Current limits:
 
 - shortest-path functions require exactly two node patterns and one typed relationship pattern;

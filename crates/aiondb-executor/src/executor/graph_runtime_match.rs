@@ -171,7 +171,7 @@ fn column_ndistinct_by_name(
     column_ndistinct(table_stats, column.column_id)
 }
 
-fn materialize_named_path_pattern(pattern: &CypherPattern) -> CypherPattern {
+pub(super) fn materialize_named_path_pattern(pattern: &CypherPattern) -> CypherPattern {
     let Some(path_variable) = pattern.path_variable.as_deref() else {
         return pattern.clone();
     };
@@ -291,7 +291,7 @@ fn bind_named_multi_segment_variable_length_path(
     })
 }
 
-fn bind_named_path_variable(
+pub(super) fn bind_named_path_variable(
     pattern: &CypherPattern,
     mut bindings: Vec<BindingRow>,
 ) -> Vec<BindingRow> {
