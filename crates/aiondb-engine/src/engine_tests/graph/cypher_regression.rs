@@ -553,6 +553,37 @@ fn undirected_target_filter_limit_returns_matching_endpoint_bindings() {
     assert_eq!(ids, vec![4, 4]);
 }
 
+#[test]
+fn undirected_multi_out_limit_returns_neighbor_pairs() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person)-[:KNOWS]-(b:Person), (a:Person)-[:KNOWS]-(c:Person) RETURN b.id, c.id LIMIT 10",
+    );
+    let mut pairs = rows
+        .into_iter()
+        .map(|row| {
+            let left = match &row.values[0] {
+                Value::Int(id) => *id,
+                Value::BigInt(id) => i32::try_from(*id).unwrap_or(i32::MAX),
+                other => panic!("expected integer id, got {other:?}"),
+            };
+            let right = match &row.values[1] {
+                Value::Int(id) => *id,
+                Value::BigInt(id) => i32::try_from(*id).unwrap_or(i32::MAX),
+                other => panic!("expected integer id, got {other:?}"),
+            };
+            (left, right)
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    assert_eq!(
+        pairs,
+        vec![(1, 1), (1, 3), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3), (3, 3), (4, 1), (4, 4)]
+    );
+}
+
 // ===================================================================
 // RETURN: projection, aliases, arithmetic, DISTINCT
 // ===================================================================

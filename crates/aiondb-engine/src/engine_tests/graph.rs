@@ -4264,6 +4264,70 @@ fn cypher_multi_out_filtered_count_distinct_c_id_is_stable() {
 }
 
 #[test]
+fn cypher_undirected_multi_out_filtered_count_uses_grouped_edge_counts() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_count_fast_both (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_multi_count_fast_both_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_count_fast_both ON people_multi_count_fast_both; \
+             CREATE EDGE LABEL knows_multi_count_fast_both ON knows_multi_count_fast_both_edges SOURCE person_multi_count_fast_both TARGET person_multi_count_fast_both; \
+             INSERT INTO people_multi_count_fast_both VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_multi_count_fast_both_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed undirected multi-out count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_multi_count_fast_both)-[:knows_multi_count_fast_both]-(b:person_multi_count_fast_both), \
+                   (a)-[:knows_multi_count_fast_both]-(c:person_multi_count_fast_both) \
+             WHERE b.number > 20 AND b.id <> c.id RETURN count(*)",
+        ),
+        12,
+    );
+}
+
+#[test]
+fn cypher_undirected_multi_out_filtered_count_distinct_c_id_is_stable() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_multi_count_distinct_both (id INT NOT NULL, number INT NOT NULL); \
+             CREATE TABLE knows_multi_count_distinct_both_edges (source_id INT NOT NULL, target_id INT NOT NULL); \
+             CREATE NODE LABEL person_multi_count_distinct_both ON people_multi_count_distinct_both; \
+             CREATE EDGE LABEL knows_multi_count_distinct_both ON knows_multi_count_distinct_both_edges SOURCE person_multi_count_distinct_both TARGET person_multi_count_distinct_both; \
+             INSERT INTO people_multi_count_distinct_both VALUES \
+                (1, 0), (2, 30), (3, 10), (4, 40), (5, 50); \
+             INSERT INTO knows_multi_count_distinct_both_edges VALUES \
+                (1, 2), (1, 3), (1, 4), \
+                (2, 3), (2, 4), (2, 5)",
+        )
+        .expect("seed undirected multi-out distinct-count graph");
+
+    assert_eq!(
+        query_count(
+            &engine,
+            &session,
+            "MATCH (a:person_multi_count_distinct_both)-[:knows_multi_count_distinct_both]-(b:person_multi_count_distinct_both), \
+                   (a)-[:knows_multi_count_distinct_both]-(c:person_multi_count_distinct_both) \
+             WHERE b.number > 20 AND b.id <> c.id RETURN count(DISTINCT c.id)",
+        ),
+        5,
+    );
+}
+
+#[test]
 fn cypher_global_count_distinct_survives_duplicate_input_bindings() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");

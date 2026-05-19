@@ -7,6 +7,38 @@
 use super::*;
 
 impl Executor {
+    fn undirected_pattern_anchor_and_target<'a>(
+        first: &'a CypherNodePattern,
+        second: &'a CypherNodePattern,
+        shared_var: &str,
+    ) -> Option<(&'a CypherNodePattern, &'a CypherNodePattern)> {
+        match (
+            first.variable.as_deref() == Some(shared_var),
+            second.variable.as_deref() == Some(shared_var),
+        ) {
+            (true, false) => Some((first, second)),
+            (false, true) => Some((second, first)),
+            _ => None,
+        }
+    }
+
+    fn fast_graph_adjacency_neighbors_both_cached(
+        &self,
+        context: &ExecutionContext,
+        edge_table_id: RelationId,
+        node_id: &Value,
+    ) -> DbResult<Vec<Value>> {
+        let mut values =
+            self.fast_graph_adjacency_neighbors_cached(context, edge_table_id, node_id, true)?;
+        values.extend(self.fast_graph_adjacency_neighbors_cached(
+            context,
+            edge_table_id,
+            node_id,
+            false,
+        )?);
+        Ok(values)
+    }
+
     fn append_fast_unanchored_endpoint_rows(
         context: &ExecutionContext,
         rows: &mut Vec<Row>,
@@ -430,27 +462,83 @@ impl Executor {
 
         let first_rel = &first.relationships[0];
         let second_rel = &second.relationships[0];
-        let (first_src, first_tgt) = match first_rel.direction {
-            CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
-            CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
-        };
-        let (second_src, second_tgt) = match second_rel.direction {
-            CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
-            CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
-        };
-        let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
-            first_src.variable.as_deref(),
-            first_tgt.variable.as_deref(),
-            second_src.variable.as_deref(),
-            second_tgt.variable.as_deref(),
-        ) else {
-            return Ok(None);
-        };
-        if !src_var.eq_ignore_ascii_case(second_src_var) {
-            return Ok(None);
-        }
+        let (first_src, first_tgt, second_src, second_tgt, first_tgt_var, second_tgt_var) =
+            match (first_rel.direction, second_rel.direction) {
+                (CypherRelDirection::Outgoing, CypherRelDirection::Outgoing)
+                | (CypherRelDirection::Outgoing, CypherRelDirection::Incoming)
+                | (CypherRelDirection::Incoming, CypherRelDirection::Outgoing)
+                | (CypherRelDirection::Incoming, CypherRelDirection::Incoming) => {
+                    let (first_src, first_tgt) = match first_rel.direction {
+                        CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
+                        CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
+                        CypherRelDirection::Both => unreachable!(),
+                    };
+                    let (second_src, second_tgt) = match second_rel.direction {
+                        CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
+                        CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
+                        CypherRelDirection::Both => unreachable!(),
+                    };
+                    let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
+                        first_src.variable.as_deref(),
+                        first_tgt.variable.as_deref(),
+                        second_src.variable.as_deref(),
+                        second_tgt.variable.as_deref(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    if !src_var.eq_ignore_ascii_case(second_src_var) {
+                        return Ok(None);
+                    }
+                    (
+                        first_src,
+                        first_tgt,
+                        second_src,
+                        second_tgt,
+                        first_tgt_var,
+                        second_tgt_var,
+                    )
+                }
+                (CypherRelDirection::Both, CypherRelDirection::Both) => {
+                    let Some(shared_var) = first
+                        .nodes
+                        .iter()
+                        .filter_map(|node| node.variable.as_deref())
+                        .find(|candidate| {
+                            second
+                                .nodes
+                                .iter()
+                                .any(|node| node.variable.as_deref() == Some(*candidate))
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((first_src, first_tgt)) =
+                        Self::undirected_pattern_anchor_and_target(&first.nodes[0], &first.nodes[1], shared_var)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((second_src, second_tgt)) =
+                        Self::undirected_pattern_anchor_and_target(&second.nodes[0], &second.nodes[1], shared_var)
+                    else {
+                        return Ok(None);
+                    };
+                    let (Some(first_tgt_var), Some(second_tgt_var)) = (
+                        first_tgt.variable.as_deref(),
+                        second_tgt.variable.as_deref(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    (
+                        first_src,
+                        first_tgt,
+                        second_src,
+                        second_tgt,
+                        first_tgt_var,
+                        second_tgt_var,
+                    )
+                }
+                _ => return Ok(None),
+            };
         if first_src.table_id.is_none()
             || first_tgt.table_id.is_none()
             || second_tgt.table_id.is_none()
@@ -561,23 +649,40 @@ impl Executor {
             }
             normalize_int_key(&mut source_id);
             normalize_int_key(&mut target_id);
-            let source_key = build_hash_key(&source_id)?;
             let target_key = build_hash_key(&target_id)?;
-            let entry = match sources.entry(source_key) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    context.track_memory(estimate_value_bytes(&source_id).saturating_add(128))?;
-                    entry.insert(SourceCounts {
-                        outdegree: 0,
-                        target_counts: HashMap::new(),
-                        filtered_target_counts: HashMap::new(),
-                    })
+            let mut update_source =
+                |anchor_id: &Value, neighbor_key: ValueHashKey| -> DbResult<()> {
+                    let anchor_key = build_hash_key(anchor_id)?;
+                    let entry = match sources.entry(anchor_key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            context.track_memory(
+                                estimate_value_bytes(anchor_id).saturating_add(128),
+                            )?;
+                            entry.insert(SourceCounts {
+                                outdegree: 0,
+                                target_counts: HashMap::new(),
+                                filtered_target_counts: HashMap::new(),
+                            })
+                        }
+                    };
+                    entry.outdegree = entry.outdegree.saturating_add(1);
+                    *entry.target_counts.entry(neighbor_key.clone()).or_insert(0) += 1;
+                    if allowed_left_target_ids.contains(&neighbor_key) {
+                        *entry.filtered_target_counts.entry(neighbor_key).or_insert(0) += 1;
+                    }
+                    Ok(())
+                };
+
+            match first_rel.direction {
+                CypherRelDirection::Both => {
+                    let source_key = build_hash_key(&source_id)?;
+                    update_source(&source_id, target_key.clone())?;
+                    update_source(&target_id, source_key)?;
                 }
-            };
-            entry.outdegree = entry.outdegree.saturating_add(1);
-            *entry.target_counts.entry(target_key.clone()).or_insert(0) += 1;
-            if allowed_left_target_ids.contains(&target_key) {
-                *entry.filtered_target_counts.entry(target_key).or_insert(0) += 1;
+                _ => {
+                    update_source(&source_id, target_key)?;
+                }
             }
         }
 
@@ -665,38 +770,83 @@ impl Executor {
         // pattern (e.g. anchoring on a filtered/returned node), turning
         // `(a)-[:k]->(b)` into `(b)<-[:k]-(a)`; both orientations describe the
         // same edge so the same scan/group/cartesian plan applies.
-        let (first_src, first_tgt) = match first_rel.direction {
-            CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
-            CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
-        };
-        let (second_src, second_tgt) = match second_rel.direction {
-            CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
-            CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
-        };
-        let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
-            first_src.variable.as_deref(),
-            first_tgt.variable.as_deref(),
-            second_src.variable.as_deref(),
-            second_tgt.variable.as_deref(),
-        ) else {
-            return Ok(None);
-        };
-        let expected_first_return = format!("{first_tgt_var}.id");
-        let expected_second_return = format!("{second_tgt_var}.id");
-        if src_var != second_src_var
-            || column_ref_name(&plan.returns[0].expr) != Some(expected_first_return.as_str())
-            || column_ref_name(&plan.returns[1].expr) != Some(expected_second_return.as_str())
-        {
-            return Ok(None);
-        }
-        if second_src
-            .table_id
-            .is_some_and(|table_id| Some(table_id) != first_src.table_id)
-        {
-            return Ok(None);
-        }
+        let (first_src, first_tgt, second_src, second_tgt, first_tgt_var, second_tgt_var) =
+            match (first_rel.direction, second_rel.direction) {
+                (CypherRelDirection::Outgoing, CypherRelDirection::Outgoing)
+                | (CypherRelDirection::Outgoing, CypherRelDirection::Incoming)
+                | (CypherRelDirection::Incoming, CypherRelDirection::Outgoing)
+                | (CypherRelDirection::Incoming, CypherRelDirection::Incoming) => {
+                    let (first_src, first_tgt) = match first_rel.direction {
+                        CypherRelDirection::Outgoing => (&first.nodes[0], &first.nodes[1]),
+                        CypherRelDirection::Incoming => (&first.nodes[1], &first.nodes[0]),
+                        CypherRelDirection::Both => unreachable!(),
+                    };
+                    let (second_src, second_tgt) = match second_rel.direction {
+                        CypherRelDirection::Outgoing => (&second.nodes[0], &second.nodes[1]),
+                        CypherRelDirection::Incoming => (&second.nodes[1], &second.nodes[0]),
+                        CypherRelDirection::Both => unreachable!(),
+                    };
+                    let (Some(src_var), Some(first_tgt_var), Some(second_src_var), Some(second_tgt_var)) = (
+                        first_src.variable.as_deref(),
+                        first_tgt.variable.as_deref(),
+                        second_src.variable.as_deref(),
+                        second_tgt.variable.as_deref(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    if src_var != second_src_var {
+                        return Ok(None);
+                    }
+                    (
+                        first_src,
+                        first_tgt,
+                        second_src,
+                        second_tgt,
+                        first_tgt_var,
+                        second_tgt_var,
+                    )
+                }
+                (CypherRelDirection::Both, CypherRelDirection::Both) => {
+                    let Some(shared_var) = first
+                        .nodes
+                        .iter()
+                        .filter_map(|node| node.variable.as_deref())
+                        .find(|candidate| {
+                            second
+                                .nodes
+                                .iter()
+                                .any(|node| node.variable.as_deref() == Some(*candidate))
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((first_src, first_tgt)) =
+                        Self::undirected_pattern_anchor_and_target(&first.nodes[0], &first.nodes[1], shared_var)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((second_src, second_tgt)) =
+                        Self::undirected_pattern_anchor_and_target(&second.nodes[0], &second.nodes[1], shared_var)
+                    else {
+                        return Ok(None);
+                    };
+                    let (Some(first_tgt_var), Some(second_tgt_var)) = (
+                        first_tgt.variable.as_deref(),
+                        second_tgt.variable.as_deref(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    (
+                        first_src,
+                        first_tgt,
+                        second_src,
+                        second_tgt,
+                        first_tgt_var,
+                        second_tgt_var,
+                    )
+                }
+                _ => return Ok(None),
+            };
         if first_src.table_id.is_none()
             || first_tgt.table_id.is_none()
             || second_tgt.table_id.is_none()
@@ -715,6 +865,19 @@ impl Executor {
             || second_rel.max_hops.is_some()
             || !first_rel.properties.is_empty()
             || !second_rel.properties.is_empty()
+        {
+            return Ok(None);
+        }
+        let expected_first_return = format!("{first_tgt_var}.id");
+        let expected_second_return = format!("{second_tgt_var}.id");
+        if column_ref_name(&plan.returns[0].expr) != Some(expected_first_return.as_str())
+            || column_ref_name(&plan.returns[1].expr) != Some(expected_second_return.as_str())
+        {
+            return Ok(None);
+        }
+        if second_src
+            .table_id
+            .is_some_and(|table_id| Some(table_id) != first_src.table_id)
         {
             return Ok(None);
         }
@@ -782,12 +945,17 @@ impl Executor {
             }
             context.track_memory(estimate_value_bytes(&source_id).saturating_add(32))?;
 
-            let neighbor_ids = match self.fast_graph_adjacency_neighbors_cached(
-                context,
-                edge_table_id,
-                &source_id,
-                true,
-            ) {
+            let neighbor_ids = match match first_rel.direction {
+                CypherRelDirection::Both => {
+                    self.fast_graph_adjacency_neighbors_both_cached(context, edge_table_id, &source_id)
+                }
+                _ => self.fast_graph_adjacency_neighbors_cached(
+                    context,
+                    edge_table_id,
+                    &source_id,
+                    true,
+                ),
+            } {
                 Ok(ids) => ids,
                 Err(_) => return Ok(None),
             };
