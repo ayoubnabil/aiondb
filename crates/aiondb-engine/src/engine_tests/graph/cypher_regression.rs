@@ -317,6 +317,87 @@ fn path_binding_returns_nodes_and_relationships() {
     }
 }
 
+#[test]
+fn named_multi_segment_variable_length_path_returns_full_path() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH p = (:Person {id: 1})-[:KNOWS]->(:Person)-[:KNOWS*1..2]->(:Person {id: 5}) \
+         RETURN length(p), nodes(p), relationships(p)",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::BigInt(3));
+    match &rows[0].values[1] {
+        Value::Array(nodes) => assert_eq!(nodes.len(), 4),
+        other => panic!("expected nodes array, got {other:?}"),
+    }
+    match &rows[0].values[2] {
+        Value::Array(rels) => assert_eq!(rels.len(), 3),
+        other => panic!("expected relationships array, got {other:?}"),
+    }
+}
+
+#[test]
+fn undirected_edge_filter_limit_returns_both_endpoint_bindings() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person)-[r:KNOWS]-(b:Person) WHERE r.since > 2021 RETURN b.id LIMIT 10",
+    );
+    let mut ids = rows
+        .into_iter()
+        .map(|row| match row.values.into_iter().next() {
+            Some(Value::Int(id)) => id,
+            Some(Value::BigInt(id)) => i32::try_from(id).unwrap_or(i32::MAX),
+            other => panic!("expected integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec![3, 4, 4, 5]);
+}
+
+#[test]
+fn undirected_edge_inline_eq_filter_returns_both_endpoint_bindings() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person)-[:KNOWS {since: 2022}]-(b:Person) RETURN b.id LIMIT 10",
+    );
+    let mut ids = rows
+        .into_iter()
+        .map(|row| match row.values.into_iter().next() {
+            Some(Value::Int(id)) => id,
+            Some(Value::BigInt(id)) => i32::try_from(id).unwrap_or(i32::MAX),
+            other => panic!("expected integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec![3, 4]);
+}
+
+#[test]
+fn undirected_target_filter_limit_returns_matching_endpoint_bindings() {
+    let (engine, session) = social();
+    let rows = query_rows(
+        &engine,
+        &session,
+        "MATCH (a:Person)-[:KNOWS]-(b:Person) WHERE b.age > 35 RETURN b.id LIMIT 10",
+    );
+    let mut ids = rows
+        .into_iter()
+        .map(|row| match row.values.into_iter().next() {
+            Some(Value::Int(id)) => id,
+            Some(Value::BigInt(id)) => i32::try_from(id).unwrap_or(i32::MAX),
+            other => panic!("expected integer id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec![4, 4]);
+}
+
 // ===================================================================
 // RETURN: projection, aliases, arithmetic, DISTINCT
 // ===================================================================

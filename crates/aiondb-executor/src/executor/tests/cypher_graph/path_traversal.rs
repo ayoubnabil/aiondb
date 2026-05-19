@@ -1082,3 +1082,123 @@ fn cypher_named_shortest_path_self_path_is_single_node() {
         other => panic!("expected query result, got {other:?}"),
     }
 }
+
+#[test]
+fn cypher_named_multi_segment_variable_length_path_renders_full_path() {
+    let (executor, catalog, _) = make_executor();
+    let person_id = create_person_table(&executor, catalog.as_ref());
+    let knows_id = create_knows_table(&executor, catalog.as_ref());
+
+    insert_person(&executor, person_id, 1, "A");
+    insert_person(&executor, person_id, 2, "B");
+    insert_person(&executor, person_id, 3, "C");
+    insert_person(&executor, person_id, 4, "D");
+
+    insert_knows(&executor, knows_id, 1, 2, 10);
+    insert_knows(&executor, knows_id, 2, 3, 20);
+    insert_knows(&executor, knows_id, 3, 4, 30);
+
+    let plan = PhysicalPlan::CypherQuery(Box::new(CypherQueryPlan {
+        pipeline: vec![],
+        matches: vec![CypherMatchClause {
+            optional: false,
+            patterns: vec![CypherPattern {
+                path_function: None,
+                path_variable: Some("p".to_owned()),
+                nodes: vec![
+                    CypherNodePattern {
+                        variable: Some("a".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(1),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("b".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                    CypherNodePattern {
+                        variable: Some("c".to_owned()),
+                        label: Some("Person".to_owned()),
+                        table_id: Some(person_id),
+                        properties: vec![CypherPropertyExpr {
+                            key: "id".to_owned(),
+                            value: lit_int(4),
+                        }],
+                        index_scan: None,
+                        range_pushdown: Vec::new(),
+                    },
+                ],
+                relationships: vec![
+                    CypherRelPattern {
+                        variable: Some("r1".to_owned()),
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: None,
+                        max_hops: None,
+                        index_scan: None,
+                    },
+                    CypherRelPattern {
+                        variable: Some("r2".to_owned()),
+                        rel_type: Some("KNOWS".to_owned()),
+                        rel_type_alternatives: Vec::new(),
+                        table_id: Some(knows_id),
+                        direction: CypherRelDirection::Outgoing,
+                        properties: vec![],
+                        min_hops: Some(1),
+                        max_hops: Some(2),
+                        index_scan: None,
+                    },
+                ],
+            }],
+            filter: None,
+        }],
+        creates: vec![],
+        merges: vec![],
+        sets: vec![],
+        deletes: vec![],
+        returns: vec![ProjectionExpr {
+            expr: TypedExpr::column_ref("p", 0, DataType::Text, true),
+            field: ResultField {
+                name: "p".to_owned(),
+                data_type: DataType::Text,
+                text_type_modifier: None,
+                nullable: true,
+            },
+        }],
+        order_by: vec![],
+        skip: None,
+        limit: None,
+        distinct: false,
+        union: None,
+    }));
+
+    let result = executor
+        .execute(&plan, &default_context())
+        .expect("execute named multi-segment variable-length path");
+
+    match result {
+        ExecutionResult::Query { rows, columns } => {
+            assert_eq!(columns.len(), 1);
+            assert_eq!(rows.len(), 1);
+            let Value::Text(path) = &rows[0].values[0] else {
+                panic!("expected path text, got {:?}", rows[0].values[0]);
+            };
+            assert_eq!(path.matches("(:Person").count(), 4, "path: {path}");
+            assert_eq!(path.matches("[:KNOWS").count(), 3, "path: {path}");
+            assert_eq!(path.matches("->").count(), 3, "path: {path}");
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}

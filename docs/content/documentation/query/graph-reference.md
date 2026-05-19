@@ -90,7 +90,7 @@ Current limits:
 
 - shortest-path functions require exactly two node patterns and one typed relationship pattern;
 - path search should be bounded with an explicit maximum hop count for serious workloads;
-- named multi-segment variable-length paths are not supported yet;
+- named paths can span fixed segments plus one bounded variable-length segment; patterns with more than one variable-length relationship are still not supported;
 - deep traversals are subject to query deadline, result-row, workset, and memory limits.
 
 ## Graph algorithm procedures

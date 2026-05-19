@@ -493,6 +493,103 @@ fn explain_match_reports_fast_unanchored_edge_eq_filter_limit_runtime() {
 }
 
 #[test]
+fn explain_match_reports_fast_unanchored_edge_filter_limit_runtime_for_both() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_edge_filter_both (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_edge_filter_both (source_id INT NOT NULL, target_id INT NOT NULL, weight INT); \
+             INSERT INTO people_explain_fast_edge_filter_both VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_edge_filter_both VALUES (1, 2, 10); \
+             CREATE NODE LABEL person_explain_fast_edge_filter_both ON people_explain_fast_edge_filter_both; \
+             CREATE EDGE LABEL knows_explain_fast_edge_filter_both ON knows_explain_fast_edge_filter_both SOURCE person_explain_fast_edge_filter_both TARGET person_explain_fast_edge_filter_both",
+        )
+        .expect("setup explain fast edge-filter both tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_edge_filter_both)-[r:knows_explain_fast_edge_filter_both]-(b:person_explain_fast_edge_filter_both) WHERE r.weight > 5 RETURN b.id LIMIT 10",
+        )
+        .expect("execute explain fast edge-filter both match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_edge_filter_limit")
+                && line.contains("reason=unanchored_edge_weight_gt_limit")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+#[test]
+fn explain_match_reports_fast_unanchored_edge_eq_filter_limit_runtime_for_both() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE people_explain_fast_edge_eq_both (id INT NOT NULL, name TEXT); \
+             CREATE TABLE knows_explain_fast_edge_eq_both (source_id INT NOT NULL, target_id INT NOT NULL, weight INT); \
+             INSERT INTO people_explain_fast_edge_eq_both VALUES (1, 'Alice'), (2, 'Bob'); \
+             INSERT INTO knows_explain_fast_edge_eq_both VALUES (1, 2, 10); \
+             CREATE NODE LABEL person_explain_fast_edge_eq_both ON people_explain_fast_edge_eq_both; \
+             CREATE EDGE LABEL knows_explain_fast_edge_eq_both ON knows_explain_fast_edge_eq_both SOURCE person_explain_fast_edge_eq_both TARGET person_explain_fast_edge_eq_both",
+        )
+        .expect("setup explain fast edge-eq both tables");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "EXPLAIN MATCH (a:person_explain_fast_edge_eq_both)-[:knows_explain_fast_edge_eq_both {weight: 10}]-(b:person_explain_fast_edge_eq_both) RETURN b.id LIMIT 10",
+        )
+        .expect("execute explain fast edge-eq both match");
+    let [StatementResult::Query { rows, .. }] = results.as_slice() else {
+        panic!("expected explain query result");
+    };
+
+    let lines: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            let [aiondb_core::Value::Text(line)] = row.values.as_slice() else {
+                panic!("expected explain text row");
+            };
+            line.as_str()
+        })
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("Graph Query Runtime:")
+                && line.contains("strategy=fast_unanchored_edge_eq_filter_limit")
+                && line.contains("reason=unanchored_edge_weight_eq_limit")
+                && line.contains("source=inferred")
+        }),
+        "explain lines: {lines:?}"
+    );
+}
+
+
+#[test]
 fn explain_match_reports_fast_unanchored_one_hop_limit_runtime() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");

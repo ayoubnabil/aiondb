@@ -120,6 +120,11 @@ impl Executor {
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_unanchored_target_filter_limit(plan, context)? {
+            record_graph_query_runtime_marker(
+                context,
+                "fast_unanchored_target_filter_limit",
+                "unanchored_target_number_gt_limit",
+            )?;
             return Ok(result);
         }
         if let Some(result) = self.try_execute_fast_unanchored_edge_filter_limit(plan, context)? {

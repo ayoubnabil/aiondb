@@ -7,6 +7,28 @@
 use super::*;
 
 impl Executor {
+    fn append_fast_unanchored_endpoint_rows(
+        context: &ExecutionContext,
+        rows: &mut Vec<Row>,
+        result_bytes: &mut u64,
+        limit: usize,
+        endpoint_ids: &[Value],
+    ) -> DbResult<bool> {
+        for endpoint_id in endpoint_ids {
+            if endpoint_id.is_null() {
+                continue;
+            }
+            let row = Row::new(vec![endpoint_id.clone()]);
+            *result_bytes =
+                ensure_result_bytes_fit_and_track_query_row(context, &row, *result_bytes)?;
+            rows.push(row);
+            if rows.len() >= limit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(in crate::executor) fn try_execute_fast_unanchored_edge_filter_limit(
         &self,
         plan: &CypherQueryPlan,
@@ -74,7 +96,6 @@ impl Executor {
             || !start.properties.is_empty()
             || !end.properties.is_empty()
             || rel.table_id.is_none()
-            || rel.direction != CypherRelDirection::Outgoing
             || rel.min_hops.is_some()
             || rel.max_hops.is_some()
             || !rel.properties.is_empty()
@@ -90,7 +111,7 @@ impl Executor {
         let Some(edge_table_id) = rel.table_id else {
             return Ok(None);
         };
-        let ((_, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+        let ((src_col_idx, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
             context,
             edge_table_id,
             rel.rel_type.as_deref(),
@@ -107,7 +128,7 @@ impl Executor {
         let Some(projected_columns) = self.table_column_ids_for_ordinals(
             context,
             edge_table_id,
-            &[tgt_col_idx, weight_col_idx],
+            &[src_col_idx, tgt_col_idx, weight_col_idx],
         )?
         else {
             return Ok(None);
@@ -161,9 +182,10 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let target_id = record.row.values.first().unwrap_or(&Value::Null);
-            let weight = record.row.values.get(1).unwrap_or(&Value::Null);
-            if target_id.is_null() || weight.is_null() {
+            let source_id = record.row.values.first().unwrap_or(&Value::Null);
+            let target_id = record.row.values.get(1).unwrap_or(&Value::Null);
+            let weight = record.row.values.get(2).unwrap_or(&Value::Null);
+            if weight.is_null() {
                 continue;
             }
             let Some(ordering) = compare_runtime_values(weight, &filter_value)? else {
@@ -172,11 +194,18 @@ impl Executor {
             if ordering != Ordering::Greater {
                 continue;
             }
-            let row = Row::new(vec![target_id.clone()]);
-            result_bytes =
-                ensure_result_bytes_fit_and_track_query_row(context, &row, result_bytes)?;
-            rows.push(row);
-            if rows.len() >= limit {
+            let endpoint_ids: [Value; 2] = match rel.direction {
+                CypherRelDirection::Outgoing => [target_id.clone(), Value::Null],
+                CypherRelDirection::Incoming => [source_id.clone(), Value::Null],
+                CypherRelDirection::Both => [source_id.clone(), target_id.clone()],
+            };
+            if Self::append_fast_unanchored_endpoint_rows(
+                context,
+                &mut rows,
+                &mut result_bytes,
+                limit,
+                &endpoint_ids,
+            )? {
                 break;
             }
         }
@@ -265,7 +294,7 @@ impl Executor {
         let (phys_src, phys_tgt) = match rel.direction {
             CypherRelDirection::Outgoing => (&pattern.nodes[0], &pattern.nodes[1]),
             CypherRelDirection::Incoming => (&pattern.nodes[1], &pattern.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
+            CypherRelDirection::Both => (&pattern.nodes[0], &pattern.nodes[1]),
         };
         if rel.table_id.is_none()
             || rel.min_hops.is_some()
@@ -295,7 +324,7 @@ impl Executor {
         let Some(edge_table_id) = rel.table_id else {
             return Ok(None);
         };
-        let ((_, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+        let ((src_col_idx, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
             context,
             edge_table_id,
             rel.rel_type.as_deref(),
@@ -312,7 +341,7 @@ impl Executor {
         let Some(projected_columns) = self.table_column_ids_for_ordinals(
             context,
             edge_table_id,
-            &[tgt_col_idx, prop_col_idx],
+            &[src_col_idx, tgt_col_idx, prop_col_idx],
         )?
         else {
             return Ok(None);
@@ -328,22 +357,27 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let target_id = record.row.values.first().unwrap_or(&Value::Null);
-            let prop_value = record.row.values.get(1).unwrap_or(&Value::Null);
-            if target_id.is_null() {
-                continue;
-            }
+            let source_id = record.row.values.first().unwrap_or(&Value::Null);
+            let target_id = record.row.values.get(1).unwrap_or(&Value::Null);
+            let prop_value = record.row.values.get(2).unwrap_or(&Value::Null);
             let Some(ordering) = compare_runtime_values(prop_value, &filter_value)? else {
                 continue;
             };
             if ordering != Ordering::Equal {
                 continue;
             }
-            let row = Row::new(vec![target_id.clone()]);
-            result_bytes =
-                ensure_result_bytes_fit_and_track_query_row(context, &row, result_bytes)?;
-            rows.push(row);
-            if rows.len() >= limit {
+            let endpoint_ids: [Value; 2] = match rel.direction {
+                CypherRelDirection::Outgoing => [target_id.clone(), Value::Null],
+                CypherRelDirection::Incoming => [source_id.clone(), Value::Null],
+                CypherRelDirection::Both => [source_id.clone(), target_id.clone()],
+            };
+            if Self::append_fast_unanchored_endpoint_rows(
+                context,
+                &mut rows,
+                &mut result_bytes,
+                limit,
+                &endpoint_ids,
+            )? {
                 break;
             }
         }
@@ -1636,22 +1670,40 @@ impl Executor {
         }
 
         let rel = &pattern.relationships[0];
-        let (source, target) = match rel.direction {
-            CypherRelDirection::Outgoing => (&pattern.nodes[0], &pattern.nodes[1]),
-            CypherRelDirection::Incoming => (&pattern.nodes[1], &pattern.nodes[0]),
-            CypherRelDirection::Both => return Ok(None),
-        };
-        let Some(target_variable) = target.variable.as_deref() else {
+        let left = &pattern.nodes[0];
+        let right = &pattern.nodes[1];
+        let Some(left_variable) = left.variable.as_deref() else {
             return Ok(None);
         };
-        let expected_return = format!("{target_variable}.id");
-        if column_ref_name(&plan.returns[0].expr) != Some(expected_return.as_str()) {
+        let Some(right_variable) = right.variable.as_deref() else {
             return Ok(None);
-        }
-        if source.table_id.is_none()
-            || target.table_id.is_none()
-            || !source.properties.is_empty()
-            || !target.properties.is_empty()
+        };
+        let return_name = column_ref_name(&plan.returns[0].expr);
+        let return_variable = if return_name == Some(format!("{left_variable}.id").as_str()) {
+            Some(left_variable)
+        } else if return_name == Some(format!("{right_variable}.id").as_str()) {
+            Some(right_variable)
+        } else {
+            None
+        };
+        let filter_variable = match_clause.filter.as_ref().and_then(|filter| {
+            if exact_named_column_literal_gt(filter, &format!("{left_variable}.number")).is_some() {
+                Some(left_variable)
+            } else if exact_named_column_literal_gt(filter, &format!("{right_variable}.number"))
+                .is_some()
+            {
+                Some(right_variable)
+            } else {
+                None
+            }
+        });
+        let Some(target_variable) = return_variable.filter(|var| Some(*var) == filter_variable) else {
+            return Ok(None);
+        };
+        if left.table_id.is_none()
+            || right.table_id.is_none()
+            || !left.properties.is_empty()
+            || !right.properties.is_empty()
             || rel.table_id.is_none()
             || rel.variable.is_some()
             || rel.min_hops.is_some()
@@ -1669,10 +1721,15 @@ impl Executor {
         let Some(edge_table_id) = rel.table_id else {
             return Ok(None);
         };
-        let Some(target_table_id) = target.table_id else {
+        let target_table_id = if target_variable == left_variable {
+            left.table_id
+        } else {
+            right.table_id
+        };
+        let Some(target_table_id) = target_table_id else {
             return Ok(None);
         };
-        let ((_, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
+        let ((src_col_idx, tgt_col_idx), _) = self.resolve_edge_endpoint_columns_for_rel(
             context,
             edge_table_id,
             rel.rel_type.as_deref(),
@@ -1688,7 +1745,7 @@ impl Executor {
             return Ok(None);
         };
         let Some(projected_columns) =
-            self.table_column_ids_for_ordinals(context, edge_table_id, &[tgt_col_idx])?
+            self.table_column_ids_for_ordinals(context, edge_table_id, &[src_col_idx, tgt_col_idx])?
         else {
             return Ok(None);
         };
@@ -1702,25 +1759,49 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let Some(target_id) = record.row.values.first() else {
+            let Some(source_id) = record.row.values.first() else {
                 continue;
             };
-            if target_id.is_null() {
-                continue;
-            }
-            let mut normalized_target_id = target_id.clone();
-            normalize_int_key(&mut normalized_target_id);
-            let Ok(target_key) = build_hash_key(&normalized_target_id) else {
-                continue;
+            let target_id = record.row.values.get(1).unwrap_or(&Value::Null);
+            let endpoint_ids: [Value; 2] = match rel.direction {
+                CypherRelDirection::Outgoing => {
+                    if target_variable == left_variable {
+                        [source_id.clone(), Value::Null]
+                    } else {
+                        [target_id.clone(), Value::Null]
+                    }
+                }
+                CypherRelDirection::Incoming => {
+                    if target_variable == left_variable {
+                        [target_id.clone(), Value::Null]
+                    } else {
+                        [source_id.clone(), Value::Null]
+                    }
+                }
+                CypherRelDirection::Both => [source_id.clone(), target_id.clone()],
             };
-            if !allowed_target_ids.contains(&target_key) {
-                continue;
+            let mut matching_ids = Vec::with_capacity(2);
+            for endpoint_id in endpoint_ids {
+                if endpoint_id.is_null() {
+                    continue;
+                }
+                let mut normalized_endpoint_id = endpoint_id;
+                normalize_int_key(&mut normalized_endpoint_id);
+                let Ok(target_key) = build_hash_key(&normalized_endpoint_id) else {
+                    continue;
+                };
+                if !allowed_target_ids.contains(&target_key) {
+                    continue;
+                }
+                matching_ids.push(normalized_endpoint_id);
             }
-            let row = Row::new(vec![normalized_target_id]);
-            result_bytes =
-                ensure_result_bytes_fit_and_track_query_row(context, &row, result_bytes)?;
-            rows.push(row);
-            if rows.len() >= limit {
+            if Self::append_fast_unanchored_endpoint_rows(
+                context,
+                &mut rows,
+                &mut result_bytes,
+                limit,
+                &matching_ids,
+            )? {
                 break;
             }
         }

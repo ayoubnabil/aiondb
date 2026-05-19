@@ -28,7 +28,8 @@ use crate::executor::graph_plans::{
     graph_access_pattern_runtime_reason_key,
     graph_access_pattern_runtime_strategy_key,
     graph_access_clause_profile_time_key, graph_access_pattern_profile_time_key,
-    graph_access_profile_key, graph_filter_node_id_inequality_peers, pick_match_pivot_index,
+    graph_access_profile_key, graph_bound_edge_literal, graph_bound_node_literal,
+    graph_filter_node_id_inequality_peers, pick_match_pivot_index,
     retain_graph_binding_variables, BindingRow, BoundValue, GraphBindingReduction,
     GraphFilterConjunct, GraphMatchRuntimeCache, SharedStrings, SharedText,
 };
@@ -206,16 +207,88 @@ fn validate_named_path_pattern(pattern: &CypherPattern) -> DbResult<()> {
     if pattern.path_function.is_some() {
         return Ok(());
     }
-    let has_variable_length = pattern
+    let variable_length_relationships = pattern
         .relationships
         .iter()
-        .any(|rel| rel.min_hops.is_some() || rel.max_hops.is_some());
-    if has_variable_length && (pattern.relationships.len() != 1 || pattern.nodes.len() != 2) {
+        .filter(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+        .count();
+    if variable_length_relationships > 1 {
         return Err(DbError::feature_not_supported(
-            "named multi-segment variable-length path bindings are not supported yet",
+            "named paths with more than one variable-length relationship are not supported yet",
         ));
     }
     Ok(())
+}
+
+fn bind_named_multi_segment_variable_length_path(
+    pattern: &CypherPattern,
+    binding: &BindingRow,
+    path_variable: &str,
+) -> Option<BoundValue> {
+    let BoundValue::PathValues {
+        nodes: variable_nodes,
+        relationships: variable_relationships,
+        directions: variable_directions,
+    } = binding.get(path_variable)?
+    else {
+        return None;
+    };
+
+    let variable_length_relationships = pattern
+        .relationships
+        .iter()
+        .filter(|rel| rel.min_hops.is_some() || rel.max_hops.is_some())
+        .count();
+    if variable_length_relationships != 1
+        || (pattern.relationships.len() == 1 && pattern.nodes.len() == 2)
+    {
+        return None;
+    }
+
+    let first_node_var = pattern.nodes.first()?.variable.as_deref()?;
+    let mut node_literals = vec![
+        graph_bound_node_literal(binding, first_node_var).unwrap_or_else(|| "()".to_owned()),
+    ];
+    let mut relationship_literals = Vec::new();
+    let mut directions = Vec::new();
+    let mut consumed_variable_segment = false;
+
+    for (idx, rel) in pattern.relationships.iter().enumerate() {
+        let is_variable_length = rel.min_hops.is_some() || rel.max_hops.is_some();
+        if is_variable_length {
+            if consumed_variable_segment {
+                return None;
+            }
+            relationship_literals.extend(variable_relationships.iter().cloned());
+            directions.extend(variable_directions.iter().copied());
+            node_literals.extend(variable_nodes.iter().skip(1).cloned());
+            consumed_variable_segment = true;
+            continue;
+        }
+
+        let rel_var = rel.variable.as_deref()?;
+        relationship_literals.push(
+            graph_bound_edge_literal(binding, rel_var)
+                .unwrap_or_else(|| "[]".to_owned()),
+        );
+        directions.push(rel.direction);
+
+        let next_node_var = pattern.nodes.get(idx + 1)?.variable.as_deref()?;
+        node_literals.push(
+            graph_bound_node_literal(binding, next_node_var)
+                .unwrap_or_else(|| "()".to_owned()),
+        );
+    }
+
+    if !consumed_variable_segment {
+        return None;
+    }
+
+    Some(BoundValue::PathValues {
+        nodes: Arc::new(node_literals),
+        relationships: Arc::new(relationship_literals),
+        directions: Arc::new(directions),
+    })
 }
 
 fn bind_named_path_variable(
@@ -248,6 +321,11 @@ fn bind_named_path_variable(
     );
     for binding in &mut bindings {
         if binding.get(path_variable).is_some() {
+            if let Some(path_value) =
+                bind_named_multi_segment_variable_length_path(pattern, binding, path_variable)
+            {
+                binding.insert_binding(path_variable.clone(), path_value);
+            }
             continue;
         }
         binding.insert_binding(

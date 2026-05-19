@@ -303,6 +303,20 @@ pub(super) fn format_cypher_bound_node_literal(
     }
 }
 
+pub(in crate::executor) fn graph_bound_node_literal(
+    binding: &BindingRow,
+    variable: &str,
+) -> Option<String> {
+    format_cypher_bound_node_literal(binding, variable)
+}
+
+pub(in crate::executor) fn graph_bound_edge_literal(
+    binding: &BindingRow,
+    variable: &str,
+) -> Option<String> {
+    format_cypher_bound_edge_literal(binding, variable)
+}
+
 pub(in crate::executor) fn compact_graph_binding_node_payloads(binding: &mut BindingRow) {
     for (_, value) in &mut binding.entries {
         let compacted = match value.as_ref() {

@@ -780,11 +780,20 @@ fn explain_query_runtime_strategy(query: &CypherQueryPlan) -> (&'static str, &'s
     };
     let return_name = query.returns.first().and_then(|projection| column_ref_name(&projection.expr));
     let expected_right = format!("{right_variable}.id");
+    let (target_node, target_variable) = match rel.direction {
+        CypherRelDirection::Outgoing => (right, right_variable),
+        CypherRelDirection::Incoming => (left, left_variable),
+        CypherRelDirection::Both => (right, right_variable),
+    };
+    let expected_target = format!("{target_variable}.id");
 
     if left.table_id.is_some()
         && right.table_id.is_some()
         && rel.table_id.is_some()
-        && rel.direction == CypherRelDirection::Outgoing
+        && matches!(
+            rel.direction,
+            CypherRelDirection::Outgoing | CypherRelDirection::Both
+        )
         && rel.variable.is_none()
         && rel.min_hops.is_none()
         && rel.max_hops.is_none()
@@ -833,7 +842,10 @@ fn explain_query_runtime_strategy(query: &CypherQueryPlan) -> (&'static str, &'s
         && rel.table_id.is_some()
         && left.properties.is_empty()
         && right.properties.is_empty()
-        && rel.direction == CypherRelDirection::Outgoing
+        && matches!(
+            rel.direction,
+            CypherRelDirection::Outgoing | CypherRelDirection::Both
+        )
         && rel.min_hops.is_none()
         && rel.max_hops.is_none()
         && rel.properties.is_empty()
@@ -864,7 +876,10 @@ fn explain_query_runtime_strategy(query: &CypherQueryPlan) -> (&'static str, &'s
         && rel.table_id.is_some()
         && left.properties.is_empty()
         && right.properties.is_empty()
-        && rel.direction == CypherRelDirection::Outgoing
+        && matches!(
+            rel.direction,
+            CypherRelDirection::Outgoing | CypherRelDirection::Both
+        )
         && rel.min_hops.is_none()
         && rel.max_hops.is_none()
         && return_name == Some(expected_right.as_str())
@@ -875,6 +890,33 @@ fn explain_query_runtime_strategy(query: &CypherQueryPlan) -> (&'static str, &'s
         return (
             "fast_unanchored_edge_eq_filter_limit",
             "unanchored_edge_weight_eq_limit",
+        );
+    }
+
+    if query.order_by.is_empty()
+        && query
+            .limit
+            .as_ref()
+            .and_then(literal_i64)
+            .is_some_and(|value| value > 0)
+        && left.table_id.is_some()
+        && right.table_id.is_some()
+        && rel.table_id.is_some()
+        && left.properties.is_empty()
+        && right.properties.is_empty()
+        && rel.variable.is_none()
+        && rel.min_hops.is_none()
+        && rel.max_hops.is_none()
+        && rel.properties.is_empty()
+        && return_name == Some(expected_target.as_str())
+        && match_clause.filter.as_ref().and_then(|filter| {
+            exact_named_column_literal_gt(filter, &format!("{target_variable}.number"))
+        }).is_some()
+        && !node_has_filter_constraints(target_node)
+    {
+        return (
+            "fast_unanchored_target_filter_limit",
+            "unanchored_target_number_gt_limit",
         );
     }
 

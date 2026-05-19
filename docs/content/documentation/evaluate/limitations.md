@@ -54,7 +54,7 @@ Deep traversals, variable-length paths, filtered vector search, and mixed graph/
 Current graph boundaries:
 
 - `shortestPath` and `allShortestPaths` are supported for one typed relationship pattern between two node patterns.
-- Named paths are supported for ordinary paths, `shortestPath`, and `allShortestPaths`, but named multi-segment variable-length paths are not supported yet.
+- Named paths are supported for ordinary paths, `shortestPath`, `allShortestPaths`, and patterns that combine fixed segments with one bounded variable-length relationship. Patterns with more than one variable-length relationship are still not supported.
 - `CALL graph.*` exposes a broad algorithm registry, but procedure compatibility should be pinned by name, arguments, yielded columns, and expected rows.
 - Graph procedures use projection cache data where possible and rebuild from adjacency data when needed; this is not a substitute for published operational runbooks.
 - Neo4j-class claims require reproducible benchmark artifacts. Do not generalize from one graph shape to all graph workloads.
