@@ -117,6 +117,23 @@ impl ProductQuantizer {
     /// `samples.len().max(1)` so a well-formed codebook always exists.
     #[must_use = "a trained quantizer should be retained for subsequent encoding"]
     pub fn train(samples: &[Vec<f32>], m: usize, k: usize) -> DbResult<Self> {
+        // Build a single Vec<&[f32]> of borrowed slices and feed the
+        // borrowing path. The shim allocates one Vec but no per-sample
+        // clone, so callers that already hold `&[Vec<f32>]` pay only the
+        // cost of an outer pointer table.
+        let slice_view: Vec<&[f32]> = samples.iter().map(Vec::as_slice).collect();
+        Self::train_from_slices(&slice_view, m, k)
+    }
+
+    /// Train from borrowed slices. Lets callers feed pre-existing
+    /// vectors (e.g. `&[(TupleId, Vec<f32>)]`) without materialising a
+    /// fresh `Vec<Vec<f32>>` first.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`train`].
+    #[must_use = "a trained quantizer should be retained for subsequent encoding"]
+    pub fn train_from_slices(samples: &[&[f32]], m: usize, k: usize) -> DbResult<Self> {
         if samples.is_empty() {
             return Err(DbError::internal(
                 "PQ: training requires at least one sample",
@@ -161,10 +178,6 @@ impl ProductQuantizer {
                 Ok(())
             })?;
         let effective_k = k.min(samples.len().max(1));
-        // Per-subspace codebooks are independent: train them in parallel.
-        // Determinism preserved — kmeans_subspace is a pure function of its
-        // inputs and is seeded from `sub` + `n`, so each worker reproduces
-        // the same codebook regardless of scheduling.
         let centroids: Vec<Vec<Vec<f32>>> = (0..m)
             .into_par_iter()
             .map(|sub| {
@@ -393,7 +406,7 @@ impl Lcg {
 }
 
 fn kmeans_subspace(
-    samples: &[Vec<f32>],
+    samples: &[&[f32]],
     sub: usize,
     sub_start: usize,
     sub_dims: usize,

@@ -879,8 +879,16 @@ impl HnswIndex {
                 let dims = first.len();
                 let m = default_pq_subspaces(dims);
                 let k = DEFAULT_PQ_CENTROIDS;
+                // The subsample helper still owns the chosen vectors -
+                // it has to, because it can pick from a sparse subset
+                // when the corpus exceeds `MAX_BULK_PQ_TRAINING_SAMPLES`.
+                // Pass them as borrowed slices into the k-means train
+                // path so the per-subspace loop never sees a Vec<Vec<>>.
                 let samples = collect_pq_training_samples(entries);
-                self.product_quantizer = Some(ProductQuantizer::train(&samples, m, k)?);
+                let sample_slices: Vec<&[f32]> =
+                    samples.iter().map(Vec::as_slice).collect();
+                self.product_quantizer =
+                    Some(ProductQuantizer::train_from_slices(&sample_slices, m, k)?);
             }
             _ => {}
         }
