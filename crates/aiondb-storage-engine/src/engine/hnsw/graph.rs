@@ -1088,7 +1088,20 @@ impl HnswIndex {
             return Ok(());
         }
 
-        let chunk_size = n_threads.max(1);
+        // Hoist immutable per-build state out of the per-chunk loop so we
+        // don't pay the quantizer clone (which can hold an `m * k *
+        // sub_dims` codebook for PQ) on every chunk. Bigger chunks
+        // amortize the rayon dispatch overhead and let each worker reuse
+        // its decode scratch across more vectors.
+        let chunk_size = n_threads.saturating_mul(8).max(32);
+        let distance_fn = self.distance_fn;
+        let gpu_metric = stored_to_gpu_metric(self.metric);
+        let element_type = self.element_type;
+        let binary_quant = self.binary_quantizer.clone();
+        let scalar_quant = self.scalar_quantizer.clone();
+        let product_quant = self.product_quantizer.clone();
+        let quantization = self.quantization;
+        let params_template = self.params.clone();
         for chunk in entries[warmup..].chunks(chunk_size) {
             // Layers are seeded from `nodes.len()` to keep the random stream
             // deterministic and aligned with sequential ordering.
@@ -1100,14 +1113,10 @@ impl HnswIndex {
             let snapshot_nodes: &HashMap<TupleId, HnswNode> = &self.nodes;
             let snapshot_ep = self.entry_point;
             let snapshot_max_layer = self.max_layer;
-            let params = self.params.clone();
-            let distance_fn = self.distance_fn;
-            let gpu_metric = stored_to_gpu_metric(self.metric);
-            let element_type = self.element_type;
-            let binary_quant = self.binary_quantizer.clone();
-            let scalar_quant = self.scalar_quantizer.clone();
-            let product_quant = self.product_quantizer.clone();
-            let quantization = self.quantization;
+            let params = params_template.clone();
+            let binary_quant = binary_quant.clone();
+            let scalar_quant = scalar_quant.clone();
+            let product_quant = product_quant.clone();
             let gpu = self.batch_distance.as_deref();
 
             let prepared: Vec<DbResult<NodeBuild>> = chunk
