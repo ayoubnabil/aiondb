@@ -421,6 +421,51 @@ pub struct HnswIndexStats {
     pub pq_centroids_per_subspace: u32,
 }
 
+impl std::fmt::Display for HnswSearchStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HNSW search: visited={}, distances={}, duration_us={}, quantization={}, \
+             ef={}, oversample={}x, rescored={}{}",
+            self.nodes_visited,
+            self.distance_computations,
+            self.duration_micros,
+            self.quantization.as_str(),
+            self.effective_ef_search,
+            self.oversample_factor.max(1),
+            self.rescored_candidates,
+            if self.truncated { " (truncated)" } else { "" },
+        )
+    }
+}
+
+impl std::fmt::Display for HnswIndexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HNSW index: vectors={}, quantization={}, codebook_ready={}, \
+             searches={}, avg_latency_us={}, memory_bytes={}",
+            self.total_vectors,
+            self.quantization.as_str(),
+            self.codebook_ready,
+            self.total_searches,
+            self.avg_search_latency_micros,
+            self.memory_usage_bytes,
+        )?;
+        if matches!(self.quantization, StoredQuantizationKind::Product) {
+            write!(
+                f,
+                ", pq=m{}xk{}",
+                self.pq_subspaces, self.pq_centroids_per_subspace
+            )?;
+        }
+        if let Some(budget) = self.memory_budget_bytes {
+            write!(f, ", budget_bytes={budget}")?;
+        }
+        Ok(())
+    }
+}
+
 /// HNSW index parameters.
 #[derive(Clone, Debug)]
 pub(crate) struct HnswParams {

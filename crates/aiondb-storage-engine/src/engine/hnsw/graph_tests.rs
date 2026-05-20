@@ -1484,6 +1484,55 @@ fn search_stats_report_no_rescore_for_raw_index() {
 }
 
 #[test]
+fn search_stats_display_renders_human_readable_summary() {
+    let table_desc = make_table_desc();
+    let mut index = HnswIndex::new(make_index_desc(), 4, 20);
+    for i in 1..=4u32 {
+        let row = make_row(i as i32, vec![i as f32, 0.0, 0.0]);
+        index
+            .insert_tuple(&table_desc, TupleId::new(u64::from(i)), &row)
+            .unwrap();
+    }
+    let (_ids, stats) = index.search(&[1.0, 0.0, 0.0], 2, 8);
+    let rendered = stats.to_string();
+    assert!(rendered.contains("HNSW search"));
+    assert!(rendered.contains("quantization=none"));
+    assert!(rendered.contains("oversample=1x"));
+}
+
+#[test]
+fn index_stats_display_renders_pq_shape_when_product_quantized() {
+    use aiondb_storage_api::{HnswStorageOptions, StoredVectorMetric};
+    let dims = 32usize;
+    let table_desc = make_table_desc_with_dims(dims as u32);
+    let mut index_desc = make_index_desc();
+    index_desc.hnsw_options = Some(HnswStorageOptions {
+        m: 8,
+        ef_construction: 32,
+        distance_metric: StoredVectorMetric::L2,
+        quantization: aiondb_storage_api::StoredQuantizationKind::Product,
+        prenormalised: false,
+    });
+    let dataset = (0..32usize)
+        .map(|idx| deterministic_vector(idx as u64 + 1, dims))
+        .collect::<Vec<_>>();
+    let rows = dataset
+        .iter()
+        .enumerate()
+        .map(|(idx, vector)| {
+            (
+                TupleId::new(idx as u64 + 1),
+                make_row(idx as i32 + 1, vector.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let index = HnswIndex::from_rows_with_options(&index_desc, &table_desc, rows).unwrap();
+    let rendered = index.index_stats().to_string();
+    assert!(rendered.contains("quantization=pq"));
+    assert!(rendered.contains("pq=m"));
+}
+
+#[test]
 fn search_stats_report_oversample_factor_for_quantized_index() {
     use aiondb_storage_api::{HnswStorageOptions, StoredVectorMetric};
     let dims = 32usize;
