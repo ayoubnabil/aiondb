@@ -319,6 +319,8 @@ mod tests {
             vector,
             compact_vector: None,
             binary_code: None,
+            scalar_code: None,
+            product_code: None,
             neighbors: vec![BTreeSet::new(); layer_count],
         }
     }

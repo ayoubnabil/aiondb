@@ -1243,3 +1243,103 @@ fn l2_metric_accepts_zero_magnitude_vectors() {
         )
         .unwrap();
 }
+
+/// Build an HNSW index from a synthetic dataset under the given quantization
+/// mode and return the average recall@k against the exact brute-force top-k.
+fn build_and_measure_recall_for_quantization(
+    quantization: aiondb_storage_api::StoredQuantizationKind,
+    k: usize,
+    ef: usize,
+) -> f64 {
+    use aiondb_storage_api::{HnswStorageOptions, StoredVectorMetric};
+    let dims = 64usize;
+    let dataset_size = 4_000usize;
+    let query_count = 100usize;
+    let m = 12u32;
+    let ef_construction = 64u32;
+
+    let table_desc = make_table_desc_with_dims(dims as u32);
+    let mut index_desc = make_index_desc();
+    index_desc.hnsw_options = Some(HnswStorageOptions {
+        m,
+        ef_construction,
+        distance_metric: StoredVectorMetric::L2,
+        quantization,
+        prenormalised: false,
+    });
+
+    let dataset = (0..dataset_size)
+        .map(|idx| deterministic_vector(idx as u64 + 1, dims))
+        .collect::<Vec<_>>();
+    let rows = dataset
+        .iter()
+        .enumerate()
+        .map(|(idx, vector)| {
+            (
+                TupleId::new(idx as u64 + 1),
+                make_row(idx as i32 + 1, vector.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let index = HnswIndex::from_rows_with_options(&index_desc, &table_desc, rows).unwrap();
+
+    let mut total_hits = 0usize;
+    for query_idx in 0..query_count {
+        let query = &dataset[(query_idx * 47) % dataset_size];
+        let expected = brute_force_top_k(&dataset, query, k);
+        let (actual, _stats) = index.search(query, k, ef);
+        let actual_set = actual
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        total_hits += expected
+            .into_iter()
+            .filter(|tuple_id| actual_set.contains(tuple_id))
+            .count();
+    }
+
+    total_hits as f64 / (query_count * k) as f64
+}
+
+#[test]
+fn recall_at_k_with_scalar_quantization_meets_threshold() {
+    let recall = build_and_measure_recall_for_quantization(
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+        10,
+        128,
+    );
+    assert!(
+        recall >= 0.90,
+        "scalar-quantized HNSW recall@10 dropped to {recall:.3}"
+    );
+}
+
+#[test]
+fn recall_at_k_with_product_quantization_meets_threshold() {
+    let recall = build_and_measure_recall_for_quantization(
+        aiondb_storage_api::StoredQuantizationKind::Product,
+        10,
+        128,
+    );
+    assert!(
+        recall >= 0.70,
+        "product-quantized HNSW recall@10 dropped to {recall:.3}"
+    );
+}
+
+#[test]
+fn recall_at_k_with_binary_quantization_meets_threshold() {
+    // Binary quantization drops the raw vector, so the in-index rescore
+    // path cannot run. Recall is therefore intrinsically lower than SQ/PQ;
+    // this baseline locks in the current behavior and will be revisited
+    // once heap-fetched rescoring is wired through the executor.
+    let recall = build_and_measure_recall_for_quantization(
+        aiondb_storage_api::StoredQuantizationKind::Binary,
+        10,
+        128,
+    );
+    assert!(
+        recall >= 0.20,
+        "binary-quantized HNSW recall@10 dropped below regression floor: {recall:.3}"
+    );
+}

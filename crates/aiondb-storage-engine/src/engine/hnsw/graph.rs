@@ -21,7 +21,10 @@ use aiondb_storage_api::{
     IndexStorageDescriptor, StoredQuantizationKind, StoredVectorMetric, TableStorageDescriptor,
 };
 use aiondb_vector::distance::{distance_fn_raw, VectorDistance};
-use aiondb_vector::{BinaryCode, BinaryQuantizer, VectorQuantizer};
+use aiondb_vector::{
+    BinaryCode, BinaryQuantizer, ProductCode, ProductQuantizer, ScalarCode, ScalarQuantizer,
+    VectorQuantizer,
+};
 
 use super::super::helpers::u64_to_f64;
 use super::search;
@@ -57,6 +60,14 @@ pub(crate) enum DistanceContext<'a> {
         query_code: BinaryCode,
         quantizer: BinaryQuantizer,
     },
+    Scalar {
+        query_code: ScalarCode,
+        quantizer: ScalarQuantizer,
+    },
+    Product {
+        query_code: ProductCode,
+        quantizer: ProductQuantizer,
+    },
 }
 
 impl DistanceContext<'_> {
@@ -91,6 +102,20 @@ impl DistanceContext<'_> {
                 quantizer,
             } => node
                 .binary_code
+                .as_ref()
+                .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
+            Self::Scalar {
+                query_code,
+                quantizer,
+            } => node
+                .scalar_code
+                .as_ref()
+                .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
+            Self::Product {
+                query_code,
+                quantizer,
+            } => node
+                .product_code
                 .as_ref()
                 .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
         }
@@ -192,6 +217,16 @@ fn prefetch_node_for_distance(node: &HnswNode) {
     if let Some(binary) = &node.binary_code {
         if !binary.bits.is_empty() {
             prefetch_read_t0(binary.bits.as_ptr().cast::<u8>());
+        }
+    }
+    if let Some(code) = &node.scalar_code {
+        if !code.codes.is_empty() {
+            prefetch_read_t0(code.codes.as_ptr().cast::<u8>());
+        }
+    }
+    if let Some(code) = &node.product_code {
+        if !code.codes.is_empty() {
+            prefetch_read_t0(code.codes.as_ptr());
         }
     }
 }
@@ -375,6 +410,27 @@ pub(crate) struct HnswParams {
 }
 
 const HNSW_MAX_M: usize = 128;
+/// Centroids per PQ subspace at training time. Matches FAISS `nbits=8` so
+/// each subspace code fits in a single byte.
+const DEFAULT_PQ_CENTROIDS: usize = 256;
+
+/// Pick the default number of PQ subspaces for a vector of `dims`
+/// dimensions. Prefers small per-subspace dimensionality (4-8) which gives
+/// the best accuracy / compression trade-off in practice.
+fn default_pq_subspaces(dims: usize) -> usize {
+    if dims < 2 {
+        return 1;
+    }
+    for sub_dims in [8usize, 4, 2] {
+        if dims.is_multiple_of(sub_dims) {
+            let m = dims / sub_dims;
+            if m >= 2 {
+                return m;
+            }
+        }
+    }
+    1
+}
 const HNSW_MAX_EF_CONSTRUCTION: usize = search::HNSW_MAX_EF_SEARCH;
 // Mirror pgvector's hard cap. Larger dimensions multiply the per-node link
 // array memory cost and let an adversarial DDL author drive OOM with very few
@@ -416,6 +472,8 @@ pub(crate) struct HnswNode {
     /// `vector` is empty and distance computation decodes on-the-fly.
     pub(crate) compact_vector: Option<Vec<u8>>,
     pub(crate) binary_code: Option<aiondb_vector::BinaryCode>,
+    pub(crate) scalar_code: Option<ScalarCode>,
+    pub(crate) product_code: Option<ProductCode>,
     /// Connections at each layer. neighbors[layer] = set of connected tuple IDs.
     pub(crate) neighbors: Vec<BTreeSet<TupleId>>,
 }
@@ -444,6 +502,8 @@ pub(crate) struct HnswIndex {
     /// `quantization == Binary`. Once set, all subsequent inserts store
     /// binary codes instead of raw f32 vectors.
     binary_quantizer: Option<BinaryQuantizer>,
+    scalar_quantizer: Option<ScalarQuantizer>,
+    product_quantizer: Option<ProductQuantizer>,
     /// Element type for stored vectors (Float32, Float16, Uint8).
     element_type: aiondb_core::VectorElementType,
     /// Optional memory budget in bytes. Insertions that would exceed this
@@ -472,6 +532,8 @@ impl Clone for HnswIndex {
             distance_fn: self.distance_fn,
             quantization: self.quantization,
             binary_quantizer: self.binary_quantizer.clone(),
+            scalar_quantizer: self.scalar_quantizer.clone(),
+            product_quantizer: self.product_quantizer.clone(),
             batch_distance: self.batch_distance.clone(),
             element_type: self.element_type,
             max_memory_bytes: self.max_memory_bytes,
@@ -504,6 +566,11 @@ impl std::fmt::Debug for HnswIndex {
             .field("metric", &self.metric)
             .field("quantization", &self.quantization)
             .field("binary_quantizer_active", &self.binary_quantizer.is_some())
+            .field("scalar_quantizer_active", &self.scalar_quantizer.is_some())
+            .field(
+                "product_quantizer_active",
+                &self.product_quantizer.is_some(),
+            )
             .field("max_memory_bytes", &self.max_memory_bytes)
             .field(
                 "stat_total_searches",
@@ -565,18 +632,6 @@ impl HnswIndex {
         metric: StoredVectorMetric,
         quantization: StoredQuantizationKind,
     ) -> Self {
-        if matches!(
-            quantization,
-            StoredQuantizationKind::Scalar | StoredQuantizationKind::Product
-        ) {
-            tracing::warn!(
-                index_id = descriptor.index_id.get(),
-                quantization = quantization.as_str(),
-                "HNSW {} quantization declared but storage compression is not yet wired for \
-                 this codec; falling back to raw f32 storage (metric dispatch still honored)",
-                quantization.as_str()
-            );
-        }
         let prenormalised = descriptor
             .hnsw_options
             .as_ref()
@@ -593,6 +648,8 @@ impl HnswIndex {
             distance_fn,
             quantization,
             binary_quantizer: None,
+            scalar_quantizer: None,
+            product_quantizer: None,
             batch_distance: None,
             element_type: aiondb_core::VectorElementType::Float32,
             max_memory_bytes: None,
@@ -701,6 +758,86 @@ impl HnswIndex {
         Ok(index)
     }
 
+    /// Eagerly train any data-dependent quantizer from extracted samples.
+    fn train_quantizer_from_entries(&mut self, entries: &[(TupleId, Vec<f32>)]) -> DbResult<()> {
+        let Some((_, first)) = entries.first() else {
+            return Ok(());
+        };
+        match self.quantization {
+            StoredQuantizationKind::Binary if self.binary_quantizer.is_none() => {
+                self.binary_quantizer = Some(BinaryQuantizer::new_checked(first.len())?);
+            }
+            StoredQuantizationKind::Scalar if self.scalar_quantizer.is_none() => {
+                let samples: Vec<Vec<f32>> =
+                    entries.iter().map(|(_, vec)| vec.clone()).collect();
+                self.scalar_quantizer = Some(ScalarQuantizer::train(&samples)?);
+            }
+            StoredQuantizationKind::Product if self.product_quantizer.is_none() => {
+                let dims = first.len();
+                let m = default_pq_subspaces(dims);
+                let k = DEFAULT_PQ_CENTROIDS;
+                let samples: Vec<Vec<f32>> =
+                    entries.iter().map(|(_, vec)| vec.clone()).collect();
+                self.product_quantizer = Some(ProductQuantizer::train(&samples, m, k)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Encode per-mode quantization codes for one vector. Codes are produced
+    /// only when the matching quantizer has already been trained.
+    fn encode_codes_for_vector(
+        &self,
+        vector: &[f32],
+    ) -> DbResult<(Option<BinaryCode>, Option<ScalarCode>, Option<ProductCode>)> {
+        let binary = if matches!(self.quantization, StoredQuantizationKind::Binary) {
+            let quantizer = self
+                .binary_quantizer
+                .as_ref()
+                .ok_or_else(|| DbError::internal("HNSW binary quantizer missing during encode"))?;
+            Some(quantizer.encode(vector)?)
+        } else {
+            None
+        };
+        let scalar = if matches!(self.quantization, StoredQuantizationKind::Scalar) {
+            if let Some(quantizer) = self.scalar_quantizer.as_ref() {
+                Some(quantizer.encode(vector)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let product = if matches!(self.quantization, StoredQuantizationKind::Product) {
+            if let Some(quantizer) = self.product_quantizer.as_ref() {
+                Some(quantizer.encode(vector)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok((binary, scalar, product))
+    }
+
+    /// Decide how to physically store the raw vector inside an [`HnswNode`].
+    fn storage_for_raw_vector(
+        &self,
+        vector: &[f32],
+        binary_present: bool,
+    ) -> (Vec<f32>, Option<Vec<u8>>) {
+        if binary_present || matches!(self.quantization, StoredQuantizationKind::Binary) {
+            return (Vec::new(), None);
+        }
+        if self.element_type != aiondb_core::VectorElementType::Float32 {
+            let compact_data =
+                aiondb_core::vector_storage::encode_vector(vector, self.element_type);
+            return (Vec::new(), Some(compact_data));
+        }
+        (vector.to_vec(), None)
+    }
+
     /// Parallel chunked builder used by [`from_rows_with_options`].
     fn parallel_build(&mut self, collected: Vec<(TupleId, Row)>) -> DbResult<()> {
         let ordinal = self
@@ -744,16 +881,10 @@ impl HnswIndex {
             })
             .collect::<DbResult<Vec<_>>>()?;
 
-        // Phase 1b: eager binary quantizer "training" (sizing). Avoids the
-        // lazy-on-first-insert mode that forced the rest of the build to wait
-        // for the binary code dimensions.
-        if matches!(self.quantization, StoredQuantizationKind::Binary)
-            && self.binary_quantizer.is_none()
-        {
-            if let Some((_, first)) = entries.first() {
-                self.binary_quantizer = Some(BinaryQuantizer::new_checked(first.len())?);
-            }
-        }
+        // Phase 1b: train every data-dependent quantizer (BQ dim, SQ ranges,
+        // PQ codebooks) eagerly so the rest of the build can encode codes
+        // directly.
+        self.train_quantizer_from_entries(&entries)?;
 
         // Aggregate memory budget check (cheap, sequential).
         for (_, v) in &entries {
@@ -789,6 +920,8 @@ impl HnswIndex {
             let gpu_metric = stored_to_gpu_metric(self.metric);
             let element_type = self.element_type;
             let binary_quant = self.binary_quantizer.clone();
+            let scalar_quant = self.scalar_quantizer.clone();
+            let product_quant = self.product_quantizer.clone();
             let quantization = self.quantization;
             let gpu = self.batch_distance.as_deref();
 
@@ -799,6 +932,8 @@ impl HnswIndex {
                     let probe = build_probe_standalone(
                         quantization,
                         binary_quant.as_ref(),
+                        scalar_quant.as_ref(),
+                        product_quant.as_ref(),
                         distance_fn,
                         gpu_metric,
                         element_type,
@@ -858,31 +993,15 @@ impl HnswIndex {
 
     /// Sequential insert of an already-extracted vector (used by warm-up).
     fn insert_extracted_sequential(&mut self, tuple_id: TupleId, vector: &[f32]) -> DbResult<()> {
-        let is_binary_mode = matches!(self.quantization, StoredQuantizationKind::Binary);
-        let binary_code = if is_binary_mode {
-            let quantizer = self
-                .binary_quantizer
-                .as_ref()
-                .ok_or_else(|| DbError::internal("HNSW binary quantizer missing during build"))?;
-            Some(quantizer.encode(vector)?)
-        } else {
-            None
-        };
-
+        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(vector)?;
         let layer = self.random_layer();
-        let (stored_vector, compact) = if is_binary_mode {
-            (Vec::new(), None)
-        } else if self.element_type != aiondb_core::VectorElementType::Float32 {
-            let compact_data =
-                aiondb_core::vector_storage::encode_vector(vector, self.element_type);
-            (Vec::new(), Some(compact_data))
-        } else {
-            (vector.to_vec(), None)
-        };
+        let (stored_vector, compact) = self.storage_for_raw_vector(vector, binary_code.is_some());
         let node = HnswNode {
             vector: stored_vector,
             compact_vector: compact,
             binary_code,
+            scalar_code,
+            product_code,
             neighbors: vec![BTreeSet::new(); layer + 1],
         };
         self.nodes.insert(tuple_id, node);
@@ -961,29 +1080,15 @@ impl HnswIndex {
             layer,
             per_layer,
         } = built;
-        let is_binary_mode = matches!(self.quantization, StoredQuantizationKind::Binary);
-        let binary_code = if is_binary_mode {
-            let quantizer = self.binary_quantizer.as_ref().ok_or_else(|| {
-                DbError::internal("HNSW binary quantizer missing during parallel commit")
-            })?;
-            Some(quantizer.encode(&vector)?)
-        } else {
-            None
-        };
-
-        let (stored_vector, compact) = if is_binary_mode {
-            (Vec::new(), None)
-        } else if self.element_type != aiondb_core::VectorElementType::Float32 {
-            let compact_data =
-                aiondb_core::vector_storage::encode_vector(&vector, self.element_type);
-            (Vec::new(), Some(compact_data))
-        } else {
-            (vector, None)
-        };
+        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(&vector)?;
+        let (stored_vector, compact) =
+            self.storage_for_raw_vector(&vector, binary_code.is_some());
         let node = HnswNode {
             vector: stored_vector,
             compact_vector: compact,
             binary_code,
+            scalar_code,
+            product_code,
             neighbors: vec![BTreeSet::new(); layer + 1],
         };
         self.nodes.insert(tid, node);
@@ -1055,39 +1160,25 @@ impl HnswIndex {
             .is_some_and(|o| o.prenormalised);
         ensure_prenormalised_invariant(self.metric, prenormalised, &vector)?;
 
-        // In Binary quantization mode, materialize the codec on first insert
-        // (its dimensionality is fixed by the first vector). Subsequent
-        // inserts reuse it. Raw f32 storage is used for all other modes.
-        let is_binary_mode = matches!(self.quantization, StoredQuantizationKind::Binary);
-        let binary_code = if is_binary_mode {
-            if self.binary_quantizer.is_none() {
-                self.binary_quantizer = Some(BinaryQuantizer::new_checked(vector.len())?);
-            }
-            let quantizer = self.binary_quantizer.as_ref().ok_or_else(|| {
-                DbError::internal("HNSW binary quantizer missing after initialization")
-            })?;
-            Some(quantizer.encode(&vector)?)
-        } else {
-            None
-        };
+        // Lazily materialize codecs that only need dimensionality (BQ). SQ/PQ
+        // codebooks are trained during the initial build / REINDEX; live
+        // inserts before training fall back to raw f32 storage and start
+        // producing codes once the codebook exists.
+        if matches!(self.quantization, StoredQuantizationKind::Binary)
+            && self.binary_quantizer.is_none()
+        {
+            self.binary_quantizer = Some(BinaryQuantizer::new_checked(vector.len())?);
+        }
+        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(&vector)?;
 
         let layer = self.random_layer();
-
-        // Create the node. In binary mode we drop the raw vector to save
-        // memory. For float16/uint8 we store compact bytes instead of f32.
-        let (stored_vector, compact) = if is_binary_mode {
-            (Vec::new(), None)
-        } else if self.element_type != aiondb_core::VectorElementType::Float32 {
-            let compact_data =
-                aiondb_core::vector_storage::encode_vector(&vector, self.element_type);
-            (Vec::new(), Some(compact_data))
-        } else {
-            (vector.clone(), None)
-        };
+        let (stored_vector, compact) = self.storage_for_raw_vector(&vector, binary_code.is_some());
         let node = HnswNode {
             vector: stored_vector,
             compact_vector: compact,
             binary_code,
+            scalar_code,
+            product_code,
             neighbors: vec![BTreeSet::new(); layer + 1],
         };
         self.nodes.insert(tuple_id, node);
@@ -1472,8 +1563,15 @@ impl HnswIndex {
             current_ep = self.greedy_closest(current_ep, &probe, lc);
         }
 
-        // Phase 2: Search layer 0 with ef candidates.
-        let ef_search = ef.max(k);
+        // Phase 2: search layer 0 with ef candidates. For SQ/PQ we widen the
+        // candidate set (`approx_k = k * oversample`) so the rescore step has
+        // enough latitude to recover recall lost to the approximate distance
+        // kernel.
+        let (oversample_factor, can_rescore) = self.rescore_plan();
+        let approx_k = k
+            .saturating_mul(oversample_factor)
+            .min(search::HNSW_MAX_EF_SEARCH);
+        let ef_search = ef.max(approx_k).max(k);
         let mut distance_computations = 0u64;
         let gpu = self.batch_distance.as_deref();
         let result = search::search_layer_interruptible_gpu(
@@ -1491,19 +1589,71 @@ impl HnswIndex {
 
         stats.nodes_visited = usize_to_u64_saturating(result.candidates.len());
         stats.distance_computations = distance_computations;
-        stats.duration_micros = u128_to_u64_saturating(start.elapsed().as_micros());
         stats.truncated = result.truncated;
 
+        let ids = if can_rescore {
+            self.rescore_candidates(query, &result.candidates, k)
+        } else {
+            result
+                .candidates
+                .iter()
+                .take(k)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+
+        stats.duration_micros = u128_to_u64_saturating(start.elapsed().as_micros());
         self.accumulate_search_stats(&stats);
 
-        // Return the k closest.
-        let ids = result
-            .candidates
-            .into_iter()
-            .take(k)
-            .map(|(id, _)| id)
-            .collect();
         Ok((ids, stats))
+    }
+
+    /// Decide how aggressively to oversample candidates for the rescoring
+    /// pass. Quantization modes that keep the raw vector around (Scalar /
+    /// Product) can recover recall by recomputing exact f32 distances on a
+    /// widened shortlist; modes that drop the raw vector (Binary) or do not
+    /// quantize at all skip the extra work.
+    fn rescore_plan(&self) -> (usize, bool) {
+        match self.quantization {
+            StoredQuantizationKind::Scalar => (3, true),
+            StoredQuantizationKind::Product => (5, true),
+            StoredQuantizationKind::Binary | StoredQuantizationKind::None => (1, false),
+        }
+    }
+
+    /// Recompute exact distances for an approximate shortlist and return the
+    /// top-`k` tuple IDs sorted by the exact metric.
+    fn rescore_candidates(
+        &self,
+        query: &[f32],
+        candidates: &[(TupleId, f32)],
+        k: usize,
+    ) -> Vec<TupleId> {
+        let exact_distance = self.distance_fn;
+        let mut rescored: Vec<(TupleId, f32)> = Vec::with_capacity(candidates.len());
+        let mut decoded = Vec::new();
+        for (tid, _approx) in candidates {
+            let Some(node) = self.nodes.get(tid) else {
+                continue;
+            };
+            let exact = if !node.vector.is_empty() {
+                exact_distance(&node.vector, query)
+            } else if let Some(compact) = &node.compact_vector {
+                aiondb_core::vector_storage::decode_vector_into(
+                    compact,
+                    self.element_type,
+                    &mut decoded,
+                );
+                exact_distance(&decoded, query)
+            } else {
+                continue;
+            };
+            rescored.push((*tid, exact));
+        }
+        rescored.sort_unstable_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rescored.into_iter().take(k).map(|(id, _)| id).collect()
     }
 
     /// Accumulate per-search stats into index-level summary counters.
@@ -1661,25 +1811,52 @@ impl HnswIndex {
     /// which matters during construction (we mutate `self.nodes` while the
     /// probe is alive).
     fn build_probe_for_query<'a>(&self, query: &'a [f32]) -> DbResult<DistanceContext<'a>> {
-        if matches!(self.quantization, StoredQuantizationKind::Binary) {
-            let Some(quantizer) = self.binary_quantizer.as_ref() else {
-                return Err(DbError::internal(
-                    "HNSW binary-quantized search on empty index",
-                ));
-            };
-            let query_code = quantizer.encode(query)?;
-            Ok(DistanceContext::Binary {
-                query_code,
-                quantizer: quantizer.clone(),
-            })
-        } else {
-            Ok(DistanceContext::Raw {
-                query: Cow::Borrowed(query),
-                distance_fn: self.distance_fn,
-                gpu_metric: stored_to_gpu_metric(self.metric),
-                element_type: self.element_type,
-                decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
-            })
+        match self.quantization {
+            StoredQuantizationKind::Binary => {
+                let Some(quantizer) = self.binary_quantizer.as_ref() else {
+                    return Err(DbError::internal(
+                        "HNSW binary-quantized search on empty index",
+                    ));
+                };
+                let query_code = quantizer.encode(query)?;
+                Ok(DistanceContext::Binary {
+                    query_code,
+                    quantizer: quantizer.clone(),
+                })
+            }
+            StoredQuantizationKind::Scalar => {
+                if let Some(quantizer) = self.scalar_quantizer.as_ref() {
+                    let query_code = quantizer.encode(query)?;
+                    Ok(DistanceContext::Scalar {
+                        query_code,
+                        quantizer: quantizer.clone(),
+                    })
+                } else {
+                    Ok(self.build_raw_probe(query))
+                }
+            }
+            StoredQuantizationKind::Product => {
+                if let Some(quantizer) = self.product_quantizer.as_ref() {
+                    let query_code = quantizer.encode(query)?;
+                    Ok(DistanceContext::Product {
+                        query_code,
+                        quantizer: quantizer.clone(),
+                    })
+                } else {
+                    Ok(self.build_raw_probe(query))
+                }
+            }
+            StoredQuantizationKind::None => Ok(self.build_raw_probe(query)),
+        }
+    }
+
+    fn build_raw_probe<'a>(&self, query: &'a [f32]) -> DistanceContext<'a> {
+        DistanceContext::Raw {
+            query: Cow::Borrowed(query),
+            distance_fn: self.distance_fn,
+            gpu_metric: stored_to_gpu_metric(self.metric),
+            element_type: self.element_type,
+            decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
         }
     }
 
@@ -1687,30 +1864,57 @@ impl HnswIndex {
     /// intra-graph distance (e.g. neighbor pruning). Returns a probe that
     /// borrows from `node`, so the caller must keep `node` alive.
     fn build_probe_for_stored_node<'a>(&self, node: &'a HnswNode) -> Option<DistanceContext<'a>> {
-        if matches!(self.quantization, StoredQuantizationKind::Binary) {
-            let quantizer = self.binary_quantizer.as_ref()?;
-            let query_code = node.binary_code.as_ref()?.clone();
-            Some(DistanceContext::Binary {
-                query_code,
-                quantizer: quantizer.clone(),
-            })
+        match self.quantization {
+            StoredQuantizationKind::Binary => {
+                let quantizer = self.binary_quantizer.as_ref()?;
+                let query_code = node.binary_code.as_ref()?.clone();
+                Some(DistanceContext::Binary {
+                    query_code,
+                    quantizer: quantizer.clone(),
+                })
+            }
+            StoredQuantizationKind::Scalar => {
+                if let (Some(quantizer), Some(code)) =
+                    (self.scalar_quantizer.as_ref(), node.scalar_code.as_ref())
+                {
+                    return Some(DistanceContext::Scalar {
+                        query_code: code.clone(),
+                        quantizer: quantizer.clone(),
+                    });
+                }
+                Some(self.build_raw_probe_for_node(node))
+            }
+            StoredQuantizationKind::Product => {
+                if let (Some(quantizer), Some(code)) =
+                    (self.product_quantizer.as_ref(), node.product_code.as_ref())
+                {
+                    return Some(DistanceContext::Product {
+                        query_code: code.clone(),
+                        quantizer: quantizer.clone(),
+                    });
+                }
+                Some(self.build_raw_probe_for_node(node))
+            }
+            StoredQuantizationKind::None => Some(self.build_raw_probe_for_node(node)),
+        }
+    }
+
+    fn build_raw_probe_for_node<'a>(&self, node: &'a HnswNode) -> DistanceContext<'a> {
+        let query = if let Some(compact) = &node.compact_vector {
+            Cow::Owned(aiondb_core::vector_storage::decode_vector(
+                compact,
+                self.element_type,
+            ))
         } else {
-            let query = if let Some(compact) = &node.compact_vector {
-                Cow::Owned(aiondb_core::vector_storage::decode_vector(
-                    compact,
-                    self.element_type,
-                ))
-            } else {
-                Cow::Borrowed(node.vector.as_slice())
-            };
-            let query_len = query.len();
-            Some(DistanceContext::Raw {
-                query,
-                distance_fn: self.distance_fn,
-                gpu_metric: stored_to_gpu_metric(self.metric),
-                element_type: self.element_type,
-                decode_scratch: RefCell::new(Vec::with_capacity(query_len)),
-            })
+            Cow::Borrowed(node.vector.as_slice())
+        };
+        let query_len = query.len();
+        DistanceContext::Raw {
+            query,
+            distance_fn: self.distance_fn,
+            gpu_metric: stored_to_gpu_metric(self.metric),
+            element_type: self.element_type,
+            decode_scratch: RefCell::new(Vec::with_capacity(query_len)),
         }
     }
 
@@ -1825,28 +2029,54 @@ fn greedy_closest_in(
 fn build_probe_standalone<'a>(
     quantization: StoredQuantizationKind,
     binary_quant: Option<&BinaryQuantizer>,
+    scalar_quant: Option<&ScalarQuantizer>,
+    product_quant: Option<&ProductQuantizer>,
     distance_fn: DistanceFn,
     gpu_metric: aiondb_gpu::DistanceMetric,
     element_type: aiondb_core::VectorElementType,
     query: &'a [f32],
 ) -> DbResult<DistanceContext<'a>> {
-    if matches!(quantization, StoredQuantizationKind::Binary) {
-        let quantizer = binary_quant.ok_or_else(|| {
-            DbError::internal("HNSW binary quantizer not initialized for parallel build")
-        })?;
-        let query_code = quantizer.encode(query)?;
-        Ok(DistanceContext::Binary {
-            query_code,
-            quantizer: quantizer.clone(),
-        })
-    } else {
-        Ok(DistanceContext::Raw {
-            query: Cow::Borrowed(query),
-            distance_fn,
-            gpu_metric,
-            element_type,
-            decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
-        })
+    let raw_fallback = || DistanceContext::Raw {
+        query: Cow::Borrowed(query),
+        distance_fn,
+        gpu_metric,
+        element_type,
+        decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
+    };
+    match quantization {
+        StoredQuantizationKind::Binary => {
+            let quantizer = binary_quant.ok_or_else(|| {
+                DbError::internal("HNSW binary quantizer not initialized for parallel build")
+            })?;
+            let query_code = quantizer.encode(query)?;
+            Ok(DistanceContext::Binary {
+                query_code,
+                quantizer: quantizer.clone(),
+            })
+        }
+        StoredQuantizationKind::Scalar => {
+            if let Some(quantizer) = scalar_quant {
+                let query_code = quantizer.encode(query)?;
+                Ok(DistanceContext::Scalar {
+                    query_code,
+                    quantizer: quantizer.clone(),
+                })
+            } else {
+                Ok(raw_fallback())
+            }
+        }
+        StoredQuantizationKind::Product => {
+            if let Some(quantizer) = product_quant {
+                let query_code = quantizer.encode(query)?;
+                Ok(DistanceContext::Product {
+                    query_code,
+                    quantizer: quantizer.clone(),
+                })
+            } else {
+                Ok(raw_fallback())
+            }
+        }
+        StoredQuantizationKind::None => Ok(raw_fallback()),
     }
 }
 
