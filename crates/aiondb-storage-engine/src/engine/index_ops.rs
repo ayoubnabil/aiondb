@@ -1869,6 +1869,49 @@ impl InMemoryStorage {
         Ok(())
     }
 
+    /// Rebuild a single HNSW vector index from the table's currently visible
+    /// rows. Used by `Storage::reindex_vector_index` (REINDEX VECTOR) so
+    /// users can retrain SQ / PQ codebooks against the current data
+    /// distribution without dropping and recreating the index.
+    pub(super) fn rebuild_hnsw_index_for_id(
+        &self,
+        state: &mut StorageState,
+        index_id: IndexId,
+    ) -> DbResult<()> {
+        let descriptor = state
+            .hnsw_indexes
+            .get(&index_id)
+            .map(|index| index.descriptor.clone())
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "REINDEX VECTOR: no HNSW index registered with id {}",
+                    index_id.get()
+                ))
+            })?;
+        let table_id = descriptor.table_id;
+
+        let (table_descriptor, visible_rows) = {
+            let table = state
+                .tables
+                .get(&table_id)
+                .ok_or_else(|| DbError::internal("table storage does not exist"))?;
+            let table_descriptor = table.descriptor.clone();
+            let tuple_ids: Vec<TupleId> = table.tuple_ids().collect();
+            let mut rows = Vec::with_capacity(tuple_ids.len());
+            for tuple_id in tuple_ids {
+                if let Some(row) = self.load_base_latest_row(state, table, table_id, tuple_id)? {
+                    rows.push((tuple_id, row));
+                }
+            }
+            (table_descriptor, rows)
+        };
+
+        let rebuilt =
+            HnswIndex::from_rows_with_options(&descriptor, &table_descriptor, visible_rows)?;
+        state.hnsw_indexes.insert(index_id, rebuilt);
+        Ok(())
+    }
+
     /// Rebuild committed GIN indexes for a table from currently visible latest
     /// rows.
     ///

@@ -400,6 +400,13 @@ pub struct HnswIndexStats {
     pub memory_usage_bytes: u64,
     /// Configured memory budget (if any).
     pub memory_budget_bytes: Option<u64>,
+    /// Declared quantization mode for this index.
+    pub quantization: StoredQuantizationKind,
+    /// Whether a codebook has been trained and is currently active. For raw
+    /// `None` indexes this is always `true`; for SQ / PQ / BQ this flips to
+    /// `true` once the codec has been initialized (from a build, a REINDEX,
+    /// or lazy on-insert training).
+    pub codebook_ready: bool,
 }
 
 /// HNSW index parameters.
@@ -1825,6 +1832,12 @@ impl HnswIndex {
         let total_searches = self.stat_total_searches.load(Ordering::Relaxed);
         let total_duration = self.stat_total_duration_micros.load(Ordering::Relaxed);
         let avg_latency = total_duration.checked_div(total_searches).unwrap_or(0);
+        let codebook_ready = match self.quantization {
+            StoredQuantizationKind::None => true,
+            StoredQuantizationKind::Binary => self.binary_quantizer.is_some(),
+            StoredQuantizationKind::Scalar => self.scalar_quantizer.is_some(),
+            StoredQuantizationKind::Product => self.product_quantizer.is_some(),
+        };
         HnswIndexStats {
             total_vectors: usize_to_u64_saturating(self.nodes.len()),
             total_inserts: self.stat_total_inserts.load(Ordering::Relaxed),
@@ -1833,6 +1846,8 @@ impl HnswIndex {
             avg_search_latency_micros: avg_latency,
             memory_usage_bytes: self.memory_usage_bytes(),
             memory_budget_bytes: self.max_memory_bytes,
+            quantization: self.quantization,
+            codebook_ready,
         }
     }
 

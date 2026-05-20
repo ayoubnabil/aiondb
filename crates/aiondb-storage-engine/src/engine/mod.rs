@@ -3048,6 +3048,21 @@ impl InMemoryStorage {
         &self.row_locks
     }
 
+    /// Rebuild an HNSW vector index from the table's currently visible rows.
+    ///
+    /// This is the storage-API equivalent of `REINDEX INDEX <name>` for
+    /// vector indexes. Useful for retraining SQ / PQ codebooks against the
+    /// current data distribution after large bulk loads or updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no HNSW index is registered for `index_id`, if
+    /// the underlying table has been dropped, or if the rebuild fails.
+    pub fn reindex_vector_index(&self, index_id: IndexId) -> DbResult<()> {
+        let mut state = self.write_state()?;
+        self.rebuild_hnsw_index_for_id(&mut state, index_id)
+    }
+
     /// Return cumulative search statistics for an HNSW vector index, or
     /// `None` when no such index is registered. Intended for dashboard /
     /// observability code that wants per-index recall and latency numbers

@@ -3117,3 +3117,103 @@ fn insert_jsonb_payload_row(
         )
         .expect("insert jsonb payload row")
 }
+
+fn create_hnsw_index_with_quantization(
+    storage: &InMemoryStorage,
+    table_id: RelationId,
+    index_id: IndexId,
+    quantization: aiondb_storage_api::StoredQuantizationKind,
+) {
+    let mut descriptor = test_index_descriptor(index_id, table_id);
+    descriptor.key_columns = vec![IndexKeyColumn {
+        column_id: ColumnId::new(2),
+        descending: false,
+        nulls_first: false,
+    }];
+    descriptor.hnsw_options = Some(aiondb_storage_api::HnswStorageOptions {
+        m: 8,
+        ef_construction: 32,
+        distance_metric: aiondb_storage_api::StoredVectorMetric::L2,
+        quantization,
+        prenormalised: false,
+    });
+    storage
+        .create_index_storage(TxnId::default(), &descriptor)
+        .expect("create quantized hnsw index");
+}
+
+#[test]
+fn reindex_vector_index_trains_scalar_codebook_for_undersized_indexes() {
+    // SQ index created on an empty table accumulates raw f32 vectors below
+    // the lazy-training threshold. `reindex_vector_index` should retrain
+    // the codebook from the current rows so subsequent searches run on the
+    // quantized hot path.
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2199);
+    let index_id = IndexId::new(2200);
+    create_vector_payload_table(&storage, table_id);
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_id,
+        index_id,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+
+    for i in 1..=50i32 {
+        let v = i as f32;
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![v, v + 1.0, v + 2.0],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+
+    let pre = storage
+        .vector_index_stats(index_id)
+        .expect("read stats")
+        .expect("hnsw index exists");
+    assert_eq!(
+        pre.quantization,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+    assert!(
+        !pre.codebook_ready,
+        "SQ codebook should be cold before REINDEX (only 50 rows)"
+    );
+    assert_eq!(pre.total_vectors, 50);
+
+    storage
+        .reindex_vector_index(index_id)
+        .expect("reindex vector index");
+
+    let post = storage
+        .vector_index_stats(index_id)
+        .expect("read stats post-reindex")
+        .expect("hnsw index still registered");
+    assert_eq!(
+        post.quantization,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+    assert!(
+        post.codebook_ready,
+        "REINDEX VECTOR must train the SQ codebook"
+    );
+    assert_eq!(post.total_vectors, 50);
+}
+
+#[test]
+fn reindex_vector_index_errors_for_unknown_index() {
+    let storage = InMemoryStorage::new_without_wal();
+    let err = storage
+        .reindex_vector_index(IndexId::new(9999))
+        .expect_err("missing index must surface an error");
+    assert!(err.to_string().contains("REINDEX VECTOR"));
+}
