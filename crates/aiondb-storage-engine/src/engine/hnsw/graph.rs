@@ -7,7 +7,9 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -575,7 +577,7 @@ pub(crate) struct HnswNode {
 pub(crate) struct HnswIndex {
     pub(crate) descriptor: IndexStorageDescriptor,
     params: HnswParams,
-    nodes: HashMap<TupleId, HnswNode>,
+    nodes: FxHashMap<TupleId, HnswNode>,
     entry_point: Option<TupleId>,
     max_layer: usize,
     /// Column ordinal in the table for the indexed vector column.
@@ -733,7 +735,7 @@ impl HnswIndex {
         Self {
             descriptor,
             params: HnswParams::new(m, ef_construction),
-            nodes: HashMap::new(),
+            nodes: FxHashMap::default(),
             entry_point: None,
             max_layer: 0,
             column_ordinal: None,
@@ -1123,7 +1125,7 @@ impl HnswIndex {
                 .map(|i| self.random_layer_for_count(base_count + i))
                 .collect();
 
-            let snapshot_nodes: &HashMap<TupleId, HnswNode> = &self.nodes;
+            let snapshot_nodes: &FxHashMap<TupleId, HnswNode> = &self.nodes;
             let snapshot_ep = self.entry_point;
             let snapshot_max_layer = self.max_layer;
             let params = params_template.clone();
@@ -2380,7 +2382,7 @@ struct NodeBuild {
 /// and the parallel build path (a stable snapshot shared across rayon
 /// workers).
 fn greedy_closest_in(
-    nodes: &HashMap<TupleId, HnswNode>,
+    nodes: &FxHashMap<TupleId, HnswNode>,
     start: TupleId,
     probe: &DistanceContext<'_>,
     layer: usize,

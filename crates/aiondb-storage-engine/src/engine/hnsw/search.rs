@@ -1,9 +1,11 @@
 #![allow(clippy::doc_markdown)]
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 
 #[cfg(test)]
 use std::collections::BTreeSet;
+
+use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 use aiondb_core::{DbError, DbResult, TupleId, HNSW_MAX_EF_SEARCH as CORE_HNSW_MAX_EF_SEARCH};
@@ -64,7 +66,7 @@ const HNSW_MAX_CANDIDATE_HEAP: usize = 262_144;
 /// `truncated` flag set to `true`.
 #[cfg(test)]
 pub(crate) fn search_layer(
-    nodes: &HashMap<TupleId, HnswNode>,
+    nodes: &FxHashMap<TupleId, HnswNode>,
     ep: TupleId,
     ef: usize,
     layer: usize,
@@ -87,7 +89,7 @@ pub(crate) fn search_layer(
 
 /// Like [`search_layer`] but passes a GPU distance computer for batch evaluation.
 pub(crate) fn search_layer_gpu(
-    nodes: &HashMap<TupleId, HnswNode>,
+    nodes: &FxHashMap<TupleId, HnswNode>,
     ep: TupleId,
     ef: usize,
     layer: usize,
@@ -121,7 +123,7 @@ pub(crate) fn search_layer_gpu(
 
 #[cfg(test)]
 pub(crate) fn search_layer_interruptible(
-    nodes: &HashMap<TupleId, HnswNode>,
+    nodes: &FxHashMap<TupleId, HnswNode>,
     ep: TupleId,
     ef: usize,
     layer: usize,
@@ -151,7 +153,7 @@ pub(crate) fn search_layer_interruptible(
 /// per candidate (>= `GPU_MIN_BATCH_SIZE`), distances are computed in batch
 /// via the GPU instead of one-at-a-time.
 pub(crate) fn search_layer_interruptible_gpu(
-    nodes: &HashMap<TupleId, HnswNode>,
+    nodes: &FxHashMap<TupleId, HnswNode>,
     ep: TupleId,
     ef: usize,
     layer: usize,
@@ -394,7 +396,7 @@ mod tests {
 
     #[test]
     fn search_layer_single_node() {
-        let mut nodes = HashMap::new();
+        let mut nodes: FxHashMap<TupleId, HnswNode> = FxHashMap::default();
         nodes.insert(TupleId::new(1), make_node(vec![1.0, 0.0, 0.0], 1));
 
         let mut dist_count = 0u64;
@@ -408,7 +410,7 @@ mod tests {
 
     #[test]
     fn search_layer_connected_nodes() {
-        let mut nodes = HashMap::new();
+        let mut nodes: FxHashMap<TupleId, HnswNode> = FxHashMap::default();
         let mut n1 = make_node(vec![1.0, 0.0, 0.0], 1);
         let mut n2 = make_node(vec![0.0, 1.0, 0.0], 1);
         let n3 = make_node(vec![0.0, 0.0, 1.0], 1);
@@ -487,7 +489,7 @@ mod tests {
 
     #[test]
     fn search_layer_empty_nodes() {
-        let nodes: HashMap<TupleId, HnswNode> = HashMap::new();
+        let nodes: FxHashMap<TupleId, HnswNode> = FxHashMap::default();
         let mut dist_count = 0u64;
         let query = [1.0f32, 0.0];
         let probe = raw_probe(&query);
@@ -498,7 +500,7 @@ mod tests {
 
     #[test]
     fn search_layer_interruptible_checks_cancellation_without_deadline() {
-        let mut nodes = HashMap::new();
+        let mut nodes: FxHashMap<TupleId, HnswNode> = FxHashMap::default();
         let node_count = 64u64;
         for id in 1..=node_count {
             let mut node = make_node(vec![id as f32, 0.0, 0.0], 1);
