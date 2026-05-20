@@ -1479,4 +1479,47 @@ fn search_stats_report_no_rescore_for_raw_index() {
         aiondb_storage_api::StoredQuantizationKind::None,
     );
     assert_eq!(stats.rescored_candidates, 0);
+    assert_eq!(stats.oversample_factor, 1);
+    assert!(stats.effective_ef_search >= 3);
+}
+
+#[test]
+fn search_stats_report_oversample_factor_for_quantized_index() {
+    use aiondb_storage_api::{HnswStorageOptions, StoredVectorMetric};
+    let dims = 32usize;
+    let dataset_size = 300usize;
+    let table_desc = make_table_desc_with_dims(dims as u32);
+    let mut index_desc = make_index_desc();
+    index_desc.hnsw_options = Some(HnswStorageOptions {
+        m: 8,
+        ef_construction: 32,
+        distance_metric: StoredVectorMetric::L2,
+        quantization: aiondb_storage_api::StoredQuantizationKind::Product,
+        prenormalised: false,
+    });
+    let dataset = (0..dataset_size)
+        .map(|idx| deterministic_vector(idx as u64 + 1, dims))
+        .collect::<Vec<_>>();
+    let rows = dataset
+        .iter()
+        .enumerate()
+        .map(|(idx, vector)| {
+            (
+                TupleId::new(idx as u64 + 1),
+                make_row(idx as i32 + 1, vector.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let index = HnswIndex::from_rows_with_options(&index_desc, &table_desc, rows).unwrap();
+    let (_results, stats) = index.search(&dataset[0], 10, 64);
+    assert_eq!(
+        stats.quantization,
+        aiondb_storage_api::StoredQuantizationKind::Product,
+    );
+    assert_eq!(stats.oversample_factor, 5);
+    assert!(
+        stats.effective_ef_search >= 50,
+        "PQ search should widen ef_search to at least k * oversample (got {})",
+        stats.effective_ef_search,
+    );
 }

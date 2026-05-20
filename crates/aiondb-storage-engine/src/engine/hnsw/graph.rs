@@ -364,6 +364,12 @@ pub struct HnswSearchStats {
     /// the approximate top-K from the codebook. Zero when no rescoring ran
     /// (raw f32 or Binary quantization).
     pub rescored_candidates: u64,
+    /// Multiplier applied to `k` to widen the candidate set for the
+    /// rescoring pass (1 when no rescoring runs).
+    pub oversample_factor: u32,
+    /// Effective layer-0 candidate breadth actually used after applying
+    /// oversampling and the `HNSW_MAX_EF_SEARCH` clamp.
+    pub effective_ef_search: u64,
 }
 
 /// Cumulative search statistics across all searches on an HNSW index.
@@ -1721,6 +1727,8 @@ impl HnswIndex {
             .saturating_mul(oversample_factor)
             .min(search::HNSW_MAX_EF_SEARCH);
         let ef_search = ef.max(approx_k).max(k);
+        stats.oversample_factor = u32::try_from(oversample_factor).unwrap_or(u32::MAX);
+        stats.effective_ef_search = usize_to_u64_saturating(ef_search);
         let mut distance_computations = 0u64;
         let gpu = self.batch_distance.as_deref();
         let result = search::search_layer_interruptible_gpu(
