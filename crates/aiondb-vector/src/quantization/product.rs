@@ -38,14 +38,16 @@ pub struct ProductCode {
     pub codes: Vec<u8>,
 }
 
-/// Precomputed asymmetric distance table for a single query vector. Stores
-/// `entries[sub][centroid_idx] = ||query_sub - centroids[sub][centroid_idx]||^2`
-/// so subsequent distance computations against PQ codes collapse into
-/// `m` table lookups.
+/// Precomputed asymmetric distance table for a single query vector. The
+/// table is stored as a single contiguous `m * k` f32 buffer with stride
+/// `k` so the search hot loop walks a single cache line per subspace
+/// instead of chasing one allocation per subspace. Layout:
+/// `entries[sub * k + centroid_idx] = ||q_sub - centroids[sub][centroid_idx]||^2`.
 #[derive(Clone, Debug)]
 pub struct QueryLut {
-    entries: Vec<Vec<f32>>,
+    entries: Vec<f32>,
     sub_count: usize,
+    k: usize,
 }
 
 impl QueryLut {
@@ -207,21 +209,23 @@ impl ProductQuantizer {
                 )));
             }
         }
-        let mut entries: Vec<Vec<f32>> = Vec::with_capacity(self.m);
+        // Allocate the full m * k table once and fill it linearly so the
+        // search hot loop hits a single contiguous buffer.
+        let mut entries = vec![0.0f32; self.m * self.k];
         for sub in 0..self.m {
             let start = sub * self.sub_dims;
             let end = start + self.sub_dims;
             let q_slice = &query[start..end];
             let book = &self.centroids[sub];
-            let row: Vec<f32> = book
-                .iter()
-                .map(|centroid| crate::simd::dispatch::l2_squared_f32(q_slice, centroid))
-                .collect();
-            entries.push(row);
+            let row = &mut entries[sub * self.k..sub * self.k + self.k];
+            for (idx, centroid) in book.iter().enumerate() {
+                row[idx] = crate::simd::dispatch::l2_squared_f32(q_slice, centroid);
+            }
         }
         Ok(QueryLut {
             entries,
             sub_count: self.m,
+            k: self.k,
         })
     }
 
@@ -230,19 +234,22 @@ impl ProductQuantizer {
     /// it expands the same sum-of-squared-subspace-distances.
     #[must_use]
     pub fn approx_l2_with_lut(&self, lut: &QueryLut, code: &ProductCode) -> f32 {
-        let subspace_count = code
-            .codes
-            .len()
-            .min(self.m)
-            .min(lut.entries.len());
+        let subspace_count = code.codes.len().min(self.m).min(lut.sub_count);
+        let k = lut.k;
+        if k == 0 {
+            return 0.0;
+        }
         let mut sum = 0.0f32;
         for sub in 0..subspace_count {
-            let row = &lut.entries[sub];
-            if row.is_empty() {
-                continue;
+            let idx = usize::from(code.codes[sub]).min(k - 1);
+            // SAFETY: `sub < lut.sub_count` and `idx < k` together keep the
+            // index inside the `m * k` allocation; bounds are validated by
+            // the two `min` calls above. Skipping the per-load bounds
+            // check tightens the inner loop without losing safety.
+            #[allow(unsafe_code)]
+            unsafe {
+                sum += *lut.entries.get_unchecked(sub * k + idx);
             }
-            let idx = usize::from(code.codes[sub]).min(row.len().saturating_sub(1));
-            sum += row[idx];
         }
         sum.sqrt()
     }

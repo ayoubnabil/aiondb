@@ -1805,7 +1805,15 @@ impl HnswIndex {
         stats.quantization = self.quantization;
 
         let ids = if can_rescore {
-            let (ids, rescored) = self.rescore_candidates(query, &result.candidates, k);
+            // Bound the rescore set to `approx_k = k * oversample`. The
+            // layer-0 search may have explored up to `ef_search` (≥
+            // approx_k) candidates so the probe could prune off the back
+            // of the heap, but rescoring all of them is wasted work -
+            // candidates ranked beyond the top-approx_k by the codebook
+            // metric are very unlikely to land in the exact top-k.
+            let rescore_limit = approx_k.min(result.candidates.len());
+            let (ids, rescored) =
+                self.rescore_candidates(query, &result.candidates[..rescore_limit], k);
             stats.rescored_candidates = usize_to_u64_saturating(rescored);
             ids
         } else {
