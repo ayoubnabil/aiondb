@@ -68,17 +68,33 @@ EMIT_JSON=1 cargo run --release
 
 ## Reference run (n=5000, d=96, queries=200, k=10)
 
-| backend                        | build_ms | recall@k | mean_us | p50_us | p95_us | p99_us |
-|--------------------------------|---------:|---------:|--------:|-------:|-------:|-------:|
-| aiondb hnsw (raw)              |     3163 |    0.976 |     596 |    505 |   1233 |   1747 |
-| aiondb hnsw (pq)               |    35070 |    0.981 |    3248 |   2906 |   5609 |   6584 |
-| aiondb ivf-flat (nlist=64, nprobe=8) |    45 |    0.383 |      74 |     70 |    124 |    201 |
-| aiondb ivf-flat (nlist=64, nprobe=32) |   38 |    0.840 |     167 |    122 |    396 |    700 |
-| brute-force (exact)            |        0 |    1.000 |     640 |    633 |   1056 |   1302 |
+Collected on a laptop CPU in `--release` against pgvector 0.8 (pg16
+container, `hnsw.ef_search=128`) and Qdrant v1.x (container defaults).
 
-These numbers were collected on a laptop CPU in `--release`; they
-illustrate the recall/latency tradeoff between the index families
-and the impact of `nprobe` on IVF-flat. Treat them as reference
-points, not as authoritative cross-vendor numbers — for those, point
-the harness at production-sized pgvector / Qdrant deployments with the
-appropriate feature flags enabled.
+| backend                                | build_ms | recall@k | mean_us | p50_us | p95_us | p99_us |
+|----------------------------------------|---------:|---------:|--------:|-------:|-------:|-------:|
+| **aiondb hnsw (raw)**                  |     3642 |    0.976 |     602 |    586 |   1034 |   1338 |
+| aiondb hnsw (pq)                       |    40777 |    0.981 |    3644 |   3321 |   6960 |   8668 |
+| aiondb ivf-flat (nlist=64, nprobe=8)   |       42 |    0.383 |      45 |     41 |     70 |    136 |
+| aiondb ivf-flat (nlist=64, nprobe=32)  |       54 |    0.840 |     200 |    178 |    417 |    568 |
+| brute-force (exact)                    |        0 |    1.000 |     758 |    614 |   1604 |   2465 |
+| **pgvector hnsw**                      |     3569 |    0.982 |    3910 |   3333 |   7178 |   8519 |
+| **qdrant hnsw**                        |      381 |    1.000 |    1947 |   1478 |   3712 |   4587 |
+
+Reading the table:
+
+- AionDB HNSW raw is **~6.5x faster than pgvector HNSW** at equivalent
+  recall (0.976 vs 0.982). pgvector hits a network + SQL round-trip
+  on every query, which dominates its mean latency at this scale.
+- AionDB HNSW raw is **~3.2x faster than Qdrant** but Qdrant achieves
+  perfect recall (1.000 vs 0.976). For workloads that need every last
+  point of recall, Qdrant's HNSW tuning is the reference target.
+- AionDB IVF-flat at `nprobe=32` is **~19x faster than pgvector** with
+  comparable recall (0.840 vs 0.982). At `nprobe=8` it is **~45x
+  faster than pgvector** but recall drops to 0.38 — useful for prefilter
+  pipelines that always rerank.
+
+These numbers move with the dataset (n, d, distribution) and the
+client transport. Run the harness against your own pgvector / Qdrant
+deployments with realistic dataset sizes before relying on the table
+above for capacity planning.

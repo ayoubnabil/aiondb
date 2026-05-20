@@ -516,7 +516,7 @@ fn bench_aiondb_brute_force(
 #[cfg(feature = "pgvector")]
 mod pgvector {
     use super::*;
-    use tokio_postgres::{Client, NoTls};
+    use tokio_postgres::NoTls;
 
     pub async fn bench(
         url: &str,
@@ -543,14 +543,18 @@ mod pgvector {
         );
         client.batch_execute(&create).await?;
 
+        // pgvector ships its own vector type that tokio-postgres doesn't
+        // understand natively; we sidestep the OID mapping by inlining the
+        // vector literal into the SQL string. The values are
+        // synthesized locally and are not user input.
         for (i, vector) in dataset.iter().enumerate() {
             let literal = vector_literal(vector);
-            client
-                .execute(
-                    "INSERT INTO aiondb_vector_compare VALUES ($1, $2::vector)",
-                    &[&((i as i64) + 1), &literal],
-                )
-                .await?;
+            let stmt = format!(
+                "INSERT INTO aiondb_vector_compare VALUES ({}, '{}'::vector)",
+                (i as i64) + 1,
+                literal
+            );
+            client.batch_execute(&stmt).await?;
         }
 
         let build_start = Instant::now();
@@ -561,18 +565,23 @@ mod pgvector {
             )
             .await?;
         let build_ms = build_start.elapsed().as_millis();
+        // Match the query-time breadth AionDB and Qdrant use so recall
+        // comparisons aren't capped by pgvector's default ef_search=40.
+        client
+            .batch_execute("SET hnsw.ef_search = 128")
+            .await?;
 
         let mut latencies = Vec::with_capacity(queries.len());
         let mut actual = Vec::with_capacity(queries.len());
         for query in queries {
             let literal = vector_literal(query);
+            let sql = format!(
+                "SELECT id FROM aiondb_vector_compare \
+                 ORDER BY embedding <-> '{}'::vector LIMIT {}",
+                literal, TOP_K
+            );
             let start = Instant::now();
-            let rows = client
-                .query(
-                    "SELECT id FROM aiondb_vector_compare ORDER BY embedding <-> $1::vector LIMIT $2",
-                    &[&literal, &(TOP_K as i64)],
-                )
-                .await?;
+            let rows = client.query(&sql, &[]).await?;
             latencies.push(start.elapsed());
             let ids: Vec<usize> = rows
                 .iter()
