@@ -49,6 +49,6 @@ pub use planner_backends::{
     VectorSearchBackendRegistry,
 };
 pub use quantization::{
-    BinaryCode, BinaryQuantizer, ProductCode, ProductQuantizer, QuantizationKind, ScalarCode,
-    ScalarQuantizer, VectorQuantizer,
+    BinaryCode, BinaryQuantizer, ProductCode, ProductQuantizer, QuantizationKind, QueryLut,
+    ScalarCode, ScalarQuantizer, VectorQuantizer,
 };

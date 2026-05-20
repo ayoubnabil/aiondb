@@ -22,8 +22,8 @@ use aiondb_storage_api::{
 };
 use aiondb_vector::distance::{distance_fn_raw, VectorDistance};
 use aiondb_vector::{
-    BinaryCode, BinaryQuantizer, ProductCode, ProductQuantizer, ScalarCode, ScalarQuantizer,
-    VectorQuantizer,
+    BinaryCode, BinaryQuantizer, ProductCode, ProductQuantizer, QueryLut, ScalarCode,
+    ScalarQuantizer, VectorQuantizer,
 };
 
 use super::super::helpers::u64_to_f64;
@@ -65,7 +65,9 @@ pub(crate) enum DistanceContext<'a> {
         quantizer: ScalarQuantizer,
     },
     Product {
-        query_code: ProductCode,
+        /// Precomputed query-to-centroid LUT. `approx_l2_with_lut` collapses
+        /// the per-node distance to `m` table lookups.
+        query_lut: QueryLut,
         quantizer: ProductQuantizer,
     },
 }
@@ -112,12 +114,14 @@ impl DistanceContext<'_> {
                 .as_ref()
                 .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
             Self::Product {
-                query_code,
+                query_lut,
                 quantizer,
             } => node
                 .product_code
                 .as_ref()
-                .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
+                .map_or(f32::INFINITY, |code| {
+                    quantizer.approx_l2_with_lut(query_lut, code)
+                }),
         }
     }
 
@@ -2101,9 +2105,9 @@ impl HnswIndex {
             }
             StoredQuantizationKind::Product => {
                 if let Some(quantizer) = self.product_quantizer.as_ref() {
-                    let query_code = quantizer.encode(query)?;
+                    let query_lut = quantizer.compute_query_lut(query)?;
                     Ok(DistanceContext::Product {
-                        query_code,
+                        query_lut,
                         quantizer: quantizer.clone(),
                     })
                 } else {
@@ -2149,13 +2153,29 @@ impl HnswIndex {
                 Some(self.build_raw_probe_for_node(node))
             }
             StoredQuantizationKind::Product => {
-                if let (Some(quantizer), Some(code)) =
-                    (self.product_quantizer.as_ref(), node.product_code.as_ref())
-                {
-                    return Some(DistanceContext::Product {
-                        query_code: code.clone(),
-                        quantizer: quantizer.clone(),
-                    });
+                if let Some(quantizer) = self.product_quantizer.as_ref() {
+                    // Pruning probes need a LUT keyed on the stored node's
+                    // own coordinates. We synthesize the query from the
+                    // retained raw vector when present (the common SQ/PQ
+                    // path), or from the decoded compact bytes otherwise.
+                    let raw: Option<Cow<'_, [f32]>> = if !node.vector.is_empty() {
+                        Some(Cow::Borrowed(node.vector.as_slice()))
+                    } else if let Some(compact) = &node.compact_vector {
+                        Some(Cow::Owned(aiondb_core::vector_storage::decode_vector(
+                            compact,
+                            self.element_type,
+                        )))
+                    } else {
+                        None
+                    };
+                    if let Some(raw) = raw {
+                        if let Ok(query_lut) = quantizer.compute_query_lut(raw.as_ref()) {
+                            return Some(DistanceContext::Product {
+                                query_lut,
+                                quantizer: quantizer.clone(),
+                            });
+                        }
+                    }
                 }
                 Some(self.build_raw_probe_for_node(node))
             }
@@ -2331,9 +2351,9 @@ fn build_probe_standalone<'a>(
         }
         StoredQuantizationKind::Product => {
             if let Some(quantizer) = product_quant {
-                let query_code = quantizer.encode(query)?;
+                let query_lut = quantizer.compute_query_lut(query)?;
                 Ok(DistanceContext::Product {
-                    query_code,
+                    query_lut,
                     quantizer: quantizer.clone(),
                 })
             } else {

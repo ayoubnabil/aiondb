@@ -22,7 +22,7 @@ pub mod scalar;
 use aiondb_core::DbResult;
 
 pub use binary::{BinaryCode, BinaryQuantizer};
-pub use product::{ProductCode, ProductQuantizer};
+pub use product::{ProductCode, ProductQuantizer, QueryLut};
 pub use scalar::{ScalarCode, ScalarQuantizer};
 
 /// Identifies which vector quantization codec is active for a given context.
