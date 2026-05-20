@@ -885,8 +885,7 @@ impl HnswIndex {
                 // Pass them as borrowed slices into the k-means train
                 // path so the per-subspace loop never sees a Vec<Vec<>>.
                 let samples = collect_pq_training_samples(entries);
-                let sample_slices: Vec<&[f32]> =
-                    samples.iter().map(Vec::as_slice).collect();
+                let sample_slices: Vec<&[f32]> = samples.iter().map(Vec::as_slice).collect();
                 self.product_quantizer =
                     Some(ProductQuantizer::train_from_slices(&sample_slices, m, k)?);
             }
@@ -1267,10 +1266,11 @@ impl HnswIndex {
             };
             // Diversification matters most on upper layers where the
             // graph carries the long-range "highway" edges that drive
-            // navigability. Layer 0 already holds the bulk of nodes;
-            // simple top-M selection there keeps the dense local
-            // neighborhood that lets greedy descent converge quickly.
-            let selected = if lc == 0 {
+            // navigability. Layers 0 through 2 already hold many nodes;
+            // simple top-M selection there keeps dense local
+            // neighborhoods while avoiding the expensive pair-distance
+            // heuristic on the hottest build layers.
+            let selected = if lc <= 2 {
                 candidates
                     .iter()
                     .take(max_connections)
@@ -1349,7 +1349,7 @@ impl HnswIndex {
             } else {
                 self.params.m
             };
-            let selected = if lc == 0 {
+            let selected = if lc <= 2 {
                 candidates
                     .iter()
                     .take(max_connections)
@@ -1474,8 +1474,8 @@ impl HnswIndex {
                 self.params.m
             };
 
-            // Diversify only on upper layers; layer 0 keeps simple top-M.
-            let selected = if lc == 0 {
+            // Diversify only on upper layers; layers 0 through 2 keep simple top-M.
+            let selected = if lc <= 2 {
                 candidates
                     .iter()
                     .take(max_connections)
@@ -1925,11 +1925,11 @@ impl HnswIndex {
         let nodes = self.nodes.len();
         let mut floor = requested.max(k);
         if nodes >= 10_000 {
-            floor = floor.max(self.params.m_max0.saturating_mul(4));
-            floor = floor.max(k.saturating_mul(8));
+            floor = floor.max(self.params.m_max0.saturating_mul(6));
+            floor = floor.max(k.saturating_mul(12));
         }
         if nodes >= 100_000 {
-            floor = floor.max(self.params.m_max0.saturating_mul(8));
+            floor = floor.max(self.params.m_max0.saturating_mul(10));
         }
         requested.max(floor.min(search::HNSW_MAX_EF_SEARCH))
     }
