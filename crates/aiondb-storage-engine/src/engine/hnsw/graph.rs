@@ -358,6 +358,12 @@ pub struct HnswSearchStats {
     /// `true` when the search was aborted early because the latency budget
     /// (deadline) was exceeded. The results are partial in that case.
     pub truncated: bool,
+    /// Quantization mode active for this search. `None` for raw f32 search.
+    pub quantization: StoredQuantizationKind,
+    /// Number of candidates that were rescored with the exact metric after
+    /// the approximate top-K from the codebook. Zero when no rescoring ran
+    /// (raw f32 or Binary quantization).
+    pub rescored_candidates: u64,
 }
 
 /// Cumulative search statistics across all searches on an HNSW index.
@@ -1703,9 +1709,12 @@ impl HnswIndex {
         stats.nodes_visited = usize_to_u64_saturating(result.candidates.len());
         stats.distance_computations = distance_computations;
         stats.truncated = result.truncated;
+        stats.quantization = self.quantization;
 
         let ids = if can_rescore {
-            self.rescore_candidates(query, &result.candidates, k)
+            let (ids, rescored) = self.rescore_candidates(query, &result.candidates, k);
+            stats.rescored_candidates = usize_to_u64_saturating(rescored);
+            ids
         } else {
             result
                 .candidates
@@ -1735,13 +1744,14 @@ impl HnswIndex {
     }
 
     /// Recompute exact distances for an approximate shortlist and return the
-    /// top-`k` tuple IDs sorted by the exact metric.
+    /// top-`k` tuple IDs sorted by the exact metric, together with the
+    /// number of candidates that actually contributed to the rescoring pass.
     fn rescore_candidates(
         &self,
         query: &[f32],
         candidates: &[(TupleId, f32)],
         k: usize,
-    ) -> Vec<TupleId> {
+    ) -> (Vec<TupleId>, usize) {
         let exact_distance = self.distance_fn;
         let mut rescored: Vec<(TupleId, f32)> = Vec::with_capacity(candidates.len());
         let mut decoded = Vec::new();
@@ -1763,10 +1773,12 @@ impl HnswIndex {
             };
             rescored.push((*tid, exact));
         }
+        let rescored_count = rescored.len();
         rescored.sort_unstable_by(|a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         });
-        rescored.into_iter().take(k).map(|(id, _)| id).collect()
+        let ids = rescored.into_iter().take(k).map(|(id, _)| id).collect();
+        (ids, rescored_count)
     }
 
     /// Accumulate per-search stats into index-level summary counters.
