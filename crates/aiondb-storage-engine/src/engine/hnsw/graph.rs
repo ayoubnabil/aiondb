@@ -1783,27 +1783,59 @@ impl HnswIndex {
         k: usize,
     ) -> (Vec<TupleId>, usize) {
         let exact_distance = self.distance_fn;
-        let mut rescored: Vec<(TupleId, f32)> = Vec::with_capacity(candidates.len());
-        let mut decoded = Vec::new();
-        for (tid, _approx) in candidates {
-            let Some(node) = self.nodes.get(tid) else {
-                continue;
-            };
-            let exact = if !node.vector.is_empty() {
-                exact_distance(&node.vector, query)
-            } else if let Some(compact) = &node.compact_vector {
-                aiondb_core::vector_storage::decode_vector_into(
-                    compact,
-                    self.element_type,
-                    &mut decoded,
-                );
-                exact_distance(&decoded, query)
-            } else {
-                continue;
-            };
-            rescored.push((*tid, exact));
-        }
+        let element_type = self.element_type;
+        // Small shortlists do not justify rayon dispatch overhead; the
+        // sequential path also keeps decode_scratch on the stack of one
+        // thread. Above the threshold each rayon worker decodes into its
+        // own buffer, which preserves correctness without contention.
+        const PAR_RESCORE_THRESHOLD: usize = 128;
+        let rescored: Vec<(TupleId, f32)> = if candidates.len() >= PAR_RESCORE_THRESHOLD {
+            candidates
+                .par_iter()
+                .with_min_len(32)
+                .filter_map(|(tid, _approx)| {
+                    let node = self.nodes.get(tid)?;
+                    let mut decoded = Vec::new();
+                    let exact = if !node.vector.is_empty() {
+                        exact_distance(&node.vector, query)
+                    } else if let Some(compact) = &node.compact_vector {
+                        aiondb_core::vector_storage::decode_vector_into(
+                            compact,
+                            element_type,
+                            &mut decoded,
+                        );
+                        exact_distance(&decoded, query)
+                    } else {
+                        return None;
+                    };
+                    Some((*tid, exact))
+                })
+                .collect()
+        } else {
+            let mut out: Vec<(TupleId, f32)> = Vec::with_capacity(candidates.len());
+            let mut decoded = Vec::new();
+            for (tid, _approx) in candidates {
+                let Some(node) = self.nodes.get(tid) else {
+                    continue;
+                };
+                let exact = if !node.vector.is_empty() {
+                    exact_distance(&node.vector, query)
+                } else if let Some(compact) = &node.compact_vector {
+                    aiondb_core::vector_storage::decode_vector_into(
+                        compact,
+                        element_type,
+                        &mut decoded,
+                    );
+                    exact_distance(&decoded, query)
+                } else {
+                    continue;
+                };
+                out.push((*tid, exact));
+            }
+            out
+        };
         let rescored_count = rescored.len();
+        let mut rescored = rescored;
         rescored.sort_unstable_by(|a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         });
