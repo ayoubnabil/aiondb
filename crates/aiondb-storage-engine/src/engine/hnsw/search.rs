@@ -2,9 +2,6 @@
 
 use std::collections::BinaryHeap;
 
-#[cfg(test)]
-use std::collections::BTreeSet;
-
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
@@ -381,7 +378,7 @@ mod tests {
             binary_code: None,
             scalar_code: None,
             product_code: None,
-            neighbors: vec![BTreeSet::new(); layer_count],
+            neighbors: vec![Vec::new(); layer_count],
         }
     }
 
@@ -415,9 +412,9 @@ mod tests {
         let mut n1 = make_node(vec![1.0, 0.0, 0.0], 1);
         let mut n2 = make_node(vec![0.0, 1.0, 0.0], 1);
         let n3 = make_node(vec![0.0, 0.0, 1.0], 1);
-        n1.neighbors[0].insert(TupleId::new(2));
-        n2.neighbors[0].insert(TupleId::new(1));
-        n2.neighbors[0].insert(TupleId::new(3));
+        n1.neighbors[0].push(TupleId::new(2));
+        n2.neighbors[0].push(TupleId::new(1));
+        n2.neighbors[0].push(TupleId::new(3));
         nodes.insert(TupleId::new(1), n1);
         nodes.insert(TupleId::new(2), n2);
         nodes.insert(TupleId::new(3), n3);
@@ -506,10 +503,10 @@ mod tests {
         for id in 1..=node_count {
             let mut node = make_node(vec![id as f32, 0.0, 0.0], 1);
             if id > 1 {
-                node.neighbors[0].insert(TupleId::new(id - 1));
+                node.neighbors[0].push(TupleId::new(id - 1));
             }
             if id < node_count {
-                node.neighbors[0].insert(TupleId::new(id + 1));
+                node.neighbors[0].push(TupleId::new(id + 1));
             }
             nodes.insert(TupleId::new(id), node);
         }

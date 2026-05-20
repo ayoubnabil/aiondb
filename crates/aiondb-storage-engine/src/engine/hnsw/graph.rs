@@ -7,7 +7,6 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -570,7 +569,13 @@ pub(crate) struct HnswNode {
     pub(crate) scalar_code: Option<ScalarCode>,
     pub(crate) product_code: Option<ProductCode>,
     /// Connections at each layer. neighbors[layer] = set of connected tuple IDs.
-    pub(crate) neighbors: Vec<BTreeSet<TupleId>>,
+    /// Neighbor lists keyed by layer. We use a flat `Vec<TupleId>` per
+    /// layer instead of a tree set because HNSW caps the per-layer
+    /// neighbor count at `m_max0 = 2m` (~32 by default), and at that
+    /// scale a linear-scan dedup is dramatically faster than a tree
+    /// node walk - and the search hot loop iterates these slices,
+    /// where contiguous memory pays off via prefetch.
+    pub(crate) neighbors: Vec<Vec<TupleId>>,
 }
 
 /// The HNSW index data structure for approximate nearest neighbor search.
@@ -1210,7 +1215,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![BTreeSet::new(); layer + 1],
+            neighbors: vec![Vec::new(); layer + 1],
         };
         self.nodes.insert(tuple_id, node);
 
@@ -1270,12 +1275,12 @@ impl HnswIndex {
                 }
                 if let Some(node) = self.nodes.get_mut(&tuple_id) {
                     if lc < node.neighbors.len() {
-                        node.neighbors[lc].insert(neighbor_id);
+                        neighbor_list_insert(&mut node.neighbors[lc], neighbor_id);
                     }
                 }
                 if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
                     if lc < neighbor.neighbors.len() {
-                        neighbor.neighbors[lc].insert(tuple_id);
+                        neighbor_list_insert(&mut neighbor.neighbors[lc], tuple_id);
                         if neighbor.neighbors[lc].len() > max_connections {
                             self.prune_connections(neighbor_id, lc, max_connections);
                         }
@@ -1310,7 +1315,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![BTreeSet::new(); layer + 1],
+            neighbors: vec![Vec::new(); layer + 1],
         };
         self.nodes.insert(tid, node);
 
@@ -1349,12 +1354,12 @@ impl HnswIndex {
                 }
                 if let Some(node) = self.nodes.get_mut(&tid) {
                     if lc < node.neighbors.len() {
-                        node.neighbors[lc].insert(neighbor_id);
+                        neighbor_list_insert(&mut node.neighbors[lc], neighbor_id);
                     }
                 }
                 if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
                     if lc < neighbor.neighbors.len() {
-                        neighbor.neighbors[lc].insert(tid);
+                        neighbor_list_insert(&mut neighbor.neighbors[lc], tid);
                         if neighbor.neighbors[lc].len() > max_connections {
                             self.prune_connections(neighbor_id, lc, max_connections);
                         }
@@ -1412,7 +1417,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![BTreeSet::new(); layer + 1],
+            neighbors: vec![Vec::new(); layer + 1],
         };
         self.nodes.insert(tuple_id, node);
 
@@ -1478,12 +1483,12 @@ impl HnswIndex {
                 // Add bidirectional connections.
                 if let Some(node) = self.nodes.get_mut(&tuple_id) {
                     if lc < node.neighbors.len() {
-                        node.neighbors[lc].insert(neighbor_id);
+                        neighbor_list_insert(&mut node.neighbors[lc], neighbor_id);
                     }
                 }
                 if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
                     if lc < neighbor.neighbors.len() {
-                        neighbor.neighbors[lc].insert(tuple_id);
+                        neighbor_list_insert(&mut neighbor.neighbors[lc], tuple_id);
                         // Prune if over capacity.
                         if neighbor.neighbors[lc].len() > max_connections {
                             self.prune_connections(neighbor_id, lc, max_connections);
@@ -1557,7 +1562,7 @@ impl HnswIndex {
             for &neighbor_id in neighbors {
                 if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
                     if layer < neighbor.neighbors.len() {
-                        neighbor.neighbors[layer].remove(&tuple_id);
+                        neighbor_list_remove(&mut neighbor.neighbors[layer], tuple_id);
                     }
                 }
             }
@@ -2351,7 +2356,7 @@ impl HnswIndex {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             if layer < node.neighbors.len() {
                 for &rid in &removed {
-                    node.neighbors[layer].remove(&rid);
+                    neighbor_list_remove(&mut node.neighbors[layer], rid);
                 }
             }
         }
@@ -2360,7 +2365,7 @@ impl HnswIndex {
         for rid in removed {
             if let Some(neighbor) = self.nodes.get_mut(&rid) {
                 if layer < neighbor.neighbors.len() {
-                    neighbor.neighbors[layer].remove(&node_id);
+                    neighbor_list_remove(&mut neighbor.neighbors[layer], node_id);
                 }
             }
         }
@@ -2381,6 +2386,26 @@ struct NodeBuild {
 /// borrowed graph snapshot. Used by both the in-place path (`&self.nodes`)
 /// and the parallel build path (a stable snapshot shared across rayon
 /// workers).
+/// Insert `id` into a neighbor list, deduplicating against existing
+/// entries. Vec replaced BTreeSet because the neighbor count per layer
+/// is capped at `m_max0` (~32) where linear-scan dedup beats a tree
+/// walk and keeps the search hot loop cache-friendly.
+#[inline]
+fn neighbor_list_insert(list: &mut Vec<TupleId>, id: TupleId) {
+    if !list.contains(&id) {
+        list.push(id);
+    }
+}
+
+/// Remove `id` from a neighbor list. `swap_remove` keeps the list dense
+/// without preserving order; HNSW does not rely on neighbor ordering.
+#[inline]
+fn neighbor_list_remove(list: &mut Vec<TupleId>, id: TupleId) {
+    if let Some(pos) = list.iter().position(|x| *x == id) {
+        list.swap_remove(pos);
+    }
+}
+
 fn greedy_closest_in(
     nodes: &FxHashMap<TupleId, HnswNode>,
     start: TupleId,

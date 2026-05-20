@@ -1176,8 +1176,8 @@ fn compact_vector_pruning_uses_decoded_query_node() {
         node.neighbors[0].clear();
     }
     for neighbor_id in [TupleId::new(2), TupleId::new(3), TupleId::new(4)] {
-        index.nodes.get_mut(&TupleId::new(1)).unwrap().neighbors[0].insert(neighbor_id);
-        index.nodes.get_mut(&neighbor_id).unwrap().neighbors[0].insert(TupleId::new(1));
+        index.nodes.get_mut(&TupleId::new(1)).unwrap().neighbors[0].push(neighbor_id);
+        index.nodes.get_mut(&neighbor_id).unwrap().neighbors[0].push(TupleId::new(1));
     }
 
     let target = index.nodes.get(&TupleId::new(1)).unwrap();
@@ -1186,10 +1186,15 @@ fn compact_vector_pruning_uses_decoded_query_node() {
 
     index.prune_connections(TupleId::new(1), 0, 2);
 
-    let kept: Vec<TupleId> = index.nodes[&TupleId::new(1)].neighbors[0]
+    // Vec-backed neighbor lists no longer preserve sorted-by-tuple-id
+    // order (swap_remove on prune is order-disturbing). The graph
+    // semantics only care about set membership, so compare as a sorted
+    // set.
+    let mut kept: Vec<TupleId> = index.nodes[&TupleId::new(1)].neighbors[0]
         .iter()
         .copied()
         .collect();
+    kept.sort();
     assert_eq!(kept, vec![TupleId::new(3), TupleId::new(4)]);
 }
 
