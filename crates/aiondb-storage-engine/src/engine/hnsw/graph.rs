@@ -1215,7 +1215,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![Vec::new(); layer + 1],
+            neighbors: make_neighbor_layers(layer + 1, self.params.m, self.params.m_max0),
         };
         self.nodes.insert(tuple_id, node);
 
@@ -1315,7 +1315,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![Vec::new(); layer + 1],
+            neighbors: make_neighbor_layers(layer + 1, self.params.m, self.params.m_max0),
         };
         self.nodes.insert(tid, node);
 
@@ -1417,7 +1417,7 @@ impl HnswIndex {
             binary_code,
             scalar_code,
             product_code,
-            neighbors: vec![Vec::new(); layer + 1],
+            neighbors: make_neighbor_layers(layer + 1, self.params.m, self.params.m_max0),
         };
         self.nodes.insert(tuple_id, node);
 
@@ -2386,6 +2386,18 @@ struct NodeBuild {
 /// borrowed graph snapshot. Used by both the in-place path (`&self.nodes`)
 /// and the parallel build path (a stable snapshot shared across rayon
 /// workers).
+/// Build the per-layer neighbor lists for a new node with the correct
+/// capacity up-front. Layer 0 gets `m_max0` slots (the densest layer);
+/// higher layers get `m`. Pre-allocating saves the four-or-five
+/// reallocations a `Vec::new()` would do as the neighbor list grows
+/// to its bounded steady-state size.
+#[inline]
+fn make_neighbor_layers(layer_count: usize, m: usize, m_max0: usize) -> Vec<Vec<TupleId>> {
+    (0..layer_count)
+        .map(|lc| Vec::with_capacity(if lc == 0 { m_max0 } else { m }))
+        .collect()
+}
+
 /// Insert `id` into a neighbor list, deduplicating against existing
 /// entries. Vec replaced BTreeSet because the neighbor count per layer
 /// is capped at `m_max0` (~32) where linear-scan dedup beats a tree
