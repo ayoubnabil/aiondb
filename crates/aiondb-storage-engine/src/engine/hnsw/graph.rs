@@ -413,6 +413,12 @@ pub struct HnswIndexStats {
     /// `true` once the codec has been initialized (from a build, a REINDEX,
     /// or lazy on-insert training).
     pub codebook_ready: bool,
+    /// For Product quantization: the number of subspaces (`m`) the
+    /// codebook was trained with. Zero for other modes.
+    pub pq_subspaces: u32,
+    /// For Product quantization: the number of centroids per subspace
+    /// (`k`). Zero for other modes.
+    pub pq_centroids_per_subspace: u32,
 }
 
 /// HNSW index parameters.
@@ -1901,6 +1907,16 @@ impl HnswIndex {
             StoredQuantizationKind::Scalar => self.scalar_quantizer.is_some(),
             StoredQuantizationKind::Product => self.product_quantizer.is_some(),
         };
+        let (pq_subspaces, pq_centroids_per_subspace) = self
+            .product_quantizer
+            .as_ref()
+            .map(|q| {
+                (
+                    u32::try_from(q.m()).unwrap_or(u32::MAX),
+                    u32::try_from(q.k()).unwrap_or(u32::MAX),
+                )
+            })
+            .unwrap_or((0, 0));
         HnswIndexStats {
             total_vectors: usize_to_u64_saturating(self.nodes.len()),
             total_inserts: self.stat_total_inserts.load(Ordering::Relaxed),
@@ -1911,6 +1927,8 @@ impl HnswIndex {
             memory_budget_bytes: self.max_memory_bytes,
             quantization: self.quantization,
             codebook_ready,
+            pq_subspaces,
+            pq_centroids_per_subspace,
         }
     }
 

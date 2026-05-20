@@ -3263,6 +3263,60 @@ fn reindex_vector_index_storage_trait_dispatch_works_in_autocommit() {
 }
 
 #[test]
+fn vector_index_stats_expose_pq_subspaces_and_centroids() {
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2501);
+    let index_id = IndexId::new(2502);
+    create_vector_payload_table(&storage, table_id);
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_id,
+        index_id,
+        aiondb_storage_api::StoredQuantizationKind::Product,
+    );
+
+    for i in 1..=20i32 {
+        let v = i as f32;
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![v, v + 1.0, v + 2.0],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+
+    let pre = storage
+        .vector_index_stats(index_id)
+        .expect("read stats")
+        .expect("hnsw index exists");
+    assert_eq!(pre.pq_subspaces, 0);
+    assert_eq!(pre.pq_centroids_per_subspace, 0);
+    assert!(!pre.codebook_ready);
+
+    storage
+        .reindex_vector_index(index_id)
+        .expect("reindex vector index");
+
+    let post = storage
+        .vector_index_stats(index_id)
+        .expect("read stats post-reindex")
+        .expect("hnsw index registered");
+    assert!(post.codebook_ready);
+    assert!(post.pq_subspaces >= 1, "PQ subspaces must be reported");
+    assert!(
+        post.pq_centroids_per_subspace >= 1,
+        "PQ centroids count must be reported"
+    );
+}
+
+#[test]
 fn list_vector_indexes_enumerates_registered_hnsw_indexes() {
     let storage = InMemoryStorage::new_without_wal();
     let table_a = RelationId::new(2301);
