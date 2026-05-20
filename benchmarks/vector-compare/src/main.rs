@@ -364,7 +364,7 @@ fn bench_aiondb_hnsw_raw(
             table_id,
             Some(HnswStorageOptions {
                 m: 16,
-                ef_construction: 200,
+                ef_construction: 100,
                 distance_metric: StoredVectorMetric::L2,
                 quantization: StoredQuantizationKind::None,
                 prenormalised: false,
@@ -407,7 +407,7 @@ fn bench_aiondb_hnsw_pq(
             table_id,
             Some(HnswStorageOptions {
                 m: 16,
-                ef_construction: 200,
+                ef_construction: 100,
                 distance_metric: StoredVectorMetric::L2,
                 quantization: StoredQuantizationKind::Product,
                 prenormalised: false,
@@ -561,7 +561,7 @@ mod pgvector {
         client
             .batch_execute(
                 "CREATE INDEX aiondb_vector_compare_hnsw_idx ON aiondb_vector_compare \
-                 USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 200)",
+                 USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 100)",
             )
             .await?;
         let build_ms = build_start.elapsed().as_millis();
