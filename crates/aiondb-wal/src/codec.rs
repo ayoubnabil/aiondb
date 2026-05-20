@@ -838,6 +838,16 @@ fn write_index_descriptor(w: &mut BinaryWriter, desc: &IndexStorageDescriptor) -
     }
     w.write_bool(desc.gin);
     w.write_bool(desc.nulls_not_distinct);
+    match &desc.ivf_flat_options {
+        None => w.write_u8(0),
+        Some(options) => {
+            // Tag 1: nlist (u32) + nprobe (u32) + distance metric (u8).
+            w.write_u8(1);
+            w.write_u32(options.nlist);
+            w.write_u32(options.nprobe);
+            w.write_u8(stored_metric_tag(options.distance_metric));
+        }
+    }
     Ok(())
 }
 
@@ -895,6 +905,31 @@ fn read_index_descriptor(r: &mut BinaryReader<'_>) -> DbResult<IndexStorageDescr
     } else {
         false
     };
+    // IVF-flat options were added in v0.3; older WAL entries do not
+    // carry the trailing tag so we fall back to `None`.
+    let ivf_flat_options = if r.remaining() > 0 {
+        let tag = r.read_u8()?;
+        match tag {
+            0 => None,
+            1 => {
+                let nlist = r.read_u32()?;
+                let nprobe = r.read_u32()?;
+                let distance_metric = read_stored_metric(r)?;
+                Some(aiondb_storage_api::IvfFlatStorageOptions {
+                    nlist,
+                    nprobe,
+                    distance_metric,
+                })
+            }
+            other => {
+                return Err(DbError::internal(format!(
+                    "WAL: unknown ivf_flat_options tag {other}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
     Ok(IndexStorageDescriptor {
         index_id,
         table_id,
@@ -904,11 +939,7 @@ fn read_index_descriptor(r: &mut BinaryReader<'_>) -> DbResult<IndexStorageDescr
         key_columns,
         include_columns,
         hnsw_options,
-        // IVF-flat descriptor encoding lives outside this codec for v0.3;
-        // legacy WAL records never carried it, so reconstruction always
-        // yields None. New IVF indexes only persist via the in-memory
-        // engine state until the WAL codec is extended.
-        ivf_flat_options: None,
+        ivf_flat_options,
     })
 }
 

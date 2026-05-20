@@ -686,6 +686,37 @@ fn round_trip_drop_index() {
 }
 
 #[test]
+fn round_trip_create_ivf_flat_index_preserves_options() {
+    let desc = aiondb_storage_api::IndexStorageDescriptor {
+        index_id: IndexId::new(42),
+        table_id: RelationId::new(7),
+        unique: false,
+        nulls_not_distinct: false,
+        gin: false,
+        key_columns: vec![IndexKeyColumn {
+            column_id: ColumnId::new(2),
+            descending: false,
+            nulls_first: false,
+        }],
+        include_columns: vec![],
+        hnsw_options: None,
+        ivf_flat_options: Some(aiondb_storage_api::IvfFlatStorageOptions {
+            nlist: 64,
+            nprobe: 4,
+            distance_metric: aiondb_storage_api::StoredVectorMetric::Cosine,
+        }),
+    };
+    let entry = make_entry(
+        710,
+        WalRecord::CreateIndex {
+            txn_id: TxnId::new(21),
+            descriptor: desc,
+        },
+    );
+    assert_eq!(round_trip(&entry), entry);
+}
+
+#[test]
 fn round_trip_alter_table() {
     let desc = TableStorageDescriptor {
         table_id: RelationId::new(100),

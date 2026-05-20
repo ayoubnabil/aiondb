@@ -2252,7 +2252,16 @@ pub(super) fn replay_record(
                         rows.push((tuple_id, row));
                     }
                 }
-                if is_vector_index(descriptor, &table_desc) {
+                if is_vector_index(descriptor, &table_desc)
+                    && descriptor.ivf_flat_options.is_some()
+                {
+                    let index_data = super::IvfFlatIndex::from_rows_with_options(
+                        descriptor,
+                        &table_desc,
+                        rows,
+                    )?;
+                    state.ivf_indexes.insert(descriptor.index_id, index_data);
+                } else if is_vector_index(descriptor, &table_desc) {
                     let index_data =
                         HnswIndex::from_rows_with_options(descriptor, &table_desc, rows)?;
                     state.hnsw_indexes.insert(descriptor.index_id, index_data);
@@ -2268,6 +2277,7 @@ pub(super) fn replay_record(
         WalRecord::DropIndex { index_id, .. } => {
             state.indexes.remove(index_id);
             state.hnsw_indexes.remove(index_id);
+            state.ivf_indexes.remove(index_id);
             state.gin_indexes.remove(index_id);
         }
         WalRecord::AlterTable { descriptor, .. } => {
