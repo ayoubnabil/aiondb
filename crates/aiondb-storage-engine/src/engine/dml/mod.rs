@@ -3519,6 +3519,41 @@ impl InMemoryStorage {
 
         let state = self.read_state()?;
 
+        // IVF-flat indexes have their own scan path. Dispatch before
+        // checking pending HNSW state because IVF builds are
+        // autocommit-only today.
+        if let Some(ivf) = state.ivf_indexes.get(&index_id) {
+            let nprobe_override = None;
+            let (mut tuple_ids, stats) = ivf.search(query, k.max(ef), nprobe_override)?;
+            if let Some(predicate) = tuple_id_filter {
+                tuple_ids.retain(|tid| predicate(*tid));
+            }
+            tuple_ids.truncate(k);
+            tracing::debug!(
+                index_id = index_id.get(),
+                lists_scanned = stats.lists_scanned,
+                distance_computations = stats.distance_computations,
+                duration_micros = stats.duration_micros,
+                "IVF-flat search completed"
+            );
+            let table_id = ivf.descriptor().table_id;
+            let records = self.fetch_records_by_tuple_ids(
+                &state,
+                txn,
+                snapshot,
+                table_id,
+                &tuple_ids,
+                Some(k),
+            )?;
+            // Honor any pending deadline / interrupt one last time on the
+            // way out so cancellation isn't swallowed by the IVF path.
+            if let Some(checker) = interrupt_checker {
+                checker()?;
+            }
+            let _ = max_search_duration; // currently unused on the IVF hot path
+            return Ok(Box::new(VecTupleStream::new(records)));
+        }
+
         if let Some(pending) = state.active_txns.get(&txn) {
             if pending.dropped_indexes.contains(&index_id) {
                 return Err(DbError::internal("index storage does not exist"));

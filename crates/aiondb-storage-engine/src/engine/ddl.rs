@@ -282,7 +282,40 @@ impl StorageDDL for InMemoryStorage {
             .clone();
         validate_index_descriptor(index, &table_descriptor)?;
 
-        if is_vector_index(index, &table_descriptor) {
+        if is_vector_index(index, &table_descriptor) && index.ivf_flat_options.is_some() {
+            // Build an IVF-flat index by collecting visible rows and
+            // training coarse centroids in one shot. Today only the
+            // autocommit path is supported; transactional IVF builds
+            // need pending_created_ivf_indexes plumbing that is left
+            // for a follow-up.
+            if !Self::is_autocommit_txn(txn) {
+                return Err(DbError::feature_not_supported(
+                    "CREATE INDEX with IVF_FLAT inside a transaction is not yet supported",
+                ));
+            }
+            let mut rows: Vec<(TupleId, aiondb_core::Row)> = Vec::new();
+            self.visit_visible_rows_for_index_build(
+                &state,
+                txn,
+                index.table_id,
+                |_table, tuple_id, row| {
+                    rows.push((tuple_id, row.clone()));
+                    Ok(())
+                },
+            )?;
+            let ivf = super::IvfFlatIndex::from_rows_with_options(
+                index,
+                &table_descriptor,
+                rows,
+            )?;
+            let durable_lsn = self.log_wal_autocommit(&[wal_record])?;
+            state.ivf_indexes.insert(index.index_id, ivf);
+            self.refresh_paged_state_after_commit(
+                &mut state,
+                durable_lsn,
+                Some(&[] as &[RelationId]),
+            );
+        } else if is_vector_index(index, &table_descriptor) {
             // Build an HNSW index, honoring catalog-provided options
             // (distance metric, quantization, m, ef_construction).
             let mut hnsw = HnswIndex::from_descriptor(index.clone());

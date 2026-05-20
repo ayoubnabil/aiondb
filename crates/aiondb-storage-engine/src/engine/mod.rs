@@ -578,6 +578,8 @@ pub(crate) struct StorageState {
     tables: BTreeMap<RelationId, TableData>,
     indexes: BTreeMap<IndexId, IndexData>,
     hnsw_indexes: BTreeMap<IndexId, HnswIndex>,
+    #[allow(dead_code)]
+    ivf_indexes: BTreeMap<IndexId, IvfFlatIndex>,
     gin_indexes: BTreeMap<IndexId, GinIndex>,
     active_txns: BTreeMap<TxnId, PendingTransaction>,
     overflow: OverflowStore,

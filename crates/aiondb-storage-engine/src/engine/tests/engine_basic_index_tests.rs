@@ -3316,6 +3316,113 @@ fn vector_index_stats_expose_pq_subspaces_and_centroids() {
     );
 }
 
+fn create_ivf_flat_index(
+    storage: &InMemoryStorage,
+    table_id: RelationId,
+    index_id: IndexId,
+    nlist: u32,
+    nprobe: u32,
+) {
+    let mut descriptor = test_index_descriptor(index_id, table_id);
+    descriptor.key_columns = vec![IndexKeyColumn {
+        column_id: ColumnId::new(2),
+        descending: false,
+        nulls_first: false,
+    }];
+    descriptor.ivf_flat_options = Some(aiondb_storage_api::IvfFlatStorageOptions {
+        nlist,
+        nprobe,
+        distance_metric: aiondb_storage_api::StoredVectorMetric::L2,
+    });
+    storage
+        .create_index_storage(TxnId::default(), &descriptor)
+        .expect("create ivf-flat index");
+}
+
+#[test]
+fn ivf_flat_index_through_ddl_returns_results_via_vector_search() {
+    use aiondb_storage_api::StorageDML;
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2601);
+    let index_id = IndexId::new(2602);
+    create_vector_payload_table(&storage, table_id);
+
+    let mut inserted: Vec<(i32, [f32; 3])> = Vec::new();
+    for i in 1..=24i32 {
+        let v = [i as f32, (i % 5) as f32, (i % 7) as f32];
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: v.to_vec(),
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+        inserted.push((i, v));
+    }
+
+    // Build the index after the table is populated so the IVF k-means
+    // training has samples to learn from.
+    create_ivf_flat_index(&storage, table_id, index_id, 4, 3);
+
+    let target = &inserted[0].1;
+    let snapshot = snapshot();
+    let stream = StorageDML::vector_search(
+        &storage,
+        TxnId::default(),
+        &snapshot,
+        index_id,
+        target,
+        3,
+        16,
+        None,
+        None,
+        None,
+    )
+    .expect("vector_search via storage_api");
+    let records = collect_stream(stream);
+    assert!(
+        !records.is_empty(),
+        "IVF-flat vector_search must return at least one hit"
+    );
+    let first_id = records
+        .first()
+        .and_then(|record| match record.row.values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            _ => None,
+        });
+    assert_eq!(first_id, Some(inserted[0].0));
+}
+
+#[test]
+fn ivf_flat_create_index_in_transaction_errors() {
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2603);
+    let index_id = IndexId::new(2604);
+    create_vector_payload_table(&storage, table_id);
+    let txn = TxnId::new(9311);
+    storage
+        .begin_txn(txn, IsolationLevel::ReadCommitted)
+        .expect("begin");
+    let mut descriptor = test_index_descriptor(index_id, table_id);
+    descriptor.key_columns = vec![IndexKeyColumn {
+        column_id: ColumnId::new(2),
+        descending: false,
+        nulls_first: false,
+    }];
+    descriptor.ivf_flat_options = Some(aiondb_storage_api::IvfFlatStorageOptions::default());
+    let err = storage
+        .create_index_storage(txn, &descriptor)
+        .expect_err("transactional IVF should error");
+    assert!(err.to_string().contains("IVF_FLAT"));
+    storage.rollback_txn(txn).expect("rollback");
+}
+
 #[test]
 fn list_vector_indexes_enumerates_registered_hnsw_indexes() {
     let storage = InMemoryStorage::new_without_wal();
