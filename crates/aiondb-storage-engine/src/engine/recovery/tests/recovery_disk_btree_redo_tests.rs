@@ -21,6 +21,7 @@ fn recover_replays_disk_btree_meta_update() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -93,6 +94,7 @@ fn recover_replays_disk_btree_leaf_insert() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -155,6 +157,7 @@ fn recover_replays_disk_btree_leaf_delete() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     let removed_entry = {
@@ -219,6 +222,7 @@ fn recover_replays_disk_btree_leaf_split() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {

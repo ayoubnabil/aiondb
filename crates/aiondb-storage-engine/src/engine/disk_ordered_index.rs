@@ -1359,6 +1359,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         (table, index)
     }
@@ -1390,6 +1391,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         (table, index)
     }
@@ -1421,6 +1423,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         (table, index)
     }
@@ -1765,6 +1768,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         let table = TableStorageDescriptor {
             table_id: aiondb_core::RelationId::new(2),
@@ -1805,6 +1809,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         let table = TableStorageDescriptor {
             table_id: aiondb_core::RelationId::new(1),
@@ -1874,6 +1879,7 @@ mod tests {
             ],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         let plan = lookup_plan(
             &descriptor,

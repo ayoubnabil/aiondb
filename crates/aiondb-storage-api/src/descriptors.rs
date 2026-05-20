@@ -137,6 +137,34 @@ impl Default for HnswStorageOptions {
     }
 }
 
+/// Storage-layer options for an IVF-flat vector index.
+///
+/// Inverted-File indexes partition the dataset into `nlist` coarse
+/// centroids learned via k-means at build time. Searches scan `nprobe`
+/// nearest lists with exact f32 distance, so recall is tunable via
+/// `nprobe` and memory cost is `nlist` centroid vectors plus the
+/// full corpus stored once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IvfFlatStorageOptions {
+    /// Number of coarse centroids (inverted lists). Higher = finer
+    /// partition + faster search per nprobe, but larger build cost.
+    pub nlist: u32,
+    /// Default number of lists to probe per search. Higher = better
+    /// recall, lower throughput. Tunable per-query via the search API.
+    pub nprobe: u32,
+    pub distance_metric: StoredVectorMetric,
+}
+
+impl Default for IvfFlatStorageOptions {
+    fn default() -> Self {
+        Self {
+            nlist: 64,
+            nprobe: 8,
+            distance_metric: StoredVectorMetric::L2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexStorageDescriptor {
     pub index_id: IndexId,
@@ -154,6 +182,9 @@ pub struct IndexStorageDescriptor {
     /// HNSW-specific storage options, populated when this descriptor
     /// references an HNSW vector index. `None` for non-vector indexes.
     pub hnsw_options: Option<HnswStorageOptions>,
+    /// IVF-flat options. Mutually exclusive with `hnsw_options`; when
+    /// both are `None` the descriptor targets a B-tree / GIN index.
+    pub ivf_flat_options: Option<IvfFlatStorageOptions>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

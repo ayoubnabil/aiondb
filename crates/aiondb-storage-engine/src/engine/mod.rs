@@ -10,6 +10,7 @@ mod gin;
 mod heap;
 mod helpers;
 mod hnsw;
+mod ivf_flat;
 mod index_ops;
 mod paged_snapshot;
 mod paged_tables;
@@ -66,6 +67,8 @@ use heap::overflow::OverflowStore;
 use heap::TableData;
 use hnsw::HnswIndex;
 pub use hnsw::{HnswIndexStats, HnswSearchStats, HnswSearchStatsSummary};
+#[allow(unused_imports)]
+pub use ivf_flat::{IvfFlatIndex, IvfFlatSearchStats};
 use paged_snapshot::PagedSnapshotStore;
 use paged_tables::PagedTableStore;
 use tracing::warn;

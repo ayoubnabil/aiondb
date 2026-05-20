@@ -41,6 +41,7 @@ fn test_index_descriptor(index_id: IndexId, table_id: RelationId) -> IndexStorag
         }],
         include_columns: Vec::new(),
         hnsw_options: None,
+            ivf_flat_options: None,
     }
 }
 

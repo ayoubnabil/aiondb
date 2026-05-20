@@ -60,6 +60,7 @@ fn make_index_desc() -> IndexStorageDescriptor {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     }
 }
 

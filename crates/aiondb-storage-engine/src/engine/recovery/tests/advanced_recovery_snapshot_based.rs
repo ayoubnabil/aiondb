@@ -244,6 +244,7 @@ fn recover_checkpoint_with_index_rebuild() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -323,6 +324,7 @@ fn recover_checkpoint_reuses_existing_disk_index_pages_when_snapshot_is_current(
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     let before_page_count = {
@@ -420,6 +422,7 @@ fn recover_checkpoint_replays_post_snapshot_disk_index_deltas_without_full_rebui
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     let open_no_commit_publish = |cfg: aiondb_wal::WalConfig| {

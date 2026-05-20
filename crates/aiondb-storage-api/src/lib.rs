@@ -8,9 +8,9 @@ pub mod txn;
 pub use capabilities::StorageCapabilities;
 pub use ddl::StorageDDL;
 pub use descriptors::{
-    Bound, HnswStorageOptions, IndexKeyColumn, IndexStorageDescriptor, KeyRange, ShardHashFunction,
-    StorageColumn, StorageShardConfig, StoredQuantizationKind, StoredVectorMetric,
-    TableStorageDescriptor, TupleRecord, MAX_STORAGE_HASH_RING_VIRTUAL_NODES,
+    Bound, HnswStorageOptions, IndexKeyColumn, IndexStorageDescriptor, IvfFlatStorageOptions,
+    KeyRange, ShardHashFunction, StorageColumn, StorageShardConfig, StoredQuantizationKind,
+    StoredVectorMetric, TableStorageDescriptor, TupleRecord, MAX_STORAGE_HASH_RING_VIRTUAL_NODES,
     MAX_STORAGE_SHARD_COUNT, MAX_STORAGE_VIRTUAL_NODES_PER_SHARD,
 };
 pub use dml::StorageDML;

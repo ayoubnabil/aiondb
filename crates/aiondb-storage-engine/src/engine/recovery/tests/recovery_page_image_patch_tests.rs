@@ -74,6 +74,7 @@ fn recover_replays_full_page_image_into_disk_index_pages() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -150,6 +151,7 @@ fn recover_replays_full_page_image_batch_into_disk_index_pages() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -232,6 +234,7 @@ fn recover_replays_page_patch_into_disk_index_pages() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -299,6 +302,7 @@ fn recover_replays_page_patch_batch_into_disk_index_pages() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -373,6 +377,7 @@ fn recover_replays_page_set_u64_batch_into_disk_index_pages() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {

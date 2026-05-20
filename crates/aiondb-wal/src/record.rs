@@ -1026,6 +1026,7 @@ mod tests {
                 key_columns: vec![],
                 include_columns: vec![],
                 hnsw_options: None,
+            ivf_flat_options: None,
             },
         };
         assert_eq!(r.tag(), 8);
@@ -1157,6 +1158,7 @@ mod tests {
                 key_columns: vec![],
                 include_columns: vec![],
                 hnsw_options: None,
+            ivf_flat_options: None,
             },
         };
         assert_eq!(r.txn_id(), Some(txn(12)));

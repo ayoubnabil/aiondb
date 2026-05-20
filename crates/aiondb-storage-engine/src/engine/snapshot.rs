@@ -680,6 +680,7 @@ mod tests {
             }],
             include_columns: vec![],
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         let index = IndexData::new(idx_desc);
         state.indexes.insert(IndexId::new(1), index);

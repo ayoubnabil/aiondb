@@ -121,6 +121,7 @@ fn test_gin_text_index_descriptor(
         }],
         include_columns: Vec::new(),
         hnsw_options: None,
+            ivf_flat_options: None,
     }
 }
 

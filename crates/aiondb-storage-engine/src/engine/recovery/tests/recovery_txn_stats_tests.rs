@@ -574,6 +574,7 @@ fn recover_prunes_stale_btree_key_after_update_replay() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {
@@ -645,6 +646,7 @@ fn recover_prunes_stale_btree_key_after_delete_replay() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
 
     {

@@ -1631,6 +1631,7 @@ mod tests {
             }],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         }
     }
 
@@ -1675,6 +1676,7 @@ mod tests {
             ],
             include_columns: Vec::new(),
             hnsw_options: None,
+            ivf_flat_options: None,
         }
     }
 

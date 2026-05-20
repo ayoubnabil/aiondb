@@ -178,6 +178,7 @@ fn recover_index_rebuild() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
     write_wal(
         &dir,
@@ -361,6 +362,7 @@ fn recover_rebuilds_hnsw_indexes() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
     write_wal(
         &dir,
@@ -436,6 +438,7 @@ fn recover_rebuilds_gin_indexes() {
         }],
         include_columns: vec![],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
     write_wal(
         &dir,

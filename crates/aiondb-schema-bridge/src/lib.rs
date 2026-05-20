@@ -120,6 +120,7 @@ pub fn to_index_storage_descriptor(index: &IndexDescriptor) -> DbResult<IndexSto
             .collect(),
         include_columns: index.include_columns.clone(),
         hnsw_options: to_hnsw_storage_options(index)?,
+        ivf_flat_options: None,
     })
 }
 
@@ -775,6 +776,7 @@ mod tests {
             ],
             include_columns: vec![ColumnId::new(5)],
             hnsw_options: None,
+            ivf_flat_options: None,
         };
         assert_eq!(result, expected);
     }

@@ -661,6 +661,7 @@ fn round_trip_create_index() {
         ],
         include_columns: vec![ColumnId::new(3), ColumnId::new(4)],
         hnsw_options: None,
+            ivf_flat_options: None,
     };
     let entry = make_entry(
         600,

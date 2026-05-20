@@ -904,6 +904,11 @@ fn read_index_descriptor(r: &mut BinaryReader<'_>) -> DbResult<IndexStorageDescr
         key_columns,
         include_columns,
         hnsw_options,
+        // IVF-flat descriptor encoding lives outside this codec for v0.3;
+        // legacy WAL records never carried it, so reconstruction always
+        // yields None. New IVF indexes only persist via the in-memory
+        // engine state until the WAL codec is extended.
+        ivf_flat_options: None,
     })
 }
 
