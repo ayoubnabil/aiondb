@@ -1246,10 +1246,22 @@ impl HnswIndex {
             } else {
                 self.params.m
             };
-            let selected =
+            // Diversification matters most on upper layers where the
+            // graph carries the long-range "highway" edges that drive
+            // navigability. Layer 0 already holds the bulk of nodes;
+            // simple top-M selection there keeps the dense local
+            // neighborhood that lets greedy descent converge quickly.
+            let selected = if lc == 0 {
+                candidates
+                    .iter()
+                    .take(max_connections)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
                 search::select_neighbors_heuristic(&candidates, max_connections, |a, b| {
                     self.pair_distance(a, b)
-                });
+                })
+            };
             for &(neighbor_id, _) in &selected {
                 if neighbor_id == tuple_id {
                     continue;
@@ -1318,10 +1330,17 @@ impl HnswIndex {
             } else {
                 self.params.m
             };
-            let selected =
+            let selected = if lc == 0 {
+                candidates
+                    .iter()
+                    .take(max_connections)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
                 search::select_neighbors_heuristic(candidates, max_connections, |a, b| {
                     self.pair_distance(a, b)
-                });
+                })
+            };
             for &(neighbor_id, _) in &selected {
                 if neighbor_id == tid {
                     continue;
@@ -1436,11 +1455,18 @@ impl HnswIndex {
                 self.params.m
             };
 
-            // Select M closest neighbors from candidates.
-            let selected =
+            // Diversify only on upper layers; layer 0 keeps simple top-M.
+            let selected = if lc == 0 {
+                candidates
+                    .iter()
+                    .take(max_connections)
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
                 search::select_neighbors_heuristic(&candidates, max_connections, |a, b| {
                     self.pair_distance(a, b)
-                });
+                })
+            };
 
             // Connect tuple_id -> selected neighbors.
             for &(neighbor_id, _) in &selected {
