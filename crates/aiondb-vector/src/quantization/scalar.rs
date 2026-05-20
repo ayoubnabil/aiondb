@@ -39,6 +39,85 @@ impl ScalarQuantizer {
     /// - Empty samples list.
     /// - Samples with inconsistent dims.
     /// - Any sample containing a non-finite component.
+    /// Train from already-borrowed slices. Avoids the per-sample clone
+    /// that [`train`] would force when the caller already holds an
+    /// `&[(_, Vec<f32>)]` (or similar) and wants to feed the vectors
+    /// in without materialising a fresh `Vec<Vec<f32>>`.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`train`].
+    #[must_use = "a trained quantizer should be retained for subsequent encoding"]
+    pub fn train_from_slices(samples: &[&[f32]]) -> DbResult<Self> {
+        if samples.is_empty() {
+            return Err(DbError::internal(
+                "SQ: training requires at least one sample",
+            ));
+        }
+        let dims = samples[0].len();
+        if dims == 0 {
+            return Err(DbError::internal(
+                "SQ: training samples must have dims >= 1",
+            ));
+        }
+        samples
+            .par_iter()
+            .with_min_len(256)
+            .enumerate()
+            .try_for_each(|(idx, sample)| -> DbResult<()> {
+                if sample.len() != dims {
+                    return Err(DbError::internal(format!(
+                        "SQ: sample {idx} has dims {} but expected {dims}",
+                        sample.len()
+                    )));
+                }
+                for (d, v) in sample.iter().enumerate() {
+                    if !v.is_finite() {
+                        return Err(DbError::internal(format!(
+                            "SQ: sample {idx} dim {d} is not finite"
+                        )));
+                    }
+                }
+                Ok(())
+            })?;
+        let (mins, maxs) = samples
+            .par_iter()
+            .with_min_len(256)
+            .fold(
+                || (vec![f32::INFINITY; dims], vec![f32::NEG_INFINITY; dims]),
+                |(mut mins, mut maxs), sample| {
+                    for ((min_d, max_d), v) in
+                        mins.iter_mut().zip(maxs.iter_mut()).zip(sample.iter())
+                    {
+                        if *v < *min_d {
+                            *min_d = *v;
+                        }
+                        if *v > *max_d {
+                            *max_d = *v;
+                        }
+                    }
+                    (mins, maxs)
+                },
+            )
+            .reduce(
+                || (vec![f32::INFINITY; dims], vec![f32::NEG_INFINITY; dims]),
+                |(mut amins, mut amaxs), (bmins, bmaxs)| {
+                    for (a, b) in amins.iter_mut().zip(bmins.iter()) {
+                        if *b < *a {
+                            *a = *b;
+                        }
+                    }
+                    for (a, b) in amaxs.iter_mut().zip(bmaxs.iter()) {
+                        if *b > *a {
+                            *a = *b;
+                        }
+                    }
+                    (amins, amaxs)
+                },
+            );
+        Ok(Self { dims, mins, maxs })
+    }
+
     #[must_use = "a trained quantizer should be retained for subsequent encoding"]
     pub fn train(samples: &[Vec<f32>]) -> DbResult<Self> {
         if samples.is_empty() {

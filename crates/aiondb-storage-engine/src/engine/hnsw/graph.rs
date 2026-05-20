@@ -868,8 +868,12 @@ impl HnswIndex {
                 self.binary_quantizer = Some(BinaryQuantizer::new_checked(first.len())?);
             }
             StoredQuantizationKind::Scalar if self.scalar_quantizer.is_none() => {
-                let samples: Vec<Vec<f32>> = entries.iter().map(|(_, vec)| vec.clone()).collect();
-                self.scalar_quantizer = Some(ScalarQuantizer::train(&samples)?);
+                // Borrow the vectors instead of cloning. SQ training only
+                // reads per-dimension min/max so it never needs an owned
+                // copy of the corpus.
+                let sample_slices: Vec<&[f32]> =
+                    entries.iter().map(|(_, vec)| vec.as_slice()).collect();
+                self.scalar_quantizer = Some(ScalarQuantizer::train_from_slices(&sample_slices)?);
             }
             StoredQuantizationKind::Product if self.product_quantizer.is_none() => {
                 let dims = first.len();
@@ -1900,7 +1904,7 @@ impl HnswIndex {
     fn rescore_plan(&self) -> (usize, bool) {
         match self.quantization {
             StoredQuantizationKind::Scalar => (3, true),
-            StoredQuantizationKind::Product => (5, true),
+            StoredQuantizationKind::Product => (12, true),
             StoredQuantizationKind::Binary | StoredQuantizationKind::None => (1, false),
         }
     }
@@ -1913,11 +1917,11 @@ impl HnswIndex {
         let nodes = self.nodes.len();
         let mut floor = requested.max(k);
         if nodes >= 10_000 {
-            floor = floor.max(self.params.m_max0.saturating_mul(8));
-            floor = floor.max(k.saturating_mul(16));
+            floor = floor.max(self.params.m_max0.saturating_mul(4));
+            floor = floor.max(k.saturating_mul(8));
         }
         if nodes >= 100_000 {
-            floor = floor.max(self.params.m_max0.saturating_mul(16));
+            floor = floor.max(self.params.m_max0.saturating_mul(8));
         }
         requested.max(floor.min(search::HNSW_MAX_EF_SEARCH))
     }
