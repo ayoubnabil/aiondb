@@ -1,11 +1,11 @@
 #![allow(clippy::doc_markdown)]
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 #[cfg(test)]
 use std::collections::BTreeSet;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
 use aiondb_core::{DbError, DbResult, TupleId, HNSW_MAX_EF_SEARCH as CORE_HNSW_MAX_EF_SEARCH};
@@ -174,7 +174,8 @@ pub(crate) fn search_layer_interruptible_gpu(
     let ep_dist = probe.evaluate(ep_node);
     *distance_computations += 1;
 
-    let mut visited = HashSet::with_capacity(effective_ef.min(4_096));
+    let mut visited: FxHashSet<TupleId> =
+        FxHashSet::with_capacity_and_hasher(effective_ef.min(4_096), Default::default());
     visited.insert(ep);
 
     // candidates: min-heap of nodes to explore (negate distance for min behavior)
