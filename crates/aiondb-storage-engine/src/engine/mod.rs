@@ -3088,6 +3088,21 @@ impl InMemoryStorage {
             .map(|index| index.index_stats()))
     }
 
+    /// Enumerate all currently registered HNSW vector indexes and return
+    /// their `(IndexId, RelationId, HnswIndexStats)` triples. Order is the
+    /// internal `BTreeMap` order so callers get a deterministic listing
+    /// suitable for dashboards.
+    pub fn list_vector_indexes(&self) -> DbResult<Vec<(IndexId, RelationId, HnswIndexStats)>> {
+        let state = self.read_state()?;
+        Ok(state
+            .hnsw_indexes
+            .iter()
+            .map(|(index_id, index)| {
+                (*index_id, index.descriptor.table_id, index.index_stats())
+            })
+            .collect())
+    }
+
     /// Look up edge tuple IDs adjacent to the given node.
     ///
     /// When `outgoing` is `true`, returns edges whose source equals `node_id`.

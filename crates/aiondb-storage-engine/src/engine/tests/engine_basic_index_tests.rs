@@ -3263,6 +3263,48 @@ fn reindex_vector_index_storage_trait_dispatch_works_in_autocommit() {
 }
 
 #[test]
+fn list_vector_indexes_enumerates_registered_hnsw_indexes() {
+    let storage = InMemoryStorage::new_without_wal();
+    let table_a = RelationId::new(2301);
+    let table_b = RelationId::new(2302);
+    let index_a = IndexId::new(2401);
+    let index_b = IndexId::new(2402);
+    create_vector_payload_table(&storage, table_a);
+    create_vector_payload_table(&storage, table_b);
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_a,
+        index_a,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_b,
+        index_b,
+        aiondb_storage_api::StoredQuantizationKind::Product,
+    );
+
+    let listed = storage.list_vector_indexes().expect("list vector indexes");
+    let by_id: std::collections::BTreeMap<_, _> = listed
+        .into_iter()
+        .map(|(idx, tbl, stats)| (idx, (tbl, stats)))
+        .collect();
+    assert_eq!(by_id.len(), 2);
+    let (tbl_a, stats_a) = by_id.get(&index_a).expect("index A listed");
+    assert_eq!(*tbl_a, table_a);
+    assert_eq!(
+        stats_a.quantization,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+    let (tbl_b, stats_b) = by_id.get(&index_b).expect("index B listed");
+    assert_eq!(*tbl_b, table_b);
+    assert_eq!(
+        stats_b.quantization,
+        aiondb_storage_api::StoredQuantizationKind::Product,
+    );
+}
+
+#[test]
 fn reindex_vector_index_storage_rejects_in_transaction() {
     use aiondb_storage_api::StorageDDL;
     let storage = InMemoryStorage::new_without_wal();
