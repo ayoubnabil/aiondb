@@ -3217,3 +3217,71 @@ fn reindex_vector_index_errors_for_unknown_index() {
         .expect_err("missing index must surface an error");
     assert!(err.to_string().contains("REINDEX VECTOR"));
 }
+
+#[test]
+fn reindex_vector_index_storage_trait_dispatch_works_in_autocommit() {
+    use aiondb_storage_api::StorageDDL;
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2201);
+    let index_id = IndexId::new(2202);
+    create_vector_payload_table(&storage, table_id);
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_id,
+        index_id,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+
+    for i in 1..=8i32 {
+        let v = i as f32;
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![v, v + 1.0, v + 2.0],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+
+    let ddl: &dyn StorageDDL = &storage;
+    ddl.reindex_vector_index_storage(TxnId::default(), index_id)
+        .expect("REINDEX VECTOR via StorageDDL trait");
+    let stats = storage
+        .vector_index_stats(index_id)
+        .expect("read stats")
+        .expect("hnsw index registered");
+    assert!(
+        stats.codebook_ready,
+        "trait-dispatched REINDEX must train the SQ codebook"
+    );
+}
+
+#[test]
+fn reindex_vector_index_storage_rejects_in_transaction() {
+    use aiondb_storage_api::StorageDDL;
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2203);
+    let index_id = IndexId::new(2204);
+    create_vector_payload_table(&storage, table_id);
+    create_hnsw_index_with_quantization(
+        &storage,
+        table_id,
+        index_id,
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+    );
+    let txn = TxnId::new(9099);
+    storage
+        .begin_txn(txn, IsolationLevel::ReadCommitted)
+        .expect("begin txn");
+    let err = (&storage as &dyn StorageDDL)
+        .reindex_vector_index_storage(txn, index_id)
+        .expect_err("REINDEX VECTOR inside txn should error");
+    assert!(err.to_string().contains("transaction"));
+    storage.rollback_txn(txn).expect("rollback");
+}

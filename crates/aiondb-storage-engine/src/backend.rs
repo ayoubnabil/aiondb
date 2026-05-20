@@ -900,6 +900,10 @@ impl StorageDDL for StorageBackendHandle {
     fn drop_index_storage(&self, txn: TxnId, index_id: IndexId) -> DbResult<()> {
         self.inner().drop_index_storage(txn, index_id)
     }
+
+    fn reindex_vector_index_storage(&self, txn: TxnId, index_id: IndexId) -> DbResult<()> {
+        self.inner().reindex_vector_index_storage(txn, index_id)
+    }
 }
 
 impl StorageDML for StorageBackendHandle {

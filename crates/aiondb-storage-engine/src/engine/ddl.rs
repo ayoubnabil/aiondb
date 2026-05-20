@@ -596,6 +596,18 @@ impl StorageDDL for InMemoryStorage {
         }
         Ok(())
     }
+
+    fn reindex_vector_index_storage(&self, txn: TxnId, index_id: IndexId) -> DbResult<()> {
+        // Only the autocommit path is supported today; an active transaction
+        // would need to stage the rebuilt index alongside other pending
+        // index work, which is left for a future pass.
+        if !Self::is_autocommit_txn(txn) {
+            return Err(DbError::feature_not_supported(
+                "REINDEX VECTOR inside a transaction is not yet supported",
+            ));
+        }
+        self.reindex_vector_index(index_id)
+    }
 }
 
 impl InMemoryStorage {
