@@ -12,4 +12,5 @@
 mod index;
 
 pub use index::IvfFlatIndex;
+pub use index::IvfFlatIndexStats;
 pub use index::IvfFlatSearchStats;

@@ -68,7 +68,7 @@ use heap::TableData;
 use hnsw::HnswIndex;
 pub use hnsw::{HnswIndexStats, HnswSearchStats, HnswSearchStatsSummary};
 #[allow(unused_imports)]
-pub use ivf_flat::{IvfFlatIndex, IvfFlatSearchStats};
+pub use ivf_flat::{IvfFlatIndex, IvfFlatIndexStats, IvfFlatSearchStats};
 use paged_snapshot::PagedSnapshotStore;
 use paged_tables::PagedTableStore;
 use tracing::warn;
@@ -3091,6 +3091,39 @@ impl InMemoryStorage {
             .hnsw_indexes
             .get(&index_id)
             .map(|index| index.index_stats()))
+    }
+
+    /// Return per-index metrics for an IVF-flat vector index, or `None`
+    /// when no such index is registered.
+    pub fn ivf_flat_index_stats(
+        &self,
+        index_id: IndexId,
+    ) -> DbResult<Option<IvfFlatIndexStats>> {
+        let state = self.read_state()?;
+        Ok(state
+            .ivf_indexes
+            .get(&index_id)
+            .map(|index| index.index_stats()))
+    }
+
+    /// Enumerate all registered IVF-flat vector indexes and return their
+    /// `(IndexId, RelationId, IvfFlatIndexStats)` triples in `BTreeMap`
+    /// order.
+    pub fn list_ivf_flat_indexes(
+        &self,
+    ) -> DbResult<Vec<(IndexId, RelationId, IvfFlatIndexStats)>> {
+        let state = self.read_state()?;
+        Ok(state
+            .ivf_indexes
+            .iter()
+            .map(|(index_id, index)| {
+                (
+                    *index_id,
+                    index.descriptor().table_id,
+                    index.index_stats(),
+                )
+            })
+            .collect())
     }
 
     /// Enumerate all currently registered HNSW vector indexes and return

@@ -110,6 +110,61 @@ pub struct IvfFlatSearchStats {
     pub duration_micros: u64,
 }
 
+impl std::fmt::Display for IvfFlatSearchStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IVF-flat search: centroids={}, lists={}, distances={}, duration_us={}",
+            self.centroids_evaluated,
+            self.lists_scanned,
+            self.distance_computations,
+            self.duration_micros,
+        )
+    }
+}
+
+/// Index-level metrics for an IVF-flat index.
+#[derive(Clone, Debug, Default)]
+pub struct IvfFlatIndexStats {
+    /// Number of vectors currently indexed across all inverted lists.
+    pub total_vectors: u64,
+    /// Number of trained coarse centroids.
+    pub centroid_count: u32,
+    /// Configured number of lists to probe per search by default.
+    pub default_nprobe: u32,
+    /// Mean list size (`total_vectors / max(1, centroid_count)`).
+    pub avg_list_size: u64,
+    /// Largest single list size; useful for spotting skew.
+    pub max_list_size: u64,
+    /// Cumulative number of searches executed on this index.
+    pub total_searches: u64,
+    /// Cumulative count of inverted lists scanned across all searches.
+    pub total_lists_scanned: u64,
+    /// Cumulative distance computations across all searches.
+    pub total_distance_computations: u64,
+    /// Cumulative search wall time in microseconds.
+    pub total_duration_micros: u64,
+    /// Whether the codebook is trained and the index is searchable.
+    pub trained: bool,
+}
+
+impl std::fmt::Display for IvfFlatIndexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IVF-flat index: vectors={}, centroids={}, default_nprobe={}, \
+             avg_list={}, max_list={}, searches={}, trained={}",
+            self.total_vectors,
+            self.centroid_count,
+            self.default_nprobe,
+            self.avg_list_size,
+            self.max_list_size,
+            self.total_searches,
+            self.trained,
+        )
+    }
+}
+
 impl IvfFlatIndex {
     /// Borrow the descriptor this index was created from.
     pub fn descriptor(&self) -> &IndexStorageDescriptor {
@@ -336,6 +391,38 @@ impl IvfFlatIndex {
         stats.duration_micros = elapsed_micros(start);
         self.accumulate_search_stats(&stats);
         Ok((ids, stats))
+    }
+
+    /// Return per-index metrics suitable for dashboards.
+    pub fn index_stats(&self) -> IvfFlatIndexStats {
+        let centroid_count = u32::try_from(self.centroids.len()).unwrap_or(u32::MAX);
+        let total_vectors = usize_to_u64_saturating(self.tuple_index.len());
+        let max_list_size = self
+            .lists
+            .iter()
+            .map(|list| list.len())
+            .max()
+            .map(usize_to_u64_saturating)
+            .unwrap_or(0);
+        let avg_list_size = if self.centroids.is_empty() {
+            0
+        } else {
+            total_vectors / usize_to_u64_saturating(self.centroids.len()).max(1)
+        };
+        IvfFlatIndexStats {
+            total_vectors,
+            centroid_count,
+            default_nprobe: self.options.nprobe,
+            avg_list_size,
+            max_list_size,
+            total_searches: self.stat_total_searches.load(Ordering::Relaxed),
+            total_lists_scanned: self.stat_total_lists_scanned.load(Ordering::Relaxed),
+            total_distance_computations: self
+                .stat_total_distance_computations
+                .load(Ordering::Relaxed),
+            total_duration_micros: self.stat_total_duration_micros.load(Ordering::Relaxed),
+            trained: !self.centroids.is_empty(),
+        }
     }
 
     /// Return cumulative search statistics.

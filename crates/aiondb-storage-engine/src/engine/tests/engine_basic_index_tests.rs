@@ -3400,6 +3400,48 @@ fn ivf_flat_index_through_ddl_returns_results_via_vector_search() {
 }
 
 #[test]
+fn ivf_flat_index_stats_expose_centroid_shape() {
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2701);
+    let index_id = IndexId::new(2702);
+    create_vector_payload_table(&storage, table_id);
+    for i in 1..=16i32 {
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![i as f32, (i % 4) as f32, (i % 5) as f32],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+    create_ivf_flat_index(&storage, table_id, index_id, 4, 2);
+    let stats = storage
+        .ivf_flat_index_stats(index_id)
+        .expect("stats")
+        .expect("ivf index exists");
+    assert!(stats.trained, "IVF should be trained after CREATE INDEX");
+    assert_eq!(stats.total_vectors, 16);
+    assert!(stats.centroid_count <= 4);
+    assert!(stats.max_list_size <= stats.total_vectors);
+    assert_eq!(stats.default_nprobe, 2);
+
+    let listed = storage
+        .list_ivf_flat_indexes()
+        .expect("list ivf indexes");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, index_id);
+    assert_eq!(listed[0].1, table_id);
+    let rendered = listed[0].2.to_string();
+    assert!(rendered.contains("IVF-flat index"));
+}
+
+#[test]
 fn ivf_flat_create_index_in_transaction_errors() {
     let storage = InMemoryStorage::new_without_wal();
     let table_id = RelationId::new(2603);
