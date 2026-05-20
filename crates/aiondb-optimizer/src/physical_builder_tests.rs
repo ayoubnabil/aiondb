@@ -573,6 +573,78 @@ fn estimate_rows_for_vector_top_k_ids_uses_k_literal() {
     assert_eq!(estimate_plan_rows(&plan), 7.0);
 }
 
+fn vector_top_k_hits_plan(k: i32, options: Option<serde_json::Value>) -> PhysicalPlan {
+    let mut args = vec![
+        TypedExpr::literal(Value::Text("docs".to_owned()), DataType::Text, false),
+        TypedExpr::literal(Value::Text("embedding".to_owned()), DataType::Text, false),
+        TypedExpr::literal(Value::Text("[1.0,0.0]".to_owned()), DataType::Text, false),
+        TypedExpr::literal(Value::Int(k), DataType::Int, false),
+        TypedExpr::literal(Value::Null, DataType::Text, true),
+        TypedExpr::literal(Value::Null, DataType::Int, true),
+        TypedExpr::literal(Value::Null, DataType::Double, true),
+        TypedExpr::literal(Value::Null, DataType::Boolean, true),
+        TypedExpr::literal(Value::Null, DataType::Double, true),
+    ];
+    if let Some(options) = options {
+        args.push(TypedExpr::literal(
+            Value::Jsonb(options),
+            DataType::Jsonb,
+            false,
+        ));
+    }
+    PhysicalPlan::HybridFunctionScan {
+        function_name: "vector_top_k_hits".to_owned(),
+        args,
+        output_fields: vec![ResultField {
+            name: "doc_id".to_owned(),
+            data_type: DataType::BigInt,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    }
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_subtracts_options_offset() {
+    let plan = vector_top_k_hits_plan(20, Some(serde_json::json!({"offset": 5})));
+    assert_eq!(estimate_plan_rows(&plan), 15.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_discounts_payload_filter() {
+    let options = serde_json::json!({"filter": {"must": [{"key": "kind", "match": "doc"}]}});
+    let plan = vector_top_k_hits_plan(20, Some(options));
+    // 20 * 0.5 (filter discount) = 10.0
+    assert_eq!(estimate_plan_rows(&plan), 10.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_discounts_score_threshold() {
+    let options = serde_json::json!({"score_threshold": 0.8});
+    let plan = vector_top_k_hits_plan(20, Some(options));
+    // 20 * 0.5 (threshold discount) = 10.0
+    assert_eq!(estimate_plan_rows(&plan), 10.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_combines_offset_filter_and_threshold() {
+    let options = serde_json::json!({
+        "offset": 4,
+        "filter": {"must": [{"key": "kind", "match": "doc"}]},
+        "distance_threshold": 0.4,
+    });
+    let plan = vector_top_k_hits_plan(20, Some(options));
+    // (20 - 4) * 0.5 (filter) * 0.5 (threshold) = 4.0
+    assert_eq!(estimate_plan_rows(&plan), 4.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_clamps_at_one() {
+    let options = serde_json::json!({"offset": 100});
+    let plan = vector_top_k_hits_plan(20, Some(options));
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
 #[test]
 fn estimate_rows_for_graph_neighbors_uses_small_default() {
     let plan = PhysicalPlan::HybridFunctionScan {

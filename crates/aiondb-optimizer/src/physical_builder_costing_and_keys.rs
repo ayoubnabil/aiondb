@@ -286,17 +286,151 @@ fn estimate_join_rows(
     }
 }
 
+/// Argument layout of a `vector_top_k_*` family special function, used to
+/// drive the row estimator without baking ad-hoc index constants into each
+/// call site.
+#[derive(Clone, Copy)]
+struct VectorTopKLayout {
+    /// Index of the `k` literal argument.
+    k_idx: usize,
+    /// Index of the `distance_threshold` argument, when present in this
+    /// function family.
+    distance_threshold_idx: Option<usize>,
+    /// Index of the `score_threshold` argument, when present in this
+    /// function family.
+    score_threshold_idx: Option<usize>,
+    /// Index of the trailing `options` JSON / JSONB argument, when present.
+    options_idx: Option<usize>,
+}
+
+impl VectorTopKLayout {
+    const STANDARD: Self = Self {
+        k_idx: 3,
+        distance_threshold_idx: Some(6),
+        score_threshold_idx: Some(8),
+        options_idx: Some(9),
+    };
+    const PREFETCH: Self = Self {
+        k_idx: 4,
+        distance_threshold_idx: None,
+        score_threshold_idx: None,
+        options_idx: None,
+    };
+    const RECOMMEND: Self = Self {
+        k_idx: 4,
+        distance_threshold_idx: None,
+        score_threshold_idx: None,
+        options_idx: None,
+    };
+}
+
+#[derive(Default)]
+struct VectorTopKOptionHints {
+    offset: u64,
+    has_filter: bool,
+    has_threshold: bool,
+}
+
+fn vector_top_k_option_hints(expr: &TypedExpr) -> VectorTopKOptionHints {
+    let TypedExprKind::Literal(value) = &expr.kind else {
+        return VectorTopKOptionHints::default();
+    };
+    match value {
+        Value::Jsonb(json) => json
+            .as_object()
+            .map(hints_from_object)
+            .unwrap_or_default(),
+        Value::Text(text) => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .as_ref()
+            .and_then(|json| json.as_object())
+            .map(hints_from_object)
+            .unwrap_or_default(),
+        _ => VectorTopKOptionHints::default(),
+    }
+}
+
+fn hints_from_object(object: &serde_json::Map<String, serde_json::Value>) -> VectorTopKOptionHints {
+    let mut hints = VectorTopKOptionHints::default();
+    for (raw_key, raw_value) in object {
+        match raw_key.to_ascii_lowercase().as_str() {
+            "offset" => {
+                if let Some(offset) = raw_value.as_u64() {
+                    hints.offset = offset;
+                } else if let Some(offset) = raw_value.as_i64() {
+                    hints.offset = u64::try_from(offset.max(0)).unwrap_or(0);
+                }
+            }
+            "filter" => {
+                if !raw_value.is_null() {
+                    hints.has_filter = true;
+                }
+            }
+            "distance_threshold" | "score_threshold" => {
+                if !raw_value.is_null() {
+                    hints.has_threshold = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    hints
+}
+
+/// Estimate the row count for a `vector_top_k_*` special function.
+///
+/// Without table statistics we cannot compute the true intersection of the
+/// vector top-K cap and the payload filter selectivity, but we can still
+/// fold in: the literal `k`, the offset slice consumed before output, an
+/// explicit distance / score threshold, and whether a payload filter is
+/// present. Each restrictive option scales the estimate down so downstream
+/// join planning sees a tighter cardinality.
+fn estimate_vector_top_k_rows(args: &[TypedExpr], layout: VectorTopKLayout) -> f64 {
+    let k = args.get(layout.k_idx).and_then(literal_row_count_hint).unwrap_or(10.0);
+    let threshold_in_args = [layout.distance_threshold_idx, layout.score_threshold_idx]
+        .into_iter()
+        .flatten()
+        .any(|idx| {
+            args.get(idx).is_some_and(|arg| {
+                !matches!(&arg.kind, TypedExprKind::Literal(Value::Null))
+                    && !matches!(&arg.kind, TypedExprKind::Literal(Value::Boolean(_)))
+            })
+        });
+    let hints = layout
+        .options_idx
+        .and_then(|idx| args.get(idx))
+        .map(vector_top_k_option_hints)
+        .unwrap_or_default();
+    let base = (k - u64_to_f64_saturating(hints.offset)).max(1.0);
+    // Payload filter or explicit threshold prunes some candidates. Without
+    // catalog statistics we apply a conservative 0.5 default per hint, so
+    // the join planner sees a tighter cardinality without underestimating
+    // by more than an order of magnitude.
+    let filter_multiplier = if hints.has_filter { 0.5 } else { 1.0 };
+    let threshold_multiplier =
+        if hints.has_threshold || threshold_in_args { 0.5 } else { 1.0 };
+    (base * filter_multiplier * threshold_multiplier).max(1.0)
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    if value > (i64::MAX as u64) {
+        i64::MAX as f64
+    } else {
+        i64_to_f64(value as i64)
+    }
+}
+
 pub(super) fn estimate_hybrid_function_rows(function_name: &str, args: &[TypedExpr]) -> f64 {
     if function_name.eq_ignore_ascii_case("vector_top_k_ids")
         || function_name.eq_ignore_ascii_case("vector_top_k_hits")
     {
-        return args.get(3).and_then(literal_row_count_hint).unwrap_or(10.0);
+        return estimate_vector_top_k_rows(args, VectorTopKLayout::STANDARD);
     }
     if function_name.eq_ignore_ascii_case("vector_prefetch_top_k_hits") {
-        return args.get(4).and_then(literal_row_count_hint).unwrap_or(10.0);
+        return estimate_vector_top_k_rows(args, VectorTopKLayout::PREFETCH);
     }
     if function_name.eq_ignore_ascii_case("vector_recommend_top_k_hits") {
-        return args.get(4).and_then(literal_row_count_hint).unwrap_or(10.0);
+        return estimate_vector_top_k_rows(args, VectorTopKLayout::RECOMMEND);
     }
     if function_name.eq_ignore_ascii_case("full_text_top_k_hits") {
         return args.get(3).and_then(literal_row_count_hint).unwrap_or(10.0);
