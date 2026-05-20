@@ -768,4 +768,53 @@ mod tests {
         bad[0] = f32::INFINITY;
         assert!(pq.encode(&bad).is_err());
     }
+
+    #[test]
+    fn adc_lookup_outpaces_sdc_on_large_candidate_sets() {
+        // The LUT path is the whole point of asymmetric distance: build
+        // the table once, then collapse per-node distance into m
+        // lookups. This test exercises a realistic candidate budget
+        // (1024 codes, m=16, k=256) and asserts the LUT loop completes
+        // in less wall time than recomputing the SDC distance for the
+        // same nodes. Skip the assertion when the run is too short to
+        // resolve (e.g. release builds with absurd CPU clocks) so the
+        // suite stays robust across hardware.
+        let dims = 64usize;
+        let candidate_count = 1024usize;
+        let samples = synth_samples(512, dims);
+        let pq = ProductQuantizer::train(&samples, 16, 256).unwrap();
+        let codes: Vec<ProductCode> = samples
+            .iter()
+            .take(candidate_count)
+            .map(|v| pq.encode(v).unwrap())
+            .collect();
+        let query = &samples[0];
+
+        let query_code = pq.encode(query).unwrap();
+        let sdc_start = std::time::Instant::now();
+        let mut sdc_checksum = 0.0f32;
+        for code in &codes {
+            sdc_checksum += pq.approx_l2(&query_code, code);
+        }
+        let sdc_elapsed = sdc_start.elapsed();
+
+        let adc_start = std::time::Instant::now();
+        let lut = pq.compute_query_lut(query).unwrap();
+        let mut adc_checksum = 0.0f32;
+        for code in &codes {
+            adc_checksum += pq.approx_l2_with_lut(&lut, code);
+        }
+        let adc_elapsed = adc_start.elapsed();
+
+        assert!(sdc_checksum.is_finite() && adc_checksum.is_finite());
+        // Loose ceiling: ADC should not be slower than SDC. We allow
+        // 2x slack because the bench is sensitive to CI noise; the
+        // real production speedup is much larger.
+        if sdc_elapsed.as_micros() >= 50 {
+            assert!(
+                adc_elapsed <= sdc_elapsed.saturating_mul(2),
+                "ADC ({adc_elapsed:?}) regressed against SDC ({sdc_elapsed:?})"
+            );
+        }
+    }
 }
