@@ -1343,3 +1343,79 @@ fn recall_at_k_with_binary_quantization_meets_threshold() {
         "binary-quantized HNSW recall@10 dropped below regression floor: {recall:.3}"
     );
 }
+
+/// SQ / PQ indexes created on an empty table must eventually train the
+/// codebook from accumulated live inserts. After enough inserts the codes
+/// should be present on every node and search recall should match the
+/// codebook-trained baseline.
+fn assert_lazy_training_back_fills_codes(
+    quantization: aiondb_storage_api::StoredQuantizationKind,
+    expected_recall: f64,
+) {
+    use aiondb_storage_api::{HnswStorageOptions, StoredVectorMetric};
+    let dims = 64usize;
+    let dataset_size = 300usize;
+    let m = 12u32;
+    let ef_construction = 64u32;
+
+    let table_desc = make_table_desc_with_dims(dims as u32);
+    let mut index_desc = make_index_desc();
+    index_desc.hnsw_options = Some(HnswStorageOptions {
+        m,
+        ef_construction,
+        distance_metric: StoredVectorMetric::L2,
+        quantization,
+        prenormalised: false,
+    });
+
+    let dataset = (0..dataset_size)
+        .map(|idx| deterministic_vector(idx as u64 + 1, dims))
+        .collect::<Vec<_>>();
+
+    let mut index = HnswIndex::from_descriptor(index_desc);
+    for (idx, vector) in dataset.iter().enumerate() {
+        let row = make_row(idx as i32 + 1, vector.clone());
+        index
+            .insert_tuple(&table_desc, TupleId::new(idx as u64 + 1), &row)
+            .unwrap();
+    }
+
+    let mut total_hits = 0usize;
+    let k = 10usize;
+    let ef = 128usize;
+    let query_count = 60usize;
+    for query_idx in 0..query_count {
+        let query = &dataset[(query_idx * 11) % dataset_size];
+        let expected = brute_force_top_k(&dataset, query, k);
+        let (actual, _stats) = index.search(query, k, ef);
+        let actual_set = actual
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        total_hits += expected
+            .into_iter()
+            .filter(|tuple_id| actual_set.contains(tuple_id))
+            .count();
+    }
+    let recall = total_hits as f64 / (query_count * k) as f64;
+    assert!(
+        recall >= expected_recall,
+        "lazy-trained {kind:?} HNSW recall@{k} dropped to {recall:.3}",
+        kind = quantization,
+    );
+}
+
+#[test]
+fn lazy_training_trains_scalar_quantizer_after_threshold_inserts() {
+    assert_lazy_training_back_fills_codes(
+        aiondb_storage_api::StoredQuantizationKind::Scalar,
+        0.85,
+    );
+}
+
+#[test]
+fn lazy_training_trains_product_quantizer_after_threshold_inserts() {
+    assert_lazy_training_back_fills_codes(
+        aiondb_storage_api::StoredQuantizationKind::Product,
+        0.55,
+    );
+}

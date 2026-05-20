@@ -413,6 +413,11 @@ const HNSW_MAX_M: usize = 128;
 /// Centroids per PQ subspace at training time. Matches FAISS `nbits=8` so
 /// each subspace code fits in a single byte.
 const DEFAULT_PQ_CENTROIDS: usize = 256;
+/// Minimum number of nodes accumulated before SQ / PQ quantizers are
+/// trained on-the-fly from live inserts. Below this threshold we keep raw
+/// f32 storage; once crossed we train from the existing nodes' retained
+/// vectors and back-fill codes for every node.
+const LAZY_QUANTIZER_TRAINING_THRESHOLD: usize = 256;
 
 /// Pick the default number of PQ subspaces for a vector of `dims`
 /// dimensions. Prefers small per-subspace dimensionality (4-8) which gives
@@ -779,6 +784,112 @@ impl HnswIndex {
                 let samples: Vec<Vec<f32>> =
                     entries.iter().map(|(_, vec)| vec.clone()).collect();
                 self.product_quantizer = Some(ProductQuantizer::train(&samples, m, k)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Train SQ / PQ codebooks on-the-fly from the already-stored raw
+    /// vectors once the node count crosses
+    /// [`LAZY_QUANTIZER_TRAINING_THRESHOLD`], then encode codes for every
+    /// existing node. Called from `insert_tuple` so an SQ / PQ index created
+    /// on an empty table eventually converges to the quantized hot path
+    /// without requiring REINDEX.
+    fn maybe_lazy_train_quantizer(&mut self, pending_vector: &[f32]) -> DbResult<()> {
+        let needs_training = match self.quantization {
+            StoredQuantizationKind::Scalar => self.scalar_quantizer.is_none(),
+            StoredQuantizationKind::Product => self.product_quantizer.is_none(),
+            _ => false,
+        };
+        if !needs_training {
+            return Ok(());
+        }
+        if self.nodes.len() < LAZY_QUANTIZER_TRAINING_THRESHOLD.saturating_sub(1) {
+            return Ok(());
+        }
+        let mut samples: Vec<Vec<f32>> = Vec::with_capacity(self.nodes.len() + 1);
+        let mut decoded = Vec::new();
+        for node in self.nodes.values() {
+            if !node.vector.is_empty() {
+                samples.push(node.vector.clone());
+            } else if let Some(compact) = &node.compact_vector {
+                aiondb_core::vector_storage::decode_vector_into(
+                    compact,
+                    self.element_type,
+                    &mut decoded,
+                );
+                samples.push(decoded.clone());
+            }
+        }
+        samples.push(pending_vector.to_vec());
+        match self.quantization {
+            StoredQuantizationKind::Scalar => {
+                self.scalar_quantizer = Some(ScalarQuantizer::train(&samples)?);
+            }
+            StoredQuantizationKind::Product => {
+                let dims = pending_vector.len();
+                let m = default_pq_subspaces(dims);
+                self.product_quantizer =
+                    Some(ProductQuantizer::train(&samples, m, DEFAULT_PQ_CENTROIDS)?);
+            }
+            _ => {}
+        }
+        self.backfill_codes_for_existing_nodes()?;
+        Ok(())
+    }
+
+    /// Encode codes for every node that does not yet have one for the active
+    /// quantization mode. Used right after a lazy training pass.
+    fn backfill_codes_for_existing_nodes(&mut self) -> DbResult<()> {
+        match self.quantization {
+            StoredQuantizationKind::Scalar => {
+                let Some(quantizer) = self.scalar_quantizer.clone() else {
+                    return Ok(());
+                };
+                let mut decoded = Vec::new();
+                for node in self.nodes.values_mut() {
+                    if node.scalar_code.is_some() {
+                        continue;
+                    }
+                    let raw: Cow<'_, [f32]> = if !node.vector.is_empty() {
+                        Cow::Borrowed(node.vector.as_slice())
+                    } else if let Some(compact) = &node.compact_vector {
+                        aiondb_core::vector_storage::decode_vector_into(
+                            compact,
+                            self.element_type,
+                            &mut decoded,
+                        );
+                        Cow::Borrowed(decoded.as_slice())
+                    } else {
+                        continue;
+                    };
+                    node.scalar_code = Some(quantizer.encode(raw.as_ref())?);
+                }
+            }
+            StoredQuantizationKind::Product => {
+                let Some(quantizer) = self.product_quantizer.clone() else {
+                    return Ok(());
+                };
+                let mut decoded = Vec::new();
+                for node in self.nodes.values_mut() {
+                    if node.product_code.is_some() {
+                        continue;
+                    }
+                    let raw: Cow<'_, [f32]> = if !node.vector.is_empty() {
+                        Cow::Borrowed(node.vector.as_slice())
+                    } else if let Some(compact) = &node.compact_vector {
+                        aiondb_core::vector_storage::decode_vector_into(
+                            compact,
+                            self.element_type,
+                            &mut decoded,
+                        );
+                        Cow::Borrowed(decoded.as_slice())
+                    } else {
+                        continue;
+                    };
+                    node.product_code = Some(quantizer.encode(raw.as_ref())?);
+                }
             }
             _ => {}
         }
@@ -1161,14 +1272,16 @@ impl HnswIndex {
         ensure_prenormalised_invariant(self.metric, prenormalised, &vector)?;
 
         // Lazily materialize codecs that only need dimensionality (BQ). SQ/PQ
-        // codebooks are trained during the initial build / REINDEX; live
-        // inserts before training fall back to raw f32 storage and start
-        // producing codes once the codebook exists.
+        // codebooks need representative samples; if no initial build trained
+        // them, we trigger training on-the-fly once the node count crosses
+        // `LAZY_QUANTIZER_TRAINING_THRESHOLD` and back-fill codes on every
+        // existing node before encoding this insert.
         if matches!(self.quantization, StoredQuantizationKind::Binary)
             && self.binary_quantizer.is_none()
         {
             self.binary_quantizer = Some(BinaryQuantizer::new_checked(vector.len())?);
         }
+        self.maybe_lazy_train_quantizer(&vector)?;
         let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(&vector)?;
 
         let layer = self.random_layer();

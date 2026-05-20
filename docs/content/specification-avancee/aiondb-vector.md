@@ -83,8 +83,10 @@ once heap-fetched rescoring is wired through the executor.
 
 Live inserts arriving before the codebook has been trained (for example, an
 empty `CREATE INDEX` followed by individual inserts) fall back to raw f32
-storage. They start producing codes after the next build / `REINDEX` trains
-the codebook from the existing nodes.
+storage. Once the index accumulates 256 nodes the storage engine triggers a
+lazy training pass from the retained raw vectors, back-fills codes for every
+existing node, and switches subsequent inserts onto the quantized path - no
+explicit `REINDEX` required.
 
 ## example
 
