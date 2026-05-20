@@ -57,6 +57,37 @@ impl QueryLut {
     pub fn sub_count(&self) -> usize {
         self.sub_count
     }
+
+    /// Centroids per subspace this LUT was built for.
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Approximate L2 distance between the LUT's query and a previously
+    /// encoded vector. O(m) table lookups; identical numerically to the
+    /// method on [`ProductQuantizer`] but does not require holding the
+    /// quantizer alive, so it's cheap to pass through the HNSW probe
+    /// path.
+    #[must_use]
+    pub fn approx_l2(&self, code: &ProductCode) -> f32 {
+        let subspace_count = code.codes.len().min(self.sub_count);
+        if self.k == 0 {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        for sub in 0..subspace_count {
+            let idx = usize::from(code.codes[sub]).min(self.k - 1);
+            // SAFETY: `sub < self.sub_count` and `idx < self.k` keep the
+            // index inside the `m * k` allocation; both ends are clamped
+            // by `min` above.
+            #[allow(unsafe_code)]
+            unsafe {
+                sum += *self.entries.get_unchecked(sub * self.k + idx);
+            }
+        }
+        sum.sqrt()
+    }
 }
 
 /// Product quantizer with per-subspace k-means codebooks.

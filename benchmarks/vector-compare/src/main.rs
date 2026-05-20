@@ -28,7 +28,7 @@ use serde::Serialize;
 use tokio::runtime::Builder;
 
 const DIMS: usize = 96;
-const DATASET_SIZE: usize = 5_000;
+const DATASET_SIZE: usize = 50_000;
 const QUERY_COUNT: usize = 200;
 const TOP_K: usize = 10;
 
@@ -652,29 +652,36 @@ mod qdrant {
 
         let build_start = Instant::now();
         // Qdrant indexes vectors as they arrive; treat the upsert wall time
-        // as the build cost for parity with pgvector / aiondb.
-        let points: Vec<serde_json::Value> = dataset
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                json!({
-                    "id": i as u64 + 1,
-                    "vector": v,
+        // as the build cost for parity with pgvector / aiondb. Batch the
+        // upserts so the HTTP body stays inside Qdrant's default 32 MB
+        // payload limit at large dataset sizes.
+        const QDRANT_BATCH_SIZE: usize = 1_000;
+        for batch in dataset.chunks(QDRANT_BATCH_SIZE).enumerate() {
+            let (chunk_idx, chunk) = batch;
+            let base_id = chunk_idx * QDRANT_BATCH_SIZE;
+            let points: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, v)| {
+                    json!({
+                        "id": (base_id + offset) as u64 + 1,
+                        "vector": v,
+                    })
                 })
-            })
-            .collect();
-        let upsert_resp = client
-            .put(format!(
-                "{base_url}/collections/{collection}/points?wait=true"
-            ))
-            .json(&json!({ "points": points }))
-            .send()
-            .await?;
-        if !upsert_resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Qdrant upsert failed: {}",
-                upsert_resp.status()
-            ));
+                .collect();
+            let upsert_resp = client
+                .put(format!(
+                    "{base_url}/collections/{collection}/points?wait=true"
+                ))
+                .json(&json!({ "points": points }))
+                .send()
+                .await?;
+            if !upsert_resp.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "Qdrant upsert failed: {}",
+                    upsert_resp.status()
+                ));
+            }
         }
         let build_ms = build_start.elapsed().as_millis();
 

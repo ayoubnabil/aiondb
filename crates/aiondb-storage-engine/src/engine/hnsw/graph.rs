@@ -65,10 +65,12 @@ pub(crate) enum DistanceContext<'a> {
         quantizer: ScalarQuantizer,
     },
     Product {
-        /// Precomputed query-to-centroid LUT. `approx_l2_with_lut` collapses
-        /// the per-node distance to `m` table lookups.
+        /// Precomputed query-to-centroid LUT. The LUT carries enough
+        /// state to compute approximate L2 against any encoded vector,
+        /// so we don't need to hold the full ProductQuantizer codebook
+        /// alongside it - critical during HNSW build where a fresh
+        /// probe is built per vector.
         query_lut: QueryLut,
-        quantizer: ProductQuantizer,
     },
 }
 
@@ -113,15 +115,10 @@ impl DistanceContext<'_> {
                 .scalar_code
                 .as_ref()
                 .map_or(f32::INFINITY, |code| quantizer.approx_l2(code, query_code)),
-            Self::Product {
-                query_lut,
-                quantizer,
-            } => node
+            Self::Product { query_lut } => node
                 .product_code
                 .as_ref()
-                .map_or(f32::INFINITY, |code| {
-                    quantizer.approx_l2_with_lut(query_lut, code)
-                }),
+                .map_or(f32::INFINITY, |code| query_lut.approx_l2(code)),
         }
     }
 
@@ -487,6 +484,10 @@ const HNSW_MAX_M: usize = 128;
 /// Centroids per PQ subspace at training time. Matches FAISS `nbits=8` so
 /// each subspace code fits in a single byte.
 const DEFAULT_PQ_CENTROIDS: usize = 256;
+/// Upper bound for bulk PQ training. Training on every row makes k-means the
+/// dominant cost on large loads; a deterministic spread sample keeps build
+/// time bounded while preserving representative codebooks.
+const MAX_BULK_PQ_TRAINING_SAMPLES: usize = 16_384;
 /// Minimum number of nodes accumulated before SQ / PQ quantizers are
 /// trained on-the-fly from live inserts. Below this threshold we keep raw
 /// f32 storage; once crossed we train from the existing nodes' retained
@@ -509,6 +510,19 @@ fn default_pq_subspaces(dims: usize) -> usize {
         }
     }
     1
+}
+
+fn collect_pq_training_samples(entries: &[(TupleId, Vec<f32>)]) -> Vec<Vec<f32>> {
+    if entries.len() <= MAX_BULK_PQ_TRAINING_SAMPLES {
+        return entries.iter().map(|(_, vec)| vec.clone()).collect();
+    }
+    let len = entries.len();
+    (0..MAX_BULK_PQ_TRAINING_SAMPLES)
+        .map(|i| {
+            let idx = i.saturating_mul(len) / MAX_BULK_PQ_TRAINING_SAMPLES;
+            entries[idx].1.clone()
+        })
+        .collect()
 }
 const HNSW_MAX_EF_CONSTRUCTION: usize = search::HNSW_MAX_EF_SEARCH;
 // Mirror pgvector's hard cap. Larger dimensions multiply the per-node link
@@ -847,16 +861,14 @@ impl HnswIndex {
                 self.binary_quantizer = Some(BinaryQuantizer::new_checked(first.len())?);
             }
             StoredQuantizationKind::Scalar if self.scalar_quantizer.is_none() => {
-                let samples: Vec<Vec<f32>> =
-                    entries.iter().map(|(_, vec)| vec.clone()).collect();
+                let samples: Vec<Vec<f32>> = entries.iter().map(|(_, vec)| vec.clone()).collect();
                 self.scalar_quantizer = Some(ScalarQuantizer::train(&samples)?);
             }
             StoredQuantizationKind::Product if self.product_quantizer.is_none() => {
                 let dims = first.len();
                 let m = default_pq_subspaces(dims);
                 let k = DEFAULT_PQ_CENTROIDS;
-                let samples: Vec<Vec<f32>> =
-                    entries.iter().map(|(_, vec)| vec.clone()).collect();
+                let samples = collect_pq_training_samples(entries);
                 self.product_quantizer = Some(ProductQuantizer::train(&samples, m, k)?);
             }
             _ => {}
@@ -1070,6 +1082,7 @@ impl HnswIndex {
         // PQ codebooks) eagerly so the rest of the build can encode codes
         // directly.
         self.train_quantizer_from_entries(&entries)?;
+        self.nodes.reserve(entries.len());
 
         // Aggregate memory budget check (cheap, sequential).
         for (_, v) in &entries {
@@ -1134,13 +1147,11 @@ impl HnswIndex {
                         vec.as_slice(),
                     )?;
 
-                    let mut per_layer: Vec<Vec<(TupleId, f32)>> = Vec::new();
                     let Some(ep) = snapshot_ep else {
                         return Ok(NodeBuild {
                             tid: *tid,
-                            vector: vec.clone(),
                             layer,
-                            per_layer,
+                            per_layer: Vec::new(),
                         });
                     };
 
@@ -1150,6 +1161,8 @@ impl HnswIndex {
                     }
 
                     let insert_top = layer.min(snapshot_max_layer);
+                    let mut per_layer: Vec<Vec<(TupleId, f32)>> =
+                        Vec::with_capacity(insert_top + 1);
                     for lc in (0..=insert_top).rev() {
                         let mut _unused = 0u64;
                         let result = search::search_layer_gpu(
@@ -1170,7 +1183,6 @@ impl HnswIndex {
 
                     Ok(NodeBuild {
                         tid: *tid,
-                        vector: vec.clone(),
                         layer,
                         per_layer,
                     })
@@ -1178,8 +1190,8 @@ impl HnswIndex {
                 .collect();
 
             // Sequential commit: insert nodes and patch neighbor lists.
-            for built in prepared {
-                self.commit_prepared_node(built?)?;
+            for (built, (_, vector)) in prepared.into_iter().zip(chunk.iter()) {
+                self.commit_prepared_node(built?, vector)?;
             }
         }
         Ok(())
@@ -1267,16 +1279,14 @@ impl HnswIndex {
     }
 
     /// Sequentially commit a node whose candidate search ran in parallel.
-    fn commit_prepared_node(&mut self, built: NodeBuild) -> DbResult<()> {
+    fn commit_prepared_node(&mut self, built: NodeBuild, vector: &[f32]) -> DbResult<()> {
         let NodeBuild {
             tid,
-            vector,
             layer,
             per_layer,
         } = built;
-        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(&vector)?;
-        let (stored_vector, compact) =
-            self.storage_for_raw_vector(&vector, binary_code.is_some());
+        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(vector)?;
+        let (stored_vector, compact) = self.storage_for_raw_vector(vector, binary_code.is_some());
         let node = HnswNode {
             vector: stored_vector,
             compact_vector: compact,
@@ -1916,9 +1926,8 @@ impl HnswIndex {
         };
         let rescored_count = rescored.len();
         let mut rescored = rescored;
-        rescored.sort_unstable_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        rescored
+            .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let ids = rescored.into_iter().take(k).map(|(id, _)| id).collect();
         (ids, rescored_count)
     }
@@ -2123,10 +2132,7 @@ impl HnswIndex {
             StoredQuantizationKind::Product => {
                 if let Some(quantizer) = self.product_quantizer.as_ref() {
                     let query_lut = quantizer.compute_query_lut(query)?;
-                    Ok(DistanceContext::Product {
-                        query_lut,
-                        quantizer: quantizer.clone(),
-                    })
+                    Ok(DistanceContext::Product { query_lut })
                 } else {
                     Ok(self.build_raw_probe(query))
                 }
@@ -2187,10 +2193,7 @@ impl HnswIndex {
                     };
                     if let Some(raw) = raw {
                         if let Ok(query_lut) = quantizer.compute_query_lut(raw.as_ref()) {
-                            return Some(DistanceContext::Product {
-                                query_lut,
-                                quantizer: quantizer.clone(),
-                            });
+                            return Some(DistanceContext::Product { query_lut });
                         }
                     }
                 }
@@ -2280,7 +2283,6 @@ impl HnswIndex {
 /// the graph.
 struct NodeBuild {
     tid: TupleId,
-    vector: Vec<f32>,
     layer: usize,
     /// Per-layer candidate lists in push order (lc = insert_top..=0).
     per_layer: Vec<Vec<(TupleId, f32)>>,
@@ -2369,10 +2371,7 @@ fn build_probe_standalone<'a>(
         StoredQuantizationKind::Product => {
             if let Some(quantizer) = product_quant {
                 let query_lut = quantizer.compute_query_lut(query)?;
-                Ok(DistanceContext::Product {
-                    query_lut,
-                    quantizer: quantizer.clone(),
-                })
+                Ok(DistanceContext::Product { query_lut })
             } else {
                 Ok(raw_fallback())
             }
