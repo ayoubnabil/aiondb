@@ -1,0 +1,31 @@
+[package]
+name = "aiondb-vector-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+lto = false
+codegen-units = 16
+opt-level = 3
+debug = false
+
+[dependencies]
+anyhow = "1"
+aiondb-core = { path = "../../crates/aiondb-core" }
+aiondb-storage-api = { path = "../../crates/aiondb-storage-api" }
+aiondb-storage-engine = { path = "../../crates/aiondb-storage-engine" }
+aiondb-vector = { path = "../../crates/aiondb-vector" }
+aiondb-tx = { path = "../../crates/aiondb-tx" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio-postgres = { version = "0.7", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[features]
+default = []
+pgvector = ["dep:tokio-postgres"]
+qdrant = ["dep:reqwest"]
