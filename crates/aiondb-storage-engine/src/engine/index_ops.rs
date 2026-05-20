@@ -2,6 +2,12 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VectorIndexKind {
+    Hnsw,
+    IvfFlat,
+}
+
 pub(super) struct PreparedBaseIndexInsert {
     pub(super) index_id: IndexId,
     pub(super) key: super::btree::IndexKey,
@@ -1869,25 +1875,38 @@ impl InMemoryStorage {
         Ok(())
     }
 
-    /// Rebuild a single HNSW vector index from the table's currently visible
-    /// rows. Used by `Storage::reindex_vector_index` (REINDEX VECTOR) so
-    /// users can retrain SQ / PQ codebooks against the current data
-    /// distribution without dropping and recreating the index.
+    /// Rebuild a single vector index (HNSW or IVF-flat) from the table's
+    /// currently visible rows. Used by `Storage::reindex_vector_index`
+    /// (REINDEX VECTOR) so users can retrain SQ / PQ codebooks or IVF
+    /// coarse centroids against the current data distribution without
+    /// dropping and recreating the index.
     pub(super) fn rebuild_hnsw_index_for_id(
         &self,
         state: &mut StorageState,
         index_id: IndexId,
     ) -> DbResult<()> {
-        let descriptor = state
-            .hnsw_indexes
-            .get(&index_id)
-            .map(|index| index.descriptor.clone())
-            .ok_or_else(|| {
-                DbError::internal(format!(
-                    "REINDEX VECTOR: no HNSW index registered with id {}",
-                    index_id.get()
-                ))
-            })?;
+        let kind = if state.hnsw_indexes.contains_key(&index_id) {
+            VectorIndexKind::Hnsw
+        } else if state.ivf_indexes.contains_key(&index_id) {
+            VectorIndexKind::IvfFlat
+        } else {
+            return Err(DbError::internal(format!(
+                "REINDEX VECTOR: no HNSW or IVF-flat index registered with id {}",
+                index_id.get()
+            )));
+        };
+        let descriptor = match kind {
+            VectorIndexKind::Hnsw => state
+                .hnsw_indexes
+                .get(&index_id)
+                .map(|index| index.descriptor.clone())
+                .unwrap(),
+            VectorIndexKind::IvfFlat => state
+                .ivf_indexes
+                .get(&index_id)
+                .map(|index| index.descriptor().clone())
+                .unwrap(),
+        };
         let table_id = descriptor.table_id;
 
         let (table_descriptor, visible_rows) = {
@@ -1906,9 +1925,24 @@ impl InMemoryStorage {
             (table_descriptor, rows)
         };
 
-        let rebuilt =
-            HnswIndex::from_rows_with_options(&descriptor, &table_descriptor, visible_rows)?;
-        state.hnsw_indexes.insert(index_id, rebuilt);
+        match kind {
+            VectorIndexKind::Hnsw => {
+                let rebuilt = HnswIndex::from_rows_with_options(
+                    &descriptor,
+                    &table_descriptor,
+                    visible_rows,
+                )?;
+                state.hnsw_indexes.insert(index_id, rebuilt);
+            }
+            VectorIndexKind::IvfFlat => {
+                let rebuilt = super::IvfFlatIndex::from_rows_with_options(
+                    &descriptor,
+                    &table_descriptor,
+                    visible_rows,
+                )?;
+                state.ivf_indexes.insert(index_id, rebuilt);
+            }
+        }
         Ok(())
     }
 

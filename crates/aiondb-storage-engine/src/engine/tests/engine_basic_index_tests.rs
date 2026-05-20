@@ -3400,6 +3400,86 @@ fn ivf_flat_index_through_ddl_returns_results_via_vector_search() {
 }
 
 #[test]
+fn reindex_vector_index_retrains_ivf_flat_centroids() {
+    let storage = InMemoryStorage::new_without_wal();
+    let table_id = RelationId::new(2801);
+    let index_id = IndexId::new(2802);
+    create_vector_payload_table(&storage, table_id);
+    for i in 1..=12i32 {
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![i as f32, 0.0, 0.0],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+    create_ivf_flat_index(&storage, table_id, index_id, 4, 2);
+
+    let pre = storage
+        .ivf_flat_index_stats(index_id)
+        .expect("pre stats")
+        .expect("ivf index registered");
+    assert!(pre.trained);
+    assert_eq!(pre.total_vectors, 12);
+    let original_centroids = pre.centroid_count;
+
+    // Insert a second cluster of points and reindex so the centroids
+    // converge around the new distribution.
+    for i in 13..=24i32 {
+        storage
+            .insert(
+                TxnId::default(),
+                table_id,
+                Row::new(vec![
+                    Value::Int(i),
+                    Value::Vector(aiondb_core::VectorValue {
+                        dims: 3,
+                        values: vec![100.0, i as f32, 50.0],
+                    }),
+                ]),
+            )
+            .expect("insert vector row");
+    }
+    storage
+        .reindex_vector_index(index_id)
+        .expect("reindex ivf index");
+    let post = storage
+        .ivf_flat_index_stats(index_id)
+        .expect("post stats")
+        .expect("ivf index still registered");
+    assert!(post.trained);
+    assert_eq!(post.total_vectors, 24);
+    assert!(
+        post.centroid_count <= original_centroids,
+        "centroid count cannot grow without an nlist change"
+    );
+
+    // The new cluster should be reachable through vector_search.
+    let stream = aiondb_storage_api::StorageDML::vector_search(
+        &storage,
+        TxnId::default(),
+        &snapshot(),
+        index_id,
+        &[100.0_f32, 20.0, 50.0],
+        3,
+        16,
+        None,
+        None,
+        None,
+    )
+    .expect("search post-reindex");
+    let records = collect_stream(stream);
+    assert!(!records.is_empty());
+}
+
+#[test]
 fn ivf_flat_index_stats_expose_centroid_shape() {
     let storage = InMemoryStorage::new_without_wal();
     let table_id = RelationId::new(2701);
