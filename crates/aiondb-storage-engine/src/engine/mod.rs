@@ -3048,6 +3048,31 @@ impl InMemoryStorage {
         &self.row_locks
     }
 
+    /// Return cumulative search statistics for an HNSW vector index, or
+    /// `None` when no such index is registered. Intended for dashboard /
+    /// observability code that wants per-index recall and latency numbers
+    /// without having to issue a query.
+    pub fn vector_index_search_stats(
+        &self,
+        index_id: IndexId,
+    ) -> DbResult<Option<HnswSearchStatsSummary>> {
+        let state = self.read_state()?;
+        Ok(state
+            .hnsw_indexes
+            .get(&index_id)
+            .map(|index| index.search_stats_summary()))
+    }
+
+    /// Return index-level metrics (counts, memory) for an HNSW vector
+    /// index, or `None` when no such index is registered.
+    pub fn vector_index_stats(&self, index_id: IndexId) -> DbResult<Option<HnswIndexStats>> {
+        let state = self.read_state()?;
+        Ok(state
+            .hnsw_indexes
+            .get(&index_id)
+            .map(|index| index.index_stats()))
+    }
+
     /// Look up edge tuple IDs adjacent to the given node.
     ///
     /// When `outgoing` is `true`, returns edges whose source equals `node_id`.

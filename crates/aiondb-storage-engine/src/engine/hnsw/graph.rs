@@ -1793,7 +1793,6 @@ impl HnswIndex {
     }
 
     /// Return cumulative search statistics for this index.
-    #[cfg(test)]
     pub(crate) fn search_stats_summary(&self) -> HnswSearchStatsSummary {
         HnswSearchStatsSummary {
             total_searches: self.stat_total_searches.load(Ordering::Relaxed),
@@ -1822,7 +1821,6 @@ impl HnswIndex {
     }
 
     /// Return index-level metrics.
-    #[cfg(test)]
     pub(crate) fn index_stats(&self) -> HnswIndexStats {
         let total_searches = self.stat_total_searches.load(Ordering::Relaxed);
         let total_duration = self.stat_total_duration_micros.load(Ordering::Relaxed);
