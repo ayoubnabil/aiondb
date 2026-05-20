@@ -198,12 +198,16 @@ pub(crate) fn search_layer_interruptible_gpu(
     let mut ops_since_check: u64 = 0;
     let mut truncated = false;
 
-    // Reused across outer-loop iterations. Each iteration's neighbor batch
-    // is bounded by `m` (graph max-connections-per-layer, typically 16-32),
-    // so the buffer reaches steady-state capacity after the first iteration
-    // and never reallocates for the rest of the search.
-    let mut batch_pairs: Vec<(&HnswNode, TupleId)> = Vec::new();
-    let mut batch_results: Vec<(TupleId, f32)> = Vec::new();
+    // Reused across outer-loop iterations. Pre-allocate to the
+    // maximum per-layer fan-out so the very first visit doesn't pay
+    // a reallocation - `64` covers `m_max0 = 2m` for the default
+    // `m = 16` plus a safety margin; the buffer still grows if a
+    // future tuning pushes `m_max0` higher.
+    const BATCH_BUFFER_CAPACITY: usize = 64;
+    let mut batch_pairs: Vec<(&HnswNode, TupleId)> =
+        Vec::with_capacity(BATCH_BUFFER_CAPACITY);
+    let mut batch_results: Vec<(TupleId, f32)> =
+        Vec::with_capacity(BATCH_BUFFER_CAPACITY);
 
     while let Some(std::cmp::Reverse(current)) = candidates.pop() {
         // If the closest candidate is farther than the farthest result, stop.
