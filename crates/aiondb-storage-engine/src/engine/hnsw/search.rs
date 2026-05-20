@@ -302,12 +302,69 @@ pub(crate) fn search_layer_interruptible_gpu(
 }
 
 /// Select at most `max_connections` neighbors from candidates, sorted by
-/// distance (closest first).
+/// distance (closest first). Greedy top-M selection; preserves the
+/// historical behaviour and is exposed for unit tests.
+#[cfg(test)]
 pub(crate) fn select_neighbors(
     candidates: &[(TupleId, f32)],
     max_connections: usize,
 ) -> Vec<(TupleId, f32)> {
     candidates.iter().take(max_connections).copied().collect()
+}
+
+/// HNSW Algorithm 4: heuristic neighbor selection.
+///
+/// Candidates are walked closest-first. A candidate `e` is accepted as a
+/// neighbor only if it is closer to the query than to every neighbor
+/// already accepted. This "diversification" rule produces a sparse, well-
+/// connected neighborhood instead of a cluster of near-duplicates and is
+/// the dominant reason HNSW recall stays high at scale. `pair_distance`
+/// computes the metric between two stored tuple IDs; callers wire it to
+/// their distance kernel + node lookup.
+pub(crate) fn select_neighbors_heuristic<F>(
+    candidates: &[(TupleId, f32)],
+    max_connections: usize,
+    mut pair_distance: F,
+) -> Vec<(TupleId, f32)>
+where
+    F: FnMut(TupleId, TupleId) -> Option<f32>,
+{
+    if candidates.is_empty() || max_connections == 0 {
+        return Vec::new();
+    }
+    let mut selected: Vec<(TupleId, f32)> = Vec::with_capacity(max_connections);
+    for &(candidate_id, candidate_distance) in candidates {
+        if selected.len() >= max_connections {
+            break;
+        }
+        let mut accept = true;
+        for &(neighbor_id, _) in &selected {
+            if let Some(d) = pair_distance(candidate_id, neighbor_id) {
+                if d < candidate_distance {
+                    accept = false;
+                    break;
+                }
+            }
+        }
+        if accept {
+            selected.push((candidate_id, candidate_distance));
+        }
+    }
+    // If the heuristic was too aggressive (e.g. tightly clustered
+    // dataset) we still want a full neighborhood, so top up with the
+    // remaining closest candidates ignoring the diversification rule.
+    if selected.len() < max_connections {
+        for &(candidate_id, candidate_distance) in candidates {
+            if selected.len() >= max_connections {
+                break;
+            }
+            if selected.iter().any(|(id, _)| *id == candidate_id) {
+                continue;
+            }
+            selected.push((candidate_id, candidate_distance));
+        }
+    }
+    selected
 }
 
 #[cfg(test)]
@@ -384,6 +441,48 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0, TupleId::new(1));
         assert_eq!(selected[1].0, TupleId::new(2));
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_diversifies_candidates() {
+        let candidates = vec![
+            (TupleId::new(1), 0.10),
+            (TupleId::new(2), 0.11),
+            (TupleId::new(3), 0.12),
+        ];
+        let selected = select_neighbors_heuristic(&candidates, 2, |a, b| {
+            if a == TupleId::new(2) && b == TupleId::new(1) {
+                return Some(0.01);
+            }
+            Some(1.0)
+        });
+        assert_eq!(
+            selected,
+            vec![(TupleId::new(1), 0.10), (TupleId::new(3), 0.12)]
+        );
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_tops_up_when_too_strict() {
+        let candidates = vec![
+            (TupleId::new(1), 0.10),
+            (TupleId::new(2), 0.11),
+            (TupleId::new(3), 0.12),
+        ];
+        let selected = select_neighbors_heuristic(&candidates, 3, |a, b| {
+            if b == TupleId::new(1) && (a == TupleId::new(2) || a == TupleId::new(3)) {
+                return Some(0.01);
+            }
+            Some(1.0)
+        });
+        assert_eq!(
+            selected,
+            vec![
+                (TupleId::new(1), 0.10),
+                (TupleId::new(2), 0.11),
+                (TupleId::new(3), 0.12),
+            ]
+        );
     }
 
     #[test]

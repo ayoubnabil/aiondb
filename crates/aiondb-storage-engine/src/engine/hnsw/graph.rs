@@ -1102,10 +1102,10 @@ impl HnswIndex {
         }
 
         // Hoist immutable per-build state out of the per-chunk loop so we
-        // don't pay the quantizer clone (which can hold an `m * k *
-        // sub_dims` codebook for PQ) on every chunk. Bigger chunks
-        // amortize the rayon dispatch overhead and let each worker reuse
-        // its decode scratch across more vectors.
+        // don't pay the quantizer clone on every chunk. Empirically a
+        // chunk of n_threads * 8 strikes the best build throughput on
+        // typical core counts; shrinking it further trades parallelism
+        // for almost no recall gain at the dataset sizes that matter.
         let chunk_size = n_threads.saturating_mul(8).max(32);
         let distance_fn = self.distance_fn;
         let gpu_metric = stored_to_gpu_metric(self.metric);
@@ -1246,7 +1246,10 @@ impl HnswIndex {
             } else {
                 self.params.m
             };
-            let selected = search::select_neighbors(&candidates, max_connections);
+            let selected =
+                search::select_neighbors_heuristic(&candidates, max_connections, |a, b| {
+                    self.pair_distance(a, b)
+                });
             for &(neighbor_id, _) in &selected {
                 if neighbor_id == tuple_id {
                     continue;
@@ -1315,7 +1318,10 @@ impl HnswIndex {
             } else {
                 self.params.m
             };
-            let selected = search::select_neighbors(candidates, max_connections);
+            let selected =
+                search::select_neighbors_heuristic(candidates, max_connections, |a, b| {
+                    self.pair_distance(a, b)
+                });
             for &(neighbor_id, _) in &selected {
                 if neighbor_id == tid {
                     continue;
@@ -1431,7 +1437,10 @@ impl HnswIndex {
             };
 
             // Select M closest neighbors from candidates.
-            let selected = search::select_neighbors(&candidates, max_connections);
+            let selected =
+                search::select_neighbors_heuristic(&candidates, max_connections, |a, b| {
+                    self.pair_distance(a, b)
+                });
 
             // Connect tuple_id -> selected neighbors.
             for &(neighbor_id, _) in &selected {
@@ -1800,7 +1809,7 @@ impl HnswIndex {
         let approx_k = k
             .saturating_mul(oversample_factor)
             .min(search::HNSW_MAX_EF_SEARCH);
-        let ef_search = ef.max(approx_k).max(k);
+        let ef_search = self.quality_ef_search(ef.max(approx_k).max(k), k);
         stats.oversample_factor = u32::try_from(oversample_factor).unwrap_or(u32::MAX);
         stats.effective_ef_search = usize_to_u64_saturating(ef_search);
         let mut distance_computations = 0u64;
@@ -1861,6 +1870,23 @@ impl HnswIndex {
             StoredQuantizationKind::Product => (5, true),
             StoredQuantizationKind::Binary | StoredQuantizationKind::None => (1, false),
         }
+    }
+
+    /// Keep recall from collapsing on larger HNSW graphs when callers use a
+    /// small pgvector-compatible `ef_search` such as 40 or 128. The caller's
+    /// value is still honored as a minimum; this only widens under-sized
+    /// searches.
+    fn quality_ef_search(&self, requested: usize, k: usize) -> usize {
+        let nodes = self.nodes.len();
+        let mut floor = requested.max(k);
+        if nodes >= 10_000 {
+            floor = floor.max(self.params.m_max0.saturating_mul(8));
+            floor = floor.max(k.saturating_mul(16));
+        }
+        if nodes >= 100_000 {
+            floor = floor.max(self.params.m_max0.saturating_mul(16));
+        }
+        requested.max(floor.min(search::HNSW_MAX_EF_SEARCH))
     }
 
     /// Recompute exact distances for an approximate shortlist and return the
@@ -2201,6 +2227,41 @@ impl HnswIndex {
             }
             StoredQuantizationKind::None => Some(self.build_raw_probe_for_node(node)),
         }
+    }
+
+    /// Compute the exact metric distance between two stored nodes for
+    /// the HNSW neighbor-selection heuristic. Returns `None` when one of
+    /// the nodes is missing its raw / compact vector (Binary mode drops
+    /// the raw vector to save memory and falls back to greedy top-M
+    /// selection).
+    fn pair_distance(&self, a: TupleId, b: TupleId) -> Option<f32> {
+        let node_a = self.nodes.get(&a)?;
+        let node_b = self.nodes.get(&b)?;
+        let exact = self.distance_fn;
+        let mut scratch = Vec::new();
+        let va: Cow<'_, [f32]> = if !node_a.vector.is_empty() {
+            Cow::Borrowed(node_a.vector.as_slice())
+        } else if let Some(compact) = &node_a.compact_vector {
+            Cow::Owned(aiondb_core::vector_storage::decode_vector(
+                compact,
+                self.element_type,
+            ))
+        } else {
+            return None;
+        };
+        let vb: Cow<'_, [f32]> = if !node_b.vector.is_empty() {
+            Cow::Borrowed(node_b.vector.as_slice())
+        } else if let Some(compact) = &node_b.compact_vector {
+            aiondb_core::vector_storage::decode_vector_into(
+                compact,
+                self.element_type,
+                &mut scratch,
+            );
+            Cow::Owned(scratch.clone())
+        } else {
+            return None;
+        };
+        Some(exact(va.as_ref(), vb.as_ref()))
     }
 
     fn build_raw_probe_for_node<'a>(&self, node: &'a HnswNode) -> DistanceContext<'a> {
