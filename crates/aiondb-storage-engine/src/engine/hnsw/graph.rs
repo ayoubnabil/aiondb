@@ -1551,6 +1551,12 @@ impl HnswIndex {
     }
 
     /// Estimate the in-memory byte footprint of this HNSW index.
+    ///
+    /// Accounts for the raw f32 vector (when retained), the compact
+    /// float16 / uint8 encoding, and every active quantization code
+    /// (binary u64 words, scalar i8 codes, product u8 codes) so the
+    /// reported figure reflects the true storage cost across all
+    /// quantization modes.
     pub(crate) fn estimated_bytes(&self) -> u64 {
         // BTreeMap per-entry overhead (~64 bytes) + HnswNode struct.
         const PER_NODE_OVERHEAD: u64 = 96;
@@ -1564,6 +1570,23 @@ impl HnswIndex {
             bytes += usize_to_u64_saturating(
                 node.vector.len().saturating_mul(std::mem::size_of::<f32>()),
             );
+            // Compact float16 / uint8 storage (mutually exclusive with raw f32).
+            if let Some(compact) = &node.compact_vector {
+                bytes += usize_to_u64_saturating(compact.len());
+            }
+            // Quantization codes. Each present at most once per node and only
+            // when the index is in the corresponding mode.
+            if let Some(code) = &node.binary_code {
+                bytes += usize_to_u64_saturating(
+                    code.bits.len().saturating_mul(std::mem::size_of::<u64>()),
+                );
+            }
+            if let Some(code) = &node.scalar_code {
+                bytes += usize_to_u64_saturating(code.codes.len());
+            }
+            if let Some(code) = &node.product_code {
+                bytes += usize_to_u64_saturating(code.codes.len());
+            }
             // Neighbor lists per layer.
             for layer in &node.neighbors {
                 bytes += 24; // Vec/BTreeSet header
