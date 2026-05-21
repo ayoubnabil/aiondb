@@ -26,6 +26,37 @@ fn usize_to_f32(value: usize) -> f32 {
     value as f32
 }
 
+#[inline(always)]
+fn subspace_l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return f32::NAN;
+    }
+    if a.len() <= 16 {
+        let mut sum = 0.0f32;
+        for (left, right) in a.iter().zip(b.iter()) {
+            let diff = left - right;
+            sum += diff * diff;
+        }
+        return sum;
+    }
+    crate::simd::dispatch::l2_squared_f32(a, b)
+}
+
+#[inline(always)]
+fn flat_subspace_l2_squared(sample: &[f32], centroids: &[f32], offset: usize, len: usize) -> f32 {
+    debug_assert!(sample.len() >= len);
+    debug_assert!(offset + len <= centroids.len());
+    if len <= 16 {
+        let mut sum = 0.0f32;
+        for d in 0..len {
+            let diff = sample[d] - centroids[offset + d];
+            sum += diff * diff;
+        }
+        return sum;
+    }
+    subspace_l2_squared(sample, &centroids[offset..offset + len])
+}
+
 /// Maximum centroids per subspace (so codes fit in a `u8`).
 const MAX_K: usize = 256;
 /// Upper bound on Lloyd iterations.
@@ -71,6 +102,29 @@ impl QueryLut {
     /// path.
     #[must_use]
     pub fn approx_l2(&self, code: &ProductCode) -> f32 {
+        self.approx_l2_squared(code).sqrt()
+    }
+
+    /// Squared approximate L2 distance against a previously encoded vector.
+    /// This preserves the same ordering as [`Self::approx_l2`] while avoiding
+    /// a `sqrt()` in ranking-only hot paths such as HNSW graph traversal.
+    #[must_use]
+    pub fn approx_l2_squared(&self, code: &ProductCode) -> f32 {
+        if self.k == MAX_K && code.codes.len() >= self.sub_count {
+            let mut sum = 0.0f32;
+            for sub in 0..self.sub_count {
+                let idx = usize::from(code.codes[sub]);
+                // SAFETY: `code.codes.len() >= self.sub_count` above, `sub`
+                // is bounded by `self.sub_count`, and `u8` codes are always
+                // in `0..=255`, matching `MAX_K`.
+                #[allow(unsafe_code)]
+                unsafe {
+                    sum += *self.entries.get_unchecked(sub * MAX_K + idx);
+                }
+            }
+            return sum;
+        }
+
         let subspace_count = code.codes.len().min(self.sub_count);
         if self.k == 0 {
             return 0.0;
@@ -86,7 +140,7 @@ impl QueryLut {
                 sum += *self.entries.get_unchecked(sub * self.k + idx);
             }
         }
-        sum.sqrt()
+        sum
     }
 }
 
@@ -134,6 +188,33 @@ impl ProductQuantizer {
     /// Same conditions as [`train`].
     #[must_use = "a trained quantizer should be retained for subsequent encoding"]
     pub fn train_from_slices(samples: &[&[f32]], m: usize, k: usize) -> DbResult<Self> {
+        Self::train_from_slices_impl(samples, m, k, true)
+    }
+
+    /// Train from borrowed slices that the caller has already checked for
+    /// finite components. Dimension consistency is still validated here so
+    /// malformed input returns an error instead of reaching the k-means hot
+    /// loop.
+    ///
+    /// Bulk HNSW builds validate every vector during extraction; using this
+    /// path avoids scanning the sampled floats a second time before PQ
+    /// training.
+    ///
+    /// # Errors
+    ///
+    /// Same structural conditions as [`train_from_slices`]. Non-finite
+    /// components are not checked by this fast path.
+    #[must_use = "a trained quantizer should be retained for subsequent encoding"]
+    pub fn train_from_validated_slices(samples: &[&[f32]], m: usize, k: usize) -> DbResult<Self> {
+        Self::train_from_slices_impl(samples, m, k, false)
+    }
+
+    fn train_from_slices_impl(
+        samples: &[&[f32]],
+        m: usize,
+        k: usize,
+        validate_finite: bool,
+    ) -> DbResult<Self> {
         if samples.is_empty() {
             return Err(DbError::internal(
                 "PQ: training requires at least one sample",
@@ -157,26 +238,37 @@ impl ProductQuantizer {
             )));
         }
         let sub_dims = dims / m;
-        samples
-            .par_iter()
-            .with_min_len(256)
-            .enumerate()
-            .try_for_each(|(idx, sample)| -> DbResult<()> {
+        if validate_finite {
+            samples
+                .par_iter()
+                .with_min_len(256)
+                .enumerate()
+                .try_for_each(|(idx, sample)| -> DbResult<()> {
+                    if sample.len() != dims {
+                        return Err(DbError::internal(format!(
+                            "PQ: sample {idx} has dims {} but expected {dims}",
+                            sample.len()
+                        )));
+                    }
+                    for (d, v) in sample.iter().enumerate() {
+                        if !v.is_finite() {
+                            return Err(DbError::internal(format!(
+                                "PQ: sample {idx} dim {d} is not finite"
+                            )));
+                        }
+                    }
+                    Ok(())
+                })?;
+        } else {
+            for (idx, sample) in samples.iter().enumerate() {
                 if sample.len() != dims {
                     return Err(DbError::internal(format!(
                         "PQ: sample {idx} has dims {} but expected {dims}",
                         sample.len()
                     )));
                 }
-                for (d, v) in sample.iter().enumerate() {
-                    if !v.is_finite() {
-                        return Err(DbError::internal(format!(
-                            "PQ: sample {idx} dim {d} is not finite"
-                        )));
-                    }
-                }
-                Ok(())
-            })?;
+            }
+        }
         let effective_k = k.min(samples.len().max(1));
         let centroids: Vec<Vec<Vec<f32>>> = (0..m)
             .into_par_iter()
@@ -263,7 +355,7 @@ impl ProductQuantizer {
             let book = &self.centroids[sub];
             let row = &mut entries[sub * self.k..sub * self.k + self.k];
             for (idx, centroid) in book.iter().enumerate() {
-                row[idx] = crate::simd::dispatch::l2_squared_f32(q_slice, centroid);
+                row[idx] = subspace_l2_squared(q_slice, centroid);
             }
         }
         Ok(QueryLut {
@@ -303,13 +395,32 @@ impl ProductQuantizer {
         let mut best = 0usize;
         let mut best_dist = f32::INFINITY;
         for (idx, centroid) in book.iter().enumerate() {
-            let acc = crate::simd::dispatch::l2_squared_f32(slice, centroid);
+            let acc = subspace_l2_squared(slice, centroid);
             if acc < best_dist {
                 best_dist = acc;
                 best = idx;
             }
         }
         u8::try_from(best).unwrap_or(u8::MAX)
+    }
+
+    /// Encode a vector that the caller has already checked for dimensionality
+    /// and finite components.
+    ///
+    /// Bulk HNSW builds validate every vector during extraction, then encode
+    /// the same vector while constructing nodes. This path avoids repeating
+    /// that validation in the PQ hot build loop while keeping [`encode`] as
+    /// the checked public API for external callers.
+    #[must_use]
+    pub fn encode_validated(&self, vector: &[f32]) -> ProductCode {
+        debug_assert_eq!(vector.len(), self.dims);
+        let mut codes = Vec::with_capacity(self.m);
+        for sub in 0..self.m {
+            let start = sub * self.sub_dims;
+            let end = start + self.sub_dims;
+            codes.push(self.nearest_centroid(sub, &vector[start..end]));
+        }
+        ProductCode { codes }
     }
 }
 
@@ -335,13 +446,7 @@ impl VectorQuantizer for ProductQuantizer {
                 )));
             }
         }
-        let mut codes = Vec::with_capacity(self.m);
-        for sub in 0..self.m {
-            let start = sub * self.sub_dims;
-            let end = start + self.sub_dims;
-            codes.push(self.nearest_centroid(sub, &vector[start..end]));
-        }
-        Ok(ProductCode { codes })
+        Ok(self.encode_validated(vector))
     }
 
     fn decode(&self, code: &Self::Code) -> Vec<f32> {
@@ -371,7 +476,7 @@ impl VectorQuantizer for ProductQuantizer {
             }
             let left = usize::from(a.codes[sub]).min(centroids.len().saturating_sub(1));
             let right = usize::from(b.codes[sub]).min(centroids.len().saturating_sub(1));
-            sum += crate::simd::dispatch::l2_squared_f32(&centroids[left], &centroids[right]);
+            sum += subspace_l2_squared(&centroids[left], &centroids[right]);
         }
         sum.sqrt()
     }
@@ -423,12 +528,10 @@ fn kmeans_subspace(
     // a periodic cluster layout in the dataset. We use Fibonacci (Knuth
     // multiplicative) hashing to spread picks across the sample index space
     // for arbitrary `n` and `k` combinations while staying deterministic.
-    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
+    let centroid_len = k.saturating_mul(sub_dims);
+    let mut centroids = Vec::with_capacity(centroid_len);
     if n == 0 {
-        for _ in 0..k {
-            centroids.push(vec![0.0f32; sub_dims]);
-        }
-        return centroids;
+        return vec![vec![0.0f32; sub_dims]; k];
     }
     const GOLDEN_RATIO_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
     for c in 0..k {
@@ -436,14 +539,17 @@ fn kmeans_subspace(
             .wrapping_add(1)
             .wrapping_mul(GOLDEN_RATIO_MUL);
         let idx = u64_to_usize(hashed) % n;
-        centroids.push(samples[idx][sub_start..sub_end].to_vec());
+        centroids.extend_from_slice(&samples[idx][sub_start..sub_end]);
     }
 
     // De-duplicate initial centroids by nudging collisions to other samples.
     for c in 0..k {
         let mut duplicate = false;
+        let current_offset = c * sub_dims;
+        let current = &centroids[current_offset..current_offset + sub_dims];
         for p in 0..c {
-            if centroids[c] == centroids[p] {
+            let previous_offset = p * sub_dims;
+            if current == &centroids[previous_offset..previous_offset + sub_dims] {
                 duplicate = true;
                 break;
             }
@@ -454,14 +560,15 @@ fn kmeans_subspace(
             for step in 0..n {
                 let candidate = &samples[(sample_start + step) % n][sub_start..sub_end];
                 let mut seen = false;
-                for existing in centroids.iter().take(c) {
-                    if existing.as_slice() == candidate {
+                for existing in 0..c {
+                    let existing_offset = existing * sub_dims;
+                    if &centroids[existing_offset..existing_offset + sub_dims] == candidate {
                         seen = true;
                         break;
                     }
                 }
                 if !seen {
-                    centroids[c].copy_from_slice(candidate);
+                    centroids[current_offset..current_offset + sub_dims].copy_from_slice(candidate);
                     break;
                 }
             }
@@ -469,108 +576,140 @@ fn kmeans_subspace(
     }
 
     let mut assignments = vec![usize::MAX; n];
+    let mut new_assignments = vec![usize::MAX; n];
+    const PAR_ASSIGNMENT_THRESHOLD: usize = 4096;
+    const PAR_UPDATE_THRESHOLD: usize = 4096;
+    let sum_len = k.saturating_mul(sub_dims);
+    let mut sums = vec![0.0f32; sum_len];
+    let mut counts = vec![0usize; k];
     for _ in 0..MAX_ITERS {
-        let mut changed = false;
-
         // Assignment step. SIMD-dispatched squared L2 keeps the inner
         // distance step at AVX2/NEON throughput on hot training paths.
-        // Each sample's nearest-centroid computation is independent: run
-        // them across rayon workers and collect by index so determinism
-        // is preserved.
-        let new_assignments: Vec<usize> = samples
-            .par_iter()
-            .with_min_len(128)
-            .map(|sample| {
+        // HNSW already trains subspaces in parallel and caps PQ training
+        // samples below the threshold, so bulk builds stay on the cheaper
+        // sequential assignment path and avoid nested rayon dispatch.
+        if n >= PAR_ASSIGNMENT_THRESHOLD {
+            new_assignments
+                .par_iter_mut()
+                .zip(samples.par_iter())
+                .with_min_len(PAR_ASSIGNMENT_THRESHOLD)
+                .for_each(|(assignment, sample)| {
+                    let sample = &sample[sub_start..sub_end];
+                    let mut best = 0usize;
+                    let mut best_dist = f32::INFINITY;
+                    for c in 0..k {
+                        let offset = c * sub_dims;
+                        let acc = flat_subspace_l2_squared(sample, &centroids, offset, sub_dims);
+                        if acc < best_dist {
+                            best_dist = acc;
+                            best = c;
+                        }
+                    }
+                    *assignment = best;
+                });
+        } else {
+            for (assignment, sample) in new_assignments.iter_mut().zip(samples.iter()) {
                 let sample = &sample[sub_start..sub_end];
                 let mut best = 0usize;
                 let mut best_dist = f32::INFINITY;
-                for (c, centroid) in centroids.iter().enumerate() {
-                    let acc = crate::simd::dispatch::l2_squared_f32(sample, &centroid[..sub_dims]);
+                for c in 0..k {
+                    let offset = c * sub_dims;
+                    let acc = flat_subspace_l2_squared(sample, &centroids, offset, sub_dims);
                     if acc < best_dist {
                         best_dist = acc;
                         best = c;
                     }
                 }
-                best
-            })
-            .collect();
+                *assignment = best;
+            }
+        }
+        let mut changed = false;
         for (old, new) in assignments.iter_mut().zip(new_assignments.iter()) {
             if *old != *new {
                 *old = *new;
                 changed = true;
             }
         }
+        if !changed {
+            break;
+        }
 
         // Update step. For large training sets, fold per-cluster sums into
-        // thread-local accumulators and element-wise reduce. The threshold
-        // keeps small inputs (including all current tests at n=64) on a
-        // single worker so the f32 sum order — and therefore the trained
-        // centroids — stay bit-for-bit deterministic. For n big enough to
-        // benefit, the reduce trades strict bit-determinism for the
-        // throughput win; Lloyd convergence is robust to rounding noise.
-        const PAR_UPDATE_THRESHOLD: usize = 1024;
-        let (sums, counts): (Vec<Vec<f32>>, Vec<usize>) = if n >= PAR_UPDATE_THRESHOLD {
-            samples
+        // thread-local flat accumulators and element-wise reduce. Keeping
+        // sums in one allocation avoids rebuilding `k` tiny Vecs on every
+        // Lloyd iteration, which matters in bulk index builds where PQ
+        // training runs before graph construction. The threshold keeps small
+        // inputs (including all current tests at n=64) on a single worker so
+        // the f32 sum order — and therefore the trained centroids — stay
+        // bit-for-bit deterministic. The HNSW bulk path caps PQ samples below
+        // this threshold, so it stays on the allocation-light sequential
+        // update. For n big enough to benefit, the reduce trades strict
+        // bit-determinism for the throughput win; Lloyd convergence is robust
+        // to rounding noise.
+        if n >= PAR_UPDATE_THRESHOLD {
+            let (par_sums, par_counts) = samples
                 .par_iter()
                 .enumerate()
                 .with_min_len(PAR_UPDATE_THRESHOLD)
                 .fold(
-                    || (vec![vec![0.0f32; sub_dims]; k], vec![0usize; k]),
+                    || (vec![0.0f32; sum_len], vec![0usize; k]),
                     |(mut local_sums, mut local_counts), (i, sample)| {
                         let c = assignments[i];
                         local_counts[c] += 1;
-                        let cluster = &mut local_sums[c];
-                        for (d, slot) in cluster.iter_mut().enumerate() {
-                            *slot += sample[sub_start + d];
+                        let offset = c * sub_dims;
+                        for d in 0..sub_dims {
+                            local_sums[offset + d] += sample[sub_start + d];
                         }
                         (local_sums, local_counts)
                     },
                 )
                 .reduce(
-                    || (vec![vec![0.0f32; sub_dims]; k], vec![0usize; k]),
+                    || (vec![0.0f32; sum_len], vec![0usize; k]),
                     |(mut a_sums, mut a_counts), (b_sums, b_counts)| {
                         for (ac, bc) in a_counts.iter_mut().zip(b_counts.iter()) {
                             *ac += *bc;
                         }
-                        for (a_sub, b_sub) in a_sums.iter_mut().zip(b_sums.iter()) {
-                            for (av, bv) in a_sub.iter_mut().zip(b_sub.iter()) {
-                                *av += *bv;
-                            }
+                        for (av, bv) in a_sums.iter_mut().zip(b_sums.iter()) {
+                            *av += *bv;
                         }
                         (a_sums, a_counts)
                     },
-                )
+                );
+            sums = par_sums;
+            counts = par_counts;
         } else {
-            let mut sums: Vec<Vec<f32>> = vec![vec![0.0f32; sub_dims]; k];
-            let mut counts = vec![0usize; k];
+            sums.fill(0.0);
+            counts.fill(0);
             for (i, sample) in samples.iter().enumerate() {
                 let c = assignments[i];
                 counts[c] += 1;
+                let offset = c * sub_dims;
                 for d in 0..sub_dims {
-                    sums[c][d] += sample[sub_start + d];
+                    sums[offset + d] += sample[sub_start + d];
                 }
             }
-            (sums, counts)
-        };
+        }
         for c in 0..k {
             if counts[c] == 0 {
                 // Empty cluster: re-seat it on a deterministic sample.
                 let pick = u64_to_usize(lcg.next_u64()) % n;
-                centroids[c].copy_from_slice(&samples[pick][sub_start..sub_end]);
+                let offset = c * sub_dims;
+                centroids[offset..offset + sub_dims]
+                    .copy_from_slice(&samples[pick][sub_start..sub_end]);
                 continue;
             }
             let inv = 1.0f32 / usize_to_f32(counts[c]);
+            let offset = c * sub_dims;
             for d in 0..sub_dims {
-                centroids[c][d] = sums[c][d] * inv;
+                centroids[offset + d] = sums[offset + d] * inv;
             }
-        }
-
-        if !changed {
-            break;
         }
     }
 
     centroids
+        .chunks_exact(sub_dims)
+        .map(<[f32]>::to_vec)
+        .collect()
 }
 
 #[cfg(test)]
@@ -645,6 +784,30 @@ mod tests {
     }
 
     #[test]
+    fn validated_slice_training_matches_checked_training() {
+        let samples = synth_samples(64, 8);
+        let sample_slices = samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let checked = ProductQuantizer::train_from_slices(&sample_slices, 2, 8).unwrap();
+        let validated =
+            ProductQuantizer::train_from_validated_slices(&sample_slices, 2, 8).unwrap();
+
+        for sample in samples.iter().take(16) {
+            assert_eq!(
+                checked.encode(sample).unwrap().codes,
+                validated.encode(sample).unwrap().codes
+            );
+        }
+    }
+
+    #[test]
+    fn validated_slice_training_still_rejects_dim_mismatch() {
+        let a = vec![0.0f32; 8];
+        let b = vec![0.0f32; 7];
+        let samples = vec![a.as_slice(), b.as_slice()];
+        assert!(ProductQuantizer::train_from_validated_slices(&samples, 2, 4).is_err());
+    }
+
+    #[test]
     fn approx_l2_identical_is_zero() {
         let samples = synth_samples(64, 8);
         let pq = ProductQuantizer::train(&samples, 2, 8).unwrap();
@@ -684,6 +847,7 @@ mod tests {
         let query_code = pq.encode(query).unwrap();
         let symmetric = pq.approx_l2(&query_code, &candidate);
         let asymmetric = pq.approx_l2_with_lut(&lut, &candidate);
+        assert!((lut.approx_l2_squared(&candidate).sqrt() - asymmetric).abs() < 1e-6);
         // ADC reads exact query-centroid distances while SDC quantizes
         // the query first; both expand the same sum across subspaces but
         // their tail terms differ by the residual within the query's own
