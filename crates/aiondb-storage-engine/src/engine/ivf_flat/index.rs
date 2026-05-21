@@ -409,15 +409,12 @@ impl IvfFlatIndex {
             }
             out
         } else {
-            let mut out = Vec::with_capacity(total_candidates);
+            let mut out = Vec::with_capacity(probe_lists.len().saturating_mul(k));
             for list_id in probe_lists {
                 let Some(list) = self.lists.get(list_id) else {
                     continue;
                 };
-                for entry in list {
-                    let d = distance_fn(&entry.vector, query);
-                    out.push((entry.tuple_id, d));
-                }
+                out.extend(score_list_top_k(list, query, k, distance_fn));
             }
             out
         };
@@ -680,6 +677,21 @@ fn truncate_scored_to_k(scored: &mut Vec<(TupleId, f32)>, k: usize) {
         });
         scored.truncate(keep);
     }
+}
+
+#[inline(always)]
+fn score_list_top_k(
+    list: &[ListEntry],
+    query: &[f32],
+    k: usize,
+    distance_fn: DistanceFn,
+) -> Vec<(TupleId, f32)> {
+    let mut scored: Vec<(TupleId, f32)> = list
+        .iter()
+        .map(|entry| (entry.tuple_id, distance_fn(&entry.vector, query)))
+        .collect();
+    truncate_scored_to_k(&mut scored, k);
+    scored
 }
 
 /// Deterministic Lloyd's k-means over an arbitrary slice iterator.
