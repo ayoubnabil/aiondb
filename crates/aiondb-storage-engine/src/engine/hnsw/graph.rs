@@ -45,6 +45,11 @@ fn usize_to_f64(value: usize) -> f64 {
 /// from `HnswIndex`; construction phases need to mutate `self.nodes` while
 /// the probe is alive.
 pub(crate) enum DistanceContext<'a> {
+    RawF32 {
+        query: &'a [f32],
+        distance_fn: DistanceFn,
+        gpu_metric: aiondb_gpu::DistanceMetric,
+    },
     Raw {
         query: Cow<'a, [f32]>,
         distance_fn: DistanceFn,
@@ -79,6 +84,9 @@ impl DistanceContext<'_> {
     /// Compute the metric distance between `node` and the encoded query.
     pub(crate) fn evaluate(&self, node: &HnswNode) -> f32 {
         match self {
+            Self::RawF32 {
+                query, distance_fn, ..
+            } => distance_fn(&node.vector, query),
             Self::Raw {
                 query,
                 distance_fn,
@@ -119,7 +127,7 @@ impl DistanceContext<'_> {
             Self::Product { query_lut } => node
                 .product_code
                 .as_ref()
-                .map_or(f32::INFINITY, |code| query_lut.approx_l2(code)),
+                .map_or(f32::INFINITY, |code| query_lut.approx_l2_squared(code)),
         }
     }
 
@@ -143,6 +151,39 @@ impl DistanceContext<'_> {
     ) {
         out.clear();
         if let (
+            Self::RawF32 {
+                query, gpu_metric, ..
+            },
+            Some(comp),
+        ) = (self, computer)
+        {
+            let query = *query;
+            let dims = query.len();
+            if dims > 0 && !nodes.is_empty() {
+                let mut targets_flat = Vec::with_capacity(nodes.len() * dims);
+                for (node, _) in nodes {
+                    let target = node.vector.as_slice();
+                    if target.len() >= dims {
+                        targets_flat.extend_from_slice(&target[..dims]);
+                    } else {
+                        targets_flat.extend_from_slice(target);
+                        targets_flat.resize(targets_flat.len() + dims - target.len(), 0.0);
+                    }
+                }
+                if let Ok(distances) =
+                    comp.compute_distances(query, &targets_flat, dims, *gpu_metric)
+                {
+                    out.extend(
+                        nodes
+                            .iter()
+                            .zip(distances)
+                            .map(|((_, tid), dist)| (*tid, dist)),
+                    );
+                    return;
+                }
+                // Fall through to scalar on error.
+            }
+        } else if let (
             Self::Raw {
                 query,
                 gpu_metric,
@@ -189,6 +230,20 @@ impl DistanceContext<'_> {
                 // Fall through to scalar on error.
             }
         }
+        if let Self::Product { query_lut } = self {
+            out.reserve(nodes.len());
+            for (idx, (node, tid)) in nodes.iter().enumerate() {
+                if let Some((next_node, _)) = nodes.get(idx + 1) {
+                    prefetch_product_code(next_node);
+                }
+                let dist = node
+                    .product_code
+                    .as_ref()
+                    .map_or(f32::INFINITY, |code| query_lut.approx_l2_squared(code));
+                out.push((*tid, dist));
+            }
+            return;
+        }
         // CPU-batch fallback: scalar `evaluate` per node, but with software
         // prefetch of the next node's vector to overlap L2/L3 latency with
         // compute. Binary mode also benefits from prefetching the next
@@ -199,6 +254,15 @@ impl DistanceContext<'_> {
                 prefetch_node_for_distance(next_node);
             }
             out.push((*tid, self.evaluate(node)));
+        }
+    }
+}
+
+#[inline]
+fn prefetch_product_code(node: &HnswNode) {
+    if let Some(code) = &node.product_code {
+        if !code.codes.is_empty() {
+            prefetch_read_t0(code.codes.as_ptr());
         }
     }
 }
@@ -263,6 +327,11 @@ fn prefetch_read_t0(ptr: *const u8) {
 
 fn resolve_distance_fn(metric: StoredVectorMetric) -> DistanceFn {
     distance_fn_raw(stored_to_vector_distance(metric))
+}
+
+#[inline]
+fn l2_squared_ordering_distance(a: &[f32], b: &[f32]) -> f32 {
+    aiondb_vector::simd::dispatch::l2_squared_f32(a, b)
 }
 
 /// Like [`resolve_distance_fn`] but swaps to the cosine fast path
@@ -488,7 +557,7 @@ const DEFAULT_PQ_CENTROIDS: usize = 256;
 /// Upper bound for bulk PQ training. Training on every row makes k-means the
 /// dominant cost on large loads; a deterministic spread sample keeps build
 /// time bounded while preserving representative codebooks.
-const MAX_BULK_PQ_TRAINING_SAMPLES: usize = 16_384;
+const MAX_BULK_PQ_TRAINING_SAMPLES: usize = 1_536;
 /// Minimum number of nodes accumulated before SQ / PQ quantizers are
 /// trained on-the-fly from live inserts. Below this threshold we keep raw
 /// f32 storage; once crossed we train from the existing nodes' retained
@@ -502,7 +571,7 @@ fn default_pq_subspaces(dims: usize) -> usize {
     if dims < 2 {
         return 1;
     }
-    for sub_dims in [8usize, 4, 2] {
+    for sub_dims in [6usize, 4, 8, 2] {
         if dims.is_multiple_of(sub_dims) {
             let m = dims / sub_dims;
             if m >= 2 {
@@ -513,18 +582,19 @@ fn default_pq_subspaces(dims: usize) -> usize {
     1
 }
 
-fn collect_pq_training_samples(entries: &[(TupleId, Vec<f32>)]) -> Vec<Vec<f32>> {
+fn collect_pq_training_sample_slices(entries: &[(TupleId, Vec<f32>)]) -> Vec<&[f32]> {
     if entries.len() <= MAX_BULK_PQ_TRAINING_SAMPLES {
-        return entries.iter().map(|(_, vec)| vec.clone()).collect();
+        return entries.iter().map(|(_, vec)| vec.as_slice()).collect();
     }
     let len = entries.len();
     (0..MAX_BULK_PQ_TRAINING_SAMPLES)
         .map(|i| {
             let idx = i.saturating_mul(len) / MAX_BULK_PQ_TRAINING_SAMPLES;
-            entries[idx].1.clone()
+            entries[idx].1.as_slice()
         })
         .collect()
 }
+
 const HNSW_MAX_EF_CONSTRUCTION: usize = search::HNSW_MAX_EF_SEARCH;
 // Mirror pgvector's hard cap. Larger dimensions multiply the per-node link
 // array memory cost and let an adversarial DDL author drive OOM with very few
@@ -879,15 +949,15 @@ impl HnswIndex {
                 let dims = first.len();
                 let m = default_pq_subspaces(dims);
                 let k = DEFAULT_PQ_CENTROIDS;
-                // The subsample helper still owns the chosen vectors -
-                // it has to, because it can pick from a sparse subset
-                // when the corpus exceeds `MAX_BULK_PQ_TRAINING_SAMPLES`.
-                // Pass them as borrowed slices into the k-means train
-                // path so the per-subspace loop never sees a Vec<Vec<>>.
-                let samples = collect_pq_training_samples(entries);
-                let sample_slices: Vec<&[f32]> = samples.iter().map(Vec::as_slice).collect();
-                self.product_quantizer =
-                    Some(ProductQuantizer::train_from_slices(&sample_slices, m, k)?);
+                // Borrow the sampled vectors directly; PQ training only
+                // reads them, so the bulk build path should not clone
+                // thousands of full-dimensional f32 vectors first.
+                let sample_slices = collect_pq_training_sample_slices(entries);
+                self.product_quantizer = Some(ProductQuantizer::train_from_validated_slices(
+                    &sample_slices,
+                    m,
+                    k,
+                )?);
             }
             _ => {}
         }
@@ -1026,7 +1096,7 @@ impl HnswIndex {
         };
         let product = if matches!(self.quantization, StoredQuantizationKind::Product) {
             if let Some(quantizer) = self.product_quantizer.as_ref() {
-                Some(quantizer.encode(vector)?)
+                Some(quantizer.encode_validated(vector))
             } else {
                 None
             }
@@ -1053,6 +1123,22 @@ impl HnswIndex {
         (vector.to_vec(), None)
     }
 
+    fn storage_for_owned_raw_vector(
+        &self,
+        vector: Vec<f32>,
+        binary_present: bool,
+    ) -> (Vec<f32>, Option<Vec<u8>>) {
+        if binary_present || matches!(self.quantization, StoredQuantizationKind::Binary) {
+            return (Vec::new(), None);
+        }
+        if self.element_type != aiondb_core::VectorElementType::Float32 {
+            let compact_data =
+                aiondb_core::vector_storage::encode_vector(&vector, self.element_type);
+            return (Vec::new(), Some(compact_data));
+        }
+        (vector, None)
+    }
+
     /// Parallel chunked builder used by [`from_rows_with_options`].
     fn parallel_build(&mut self, collected: Vec<(TupleId, Row)>) -> DbResult<()> {
         let ordinal = self
@@ -1069,10 +1155,11 @@ impl HnswIndex {
         let entries: Vec<(TupleId, Vec<f32>)> = collected
             .into_par_iter()
             .map(|(tid, row)| -> DbResult<(TupleId, Vec<f32>)> {
-                let value = row
-                    .values
-                    .get(ordinal)
-                    .ok_or_else(|| DbError::internal("row is missing indexed vector value"))?;
+                let mut values = row.into_values();
+                if ordinal >= values.len() {
+                    return Err(DbError::internal("row is missing indexed vector value"));
+                }
+                let value = values.swap_remove(ordinal);
                 let values = match value {
                     Value::Vector(v) => {
                         enforce_vector_dimension_limit(v.values.len())?;
@@ -1081,7 +1168,7 @@ impl HnswIndex {
                                 "HNSW index does not support non-finite vector values",
                             ));
                         }
-                        v.values.clone()
+                        v.values
                     }
                     Value::Null => {
                         return Err(DbError::internal(
@@ -1102,10 +1189,7 @@ impl HnswIndex {
         self.train_quantizer_from_entries(&entries)?;
         self.nodes.reserve(entries.len());
 
-        // Aggregate memory budget check (cheap, sequential).
-        for (_, v) in &entries {
-            self.ensure_insert_fits_budget(v.len())?;
-        }
+        self.ensure_bulk_insert_fits_budget(&entries)?;
 
         let total = entries.len();
         let n_threads = rayon::current_num_threads().max(1);
@@ -1128,48 +1212,86 @@ impl HnswIndex {
         let distance_fn = self.distance_fn;
         let gpu_metric = stored_to_gpu_metric(self.metric);
         let element_type = self.element_type;
-        let binary_quant = self.binary_quantizer.clone();
-        let scalar_quant = self.scalar_quantizer.clone();
-        let product_quant = self.product_quantizer.clone();
-        let quantization = self.quantization;
-        let params_template = self.params.clone();
-        for chunk in entries[warmup..].chunks(chunk_size) {
+        let storage_quantization = self.quantization;
+        let quantization = self.graph_build_quantization();
+        let ef_construction = self.params.ef_construction;
+        let m = self.params.m;
+        let m_max0 = self.params.m_max0;
+        let mut remaining = entries.into_iter().skip(warmup);
+        loop {
+            let chunk: Vec<(TupleId, Vec<f32>)> = remaining.by_ref().take(chunk_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
             // Layers are seeded from `nodes.len()` to keep the random stream
             // deterministic and aligned with sequential ordering.
             let base_count = self.nodes.len();
-            let layers: Vec<usize> = (0..chunk.len())
-                .map(|i| self.random_layer_for_count(base_count + i))
-                .collect();
+            let level_multiplier = self.params.ml;
 
             let snapshot_nodes: &FxHashMap<TupleId, HnswNode> = &self.nodes;
             let snapshot_ep = self.entry_point;
             let snapshot_max_layer = self.max_layer;
-            let params = params_template.clone();
-            let binary_quant = binary_quant.clone();
-            let scalar_quant = scalar_quant.clone();
-            let product_quant = product_quant.clone();
+            let binary_quant_ref = self.binary_quantizer.as_ref();
+            let scalar_quant_ref = self.scalar_quantizer.as_ref();
+            let product_quant_ref = self.product_quantizer.as_ref();
             let gpu = self.batch_distance.as_deref();
 
             let prepared: Vec<DbResult<NodeBuild>> = chunk
                 .par_iter()
-                .zip(layers.par_iter())
-                .map(|((tid, vec), &layer)| -> DbResult<NodeBuild> {
+                .enumerate()
+                .map(|(offset, (tid, vec))| -> DbResult<NodeBuild> {
+                    let layer = random_layer_for_count_with_multiplier(
+                        base_count + offset,
+                        level_multiplier,
+                    );
                     let probe = build_probe_standalone(
                         quantization,
-                        binary_quant.as_ref(),
-                        scalar_quant.as_ref(),
-                        product_quant.as_ref(),
+                        binary_quant_ref,
+                        scalar_quant_ref,
+                        product_quant_ref,
                         distance_fn,
                         gpu_metric,
                         element_type,
                         vec.as_slice(),
                     )?;
+                    let binary_code =
+                        if matches!(storage_quantization, StoredQuantizationKind::Binary) {
+                            let quantizer = binary_quant_ref.ok_or_else(|| {
+                                DbError::internal(
+                                    "HNSW binary quantizer not initialized for parallel build",
+                                )
+                            })?;
+                            Some(quantizer.encode(vec.as_slice())?)
+                        } else {
+                            None
+                        };
+                    let scalar_code =
+                        if matches!(storage_quantization, StoredQuantizationKind::Scalar) {
+                            if let Some(quantizer) = scalar_quant_ref {
+                                Some(quantizer.encode(vec.as_slice())?)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                    let product_code =
+                        if matches!(storage_quantization, StoredQuantizationKind::Product) {
+                            product_quant_ref
+                                .map(|quantizer| quantizer.encode_validated(vec.as_slice()))
+                        } else {
+                            None
+                        };
 
                     let Some(ep) = snapshot_ep else {
                         return Ok(NodeBuild {
                             tid: *tid,
                             layer,
-                            per_layer: Vec::new(),
+                            binary_code,
+                            scalar_code,
+                            product_code,
+                            upper_layers: Vec::new(),
+                            layer0: Vec::new(),
                         });
                     };
 
@@ -1179,36 +1301,49 @@ impl HnswIndex {
                     }
 
                     let insert_top = layer.min(snapshot_max_layer);
-                    let mut per_layer: Vec<Vec<(TupleId, f32)>> =
-                        Vec::with_capacity(insert_top + 1);
+                    let mut upper_layers: Vec<Vec<(TupleId, f32)>> = Vec::with_capacity(insert_top);
+                    let mut layer0 = Vec::new();
                     for lc in (0..=insert_top).rev() {
                         let mut _unused = 0u64;
-                        let result = search::search_layer_gpu(
+                        let mut candidates = search::search_layer_gpu(
                             snapshot_nodes,
                             current_ep,
-                            params.ef_construction,
+                            ef_construction,
                             lc,
                             &probe,
                             &mut _unused,
                             None,
                             gpu,
-                        );
-                        if !result.candidates.is_empty() {
-                            current_ep = result.candidates[0].0;
+                        )
+                        .candidates;
+                        if !candidates.is_empty() {
+                            current_ep = candidates[0].0;
                         }
-                        per_layer.push(result.candidates);
+                        if lc <= 2 {
+                            let max_connections = if lc == 0 { m_max0 } else { m };
+                            candidates.truncate(max_connections);
+                        }
+                        if lc == 0 {
+                            layer0 = candidates;
+                        } else {
+                            upper_layers.push(candidates);
+                        }
                     }
 
                     Ok(NodeBuild {
                         tid: *tid,
                         layer,
-                        per_layer,
+                        binary_code,
+                        scalar_code,
+                        product_code,
+                        upper_layers,
+                        layer0,
                     })
                 })
                 .collect();
 
             // Sequential commit: insert nodes and patch neighbor lists.
-            for (built, (_, vector)) in prepared.into_iter().zip(chunk.iter()) {
+            for (built, (_, vector)) in prepared.into_iter().zip(chunk.into_iter()) {
                 self.commit_prepared_node(built?, vector)?;
             }
         }
@@ -1230,7 +1365,7 @@ impl HnswIndex {
         };
         self.nodes.insert(tuple_id, node);
 
-        let probe = self.build_probe_for_query(vector)?;
+        let probe = self.build_probe_for_graph_insert(vector)?;
 
         let Some(ep) = self.entry_point else {
             self.entry_point = Some(tuple_id);
@@ -1313,14 +1448,18 @@ impl HnswIndex {
     }
 
     /// Sequentially commit a node whose candidate search ran in parallel.
-    fn commit_prepared_node(&mut self, built: NodeBuild, vector: &[f32]) -> DbResult<()> {
+    fn commit_prepared_node(&mut self, built: NodeBuild, vector: Vec<f32>) -> DbResult<()> {
         let NodeBuild {
             tid,
             layer,
-            per_layer,
+            binary_code,
+            scalar_code,
+            product_code,
+            upper_layers,
+            layer0,
         } = built;
-        let (binary_code, scalar_code, product_code) = self.encode_codes_for_vector(vector)?;
-        let (stored_vector, compact) = self.storage_for_raw_vector(vector, binary_code.is_some());
+        let (stored_vector, compact) =
+            self.storage_for_owned_raw_vector(vector, binary_code.is_some());
         let node = HnswNode {
             vector: stored_vector,
             compact_vector: compact,
@@ -1338,10 +1477,9 @@ impl HnswIndex {
             return Ok(());
         }
 
-        // `per_layer` was produced in order lc = insert_top..=0 (push order).
         let insert_top = layer.min(self.max_layer);
-        for (i, lc) in (0..=insert_top).rev().enumerate() {
-            let Some(candidates) = per_layer.get(i) else {
+        for (i, lc) in (1..=insert_top).rev().enumerate() {
+            let Some(candidates) = upper_layers.get(i) else {
                 break;
             };
             let max_connections = if lc == 0 {
@@ -1375,6 +1513,30 @@ impl HnswIndex {
                         if neighbor.neighbors[lc].len() > max_connections {
                             self.prune_connections(neighbor_id, lc, max_connections);
                         }
+                    }
+                }
+            }
+        }
+        let max_connections = self.params.m_max0;
+        let selected = layer0
+            .iter()
+            .take(max_connections)
+            .copied()
+            .collect::<Vec<_>>();
+        for &(neighbor_id, _) in &selected {
+            if neighbor_id == tid {
+                continue;
+            }
+            if let Some(node) = self.nodes.get_mut(&tid) {
+                if !node.neighbors.is_empty() {
+                    neighbor_list_insert(&mut node.neighbors[0], neighbor_id);
+                }
+            }
+            if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
+                if !neighbor.neighbors.is_empty() {
+                    neighbor_list_insert(&mut neighbor.neighbors[0], tid);
+                    if neighbor.neighbors[0].len() > max_connections {
+                        self.prune_connections(neighbor_id, 0, max_connections);
                     }
                 }
             }
@@ -1433,7 +1595,7 @@ impl HnswIndex {
         };
         self.nodes.insert(tuple_id, node);
 
-        let probe = self.build_probe_for_query(&vector)?;
+        let probe = self.build_probe_for_graph_insert(&vector)?;
 
         let Some(ep) = self.entry_point else {
             // First node: just set as entry point.
@@ -1631,6 +1793,23 @@ impl HnswIndex {
                      {current} + {new_vector_bytes} > {budget} bytes"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_bulk_insert_fits_budget(&self, entries: &[(TupleId, Vec<f32>)]) -> DbResult<()> {
+        let Some(budget) = self.max_memory_bytes else {
+            return Ok(());
+        };
+        let current = self.memory_usage_bytes();
+        let additional = entries.iter().fold(0u64, |total, (_, vector)| {
+            total.saturating_add(self.estimate_node_bytes(vector.len(), 1))
+        });
+        if current.saturating_add(additional) > budget {
+            return Err(DbError::program_limit(format!(
+                "HNSW index memory budget exceeded: \
+                 {current} + {additional} > {budget} bytes"
+            )));
         }
         Ok(())
     }
@@ -1884,7 +2063,7 @@ impl HnswIndex {
             // of the heap, but rescoring all of them is wasted work -
             // candidates ranked beyond the top-approx_k by the codebook
             // metric are very unlikely to land in the exact top-k.
-            let rescore_limit = approx_k.min(result.candidates.len());
+            let rescore_limit = self.rescore_candidate_limit(approx_k, result.candidates.len());
             let (ids, rescored) =
                 self.rescore_candidates(query, &result.candidates[..rescore_limit], k);
             stats.rescored_candidates = usize_to_u64_saturating(rescored);
@@ -1917,6 +2096,17 @@ impl HnswIndex {
         }
     }
 
+    fn rescore_candidate_limit(&self, approx_k: usize, candidate_count: usize) -> usize {
+        match self.quantization {
+            // PQ has the widest approximate-distance error. If the caller or
+            // large-graph floor already paid to keep a broader layer-0 result
+            // set, exact rescoring all of it improves recall without changing
+            // graph traversal breadth.
+            StoredQuantizationKind::Product => candidate_count,
+            _ => approx_k.min(candidate_count),
+        }
+    }
+
     /// Keep recall from collapsing on larger HNSW graphs when callers use a
     /// small pgvector-compatible `ef_search` such as 40 or 128. The caller's
     /// value is still honored as a minimum; this only widens under-sized
@@ -1934,6 +2124,14 @@ impl HnswIndex {
         requested.max(floor.min(search::HNSW_MAX_EF_SEARCH))
     }
 
+    fn rescore_distance_fn(&self) -> DistanceFn {
+        if matches!(self.metric, StoredVectorMetric::L2) {
+            l2_squared_ordering_distance
+        } else {
+            self.distance_fn
+        }
+    }
+
     /// Recompute exact distances for an approximate shortlist and return the
     /// top-`k` tuple IDs sorted by the exact metric, together with the
     /// number of candidates that actually contributed to the rescoring pass.
@@ -1943,7 +2141,7 @@ impl HnswIndex {
         candidates: &[(TupleId, f32)],
         k: usize,
     ) -> (Vec<TupleId>, usize) {
-        let exact_distance = self.distance_fn;
+        let exact_distance = self.rescore_distance_fn();
         let element_type = self.element_type;
         // Small shortlists do not justify rayon dispatch overhead; the
         // sequential path also keeps decode_scratch on the stack of one
@@ -1997,6 +2195,13 @@ impl HnswIndex {
         };
         let rescored_count = rescored.len();
         let mut rescored = rescored;
+        let keep = k.min(rescored.len());
+        if keep < rescored.len() {
+            rescored.select_nth_unstable_by(keep, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            rescored.truncate(keep);
+        }
         rescored
             .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let ids = rescored.into_iter().take(k).map(|(id, _)| id).collect();
@@ -2147,25 +2352,30 @@ impl HnswIndex {
     /// parallel builder so layer assignment matches the eventual insertion
     /// order without requiring the node to be in `self.nodes` yet.
     fn random_layer_for_count(&self, count: usize) -> usize {
-        let r: f64 = pseudo_random(usize_to_u64_saturating(count));
-        let raw_layer = (-r.ln() * self.params.ml).floor();
+        random_layer_for_count_with_multiplier(count, self.params.ml)
+    }
 
-        // Keep layer assignment stable and bounded even under pathological
-        // floating-point inputs.
-        if !raw_layer.is_finite() || raw_layer <= 0.0 {
-            return 0;
+    /// Quantization mode to use while constructing graph topology. SQ/PQ
+    /// indexes keep raw vectors, so their edges can be chosen with the exact
+    /// metric and the quantized codes can remain a search-time accelerator.
+    fn graph_build_quantization(&self) -> StoredQuantizationKind {
+        match self.quantization {
+            StoredQuantizationKind::Scalar | StoredQuantizationKind::Product => {
+                StoredQuantizationKind::None
+            }
+            StoredQuantizationKind::Binary | StoredQuantizationKind::None => self.quantization,
         }
+    }
 
-        // Current pseudo-random mapping keeps this small in practice, but we
-        // still enforce an explicit upper bound to avoid unsafe growth.
-        const MAX_RANDOM_LAYER: usize = 64;
-        let mut remaining = raw_layer.min(usize_to_f64(MAX_RANDOM_LAYER));
-        let mut layer = 0usize;
-        while remaining >= 1.0 && layer < MAX_RANDOM_LAYER {
-            layer = layer.saturating_add(1);
-            remaining -= 1.0;
+    fn build_probe_for_graph_insert<'a>(&self, query: &'a [f32]) -> DbResult<DistanceContext<'a>> {
+        if matches!(
+            self.graph_build_quantization(),
+            StoredQuantizationKind::None
+        ) {
+            Ok(self.build_raw_probe(query))
+        } else {
+            self.build_probe_for_query(query)
         }
-        layer
     }
 
     /// Build a [`DistanceContext`] for the given raw query vector, honoring
@@ -2213,6 +2423,13 @@ impl HnswIndex {
     }
 
     fn build_raw_probe<'a>(&self, query: &'a [f32]) -> DistanceContext<'a> {
+        if self.element_type == aiondb_core::VectorElementType::Float32 {
+            return DistanceContext::RawF32 {
+                query,
+                distance_fn: self.distance_fn,
+                gpu_metric: stored_to_gpu_metric(self.metric),
+            };
+        }
         DistanceContext::Raw {
             query: Cow::Borrowed(query),
             distance_fn: self.distance_fn,
@@ -2390,8 +2607,14 @@ impl HnswIndex {
 struct NodeBuild {
     tid: TupleId,
     layer: usize,
-    /// Per-layer candidate lists in push order (lc = insert_top..=0).
-    per_layer: Vec<Vec<(TupleId, f32)>>,
+    binary_code: Option<BinaryCode>,
+    scalar_code: Option<ScalarCode>,
+    product_code: Option<ProductCode>,
+    /// Candidate lists for layers above 0 in push order (lc = insert_top..=1).
+    upper_layers: Vec<Vec<(TupleId, f32)>>,
+    /// Candidate list for layer 0. Stored inline because most nodes only have
+    /// this layer, avoiding one outer Vec allocation per bulk-built row.
+    layer0: Vec<(TupleId, f32)>,
 }
 
 /// Free-function variant of [`HnswIndex::greedy_closest`] that works on any
@@ -2428,6 +2651,28 @@ fn neighbor_list_remove(list: &mut Vec<TupleId>, id: TupleId) {
     if let Some(pos) = list.iter().position(|x| *x == id) {
         list.swap_remove(pos);
     }
+}
+
+fn random_layer_for_count_with_multiplier(count: usize, level_multiplier: f64) -> usize {
+    let r: f64 = pseudo_random(usize_to_u64_saturating(count));
+    let raw_layer = (-r.ln() * level_multiplier).floor();
+
+    // Keep layer assignment stable and bounded even under pathological
+    // floating-point inputs.
+    if !raw_layer.is_finite() || raw_layer <= 0.0 {
+        return 0;
+    }
+
+    // Current pseudo-random mapping keeps this small in practice, but we
+    // still enforce an explicit upper bound to avoid unsafe growth.
+    const MAX_RANDOM_LAYER: usize = 64;
+    let mut remaining = raw_layer.min(usize_to_f64(MAX_RANDOM_LAYER));
+    let mut layer = 0usize;
+    while remaining >= 1.0 && layer < MAX_RANDOM_LAYER {
+        layer = layer.saturating_add(1);
+        remaining -= 1.0;
+    }
+    layer
 }
 
 fn greedy_closest_in(
@@ -2477,12 +2722,21 @@ fn build_probe_standalone<'a>(
     element_type: aiondb_core::VectorElementType,
     query: &'a [f32],
 ) -> DbResult<DistanceContext<'a>> {
-    let raw_fallback = || DistanceContext::Raw {
-        query: Cow::Borrowed(query),
-        distance_fn,
-        gpu_metric,
-        element_type,
-        decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
+    let raw_fallback = || {
+        if element_type == aiondb_core::VectorElementType::Float32 {
+            return DistanceContext::RawF32 {
+                query,
+                distance_fn,
+                gpu_metric,
+            };
+        }
+        DistanceContext::Raw {
+            query: Cow::Borrowed(query),
+            distance_fn,
+            gpu_metric,
+            element_type,
+            decode_scratch: RefCell::new(Vec::with_capacity(query.len())),
+        }
     };
     match quantization {
         StoredQuantizationKind::Binary => {
