@@ -53,6 +53,9 @@ pub struct IvfFlatIndex {
     column_ordinal: Option<usize>,
     /// `centroids[i]` is the centroid vector for list `i`, length `dims`.
     centroids: Vec<Vec<f32>>,
+    /// Contiguous mirror of `centroids`, laid out as centroid_count * dims.
+    flat_centroids: Vec<f32>,
+    centroid_dims: usize,
     /// `lists[i]` holds the members assigned to centroid `i`.
     lists: Vec<Vec<ListEntry>>,
     /// Reverse lookup so deletes don't have to scan every list.
@@ -73,6 +76,8 @@ impl Clone for IvfFlatIndex {
             distance_fn: self.distance_fn,
             column_ordinal: self.column_ordinal,
             centroids: self.centroids.clone(),
+            flat_centroids: self.flat_centroids.clone(),
+            centroid_dims: self.centroid_dims,
             lists: self.lists.clone(),
             tuple_index: self.tuple_index.clone(),
             stat_total_searches: AtomicU64::new(self.stat_total_searches.load(Ordering::Relaxed)),
@@ -203,6 +208,8 @@ impl IvfFlatIndex {
             distance_fn,
             column_ordinal: None,
             centroids: Vec::new(),
+            flat_centroids: Vec::new(),
+            centroid_dims: 0,
             lists: vec![Vec::new(); nlist],
             tuple_index: HashMap::new(),
             options,
@@ -341,7 +348,7 @@ impl IvfFlatIndex {
                 "IVF-flat search query contains non-finite values",
             ));
         }
-        let centroid_dims = self.centroids[0].len();
+        let centroid_dims = self.centroid_dims;
         if centroid_dims != query.len() {
             return Err(DbError::internal(format!(
                 "IVF-flat query dimension mismatch: {centroid_dims} vs {}",
@@ -354,8 +361,8 @@ impl IvfFlatIndex {
             .min(u32_to_usize_saturating(IVF_MAX_NPROBE));
 
         let mut centroid_distances: Vec<(usize, f32)> = self
-            .centroids
-            .iter()
+            .flat_centroids
+            .chunks_exact(centroid_dims)
             .enumerate()
             .map(|(idx, centroid)| (idx, (self.distance_fn)(centroid, query)))
             .collect();
@@ -553,12 +560,15 @@ impl IvfFlatIndex {
             nlist,
             self.distance_fn,
         );
+        self.centroid_dims = dims;
+        self.flat_centroids = flatten_centroids(&centroids, dims);
         self.centroids = centroids;
         let distance_fn = self.distance_fn;
+        let flat_centroids = &self.flat_centroids;
         let assigned: Vec<(usize, TupleId, Vec<f32>)> = entries
             .into_par_iter()
             .map(|(tid, vector)| {
-                let list_id = nearest_centroid_in(&self.centroids, distance_fn, &vector);
+                let list_id = nearest_centroid_in_flat(flat_centroids, dims, distance_fn, &vector);
                 (list_id, tid, vector)
             })
             .collect();
@@ -583,23 +593,32 @@ impl IvfFlatIndex {
     }
 
     fn nearest_centroid(&self, vector: &[f32]) -> usize {
-        let mut best = 0usize;
-        let mut best_dist = f32::INFINITY;
-        for (idx, centroid) in self.centroids.iter().enumerate() {
-            let d = (self.distance_fn)(centroid, vector);
-            if d < best_dist {
-                best_dist = d;
-                best = idx;
-            }
-        }
-        best
+        nearest_centroid_in_flat(
+            &self.flat_centroids,
+            self.centroid_dims,
+            self.distance_fn,
+            vector,
+        )
     }
 }
 
-fn nearest_centroid_in(centroids: &[Vec<f32>], distance_fn: DistanceFn, vector: &[f32]) -> usize {
+fn flatten_centroids(centroids: &[Vec<f32>], dims: usize) -> Vec<f32> {
+    let mut flat = Vec::with_capacity(centroids.len().saturating_mul(dims));
+    for centroid in centroids {
+        flat.extend_from_slice(centroid);
+    }
+    flat
+}
+
+fn nearest_centroid_in_flat(
+    centroids: &[f32],
+    dims: usize,
+    distance_fn: DistanceFn,
+    vector: &[f32],
+) -> usize {
     let mut best = 0usize;
     let mut best_dist = f32::INFINITY;
-    for (idx, centroid) in centroids.iter().enumerate() {
+    for (idx, centroid) in centroids.chunks_exact(dims).enumerate() {
         let d = distance_fn(centroid, vector);
         if d < best_dist {
             best_dist = d;
