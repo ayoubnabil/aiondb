@@ -657,12 +657,20 @@ fn enforce_dimension_limit(dims: usize) -> DbResult<()> {
 }
 
 fn resolve_distance_fn(metric: StoredVectorMetric) -> DistanceFn {
+    if matches!(metric, StoredVectorMetric::L2) {
+        return l2_squared_ordering_distance;
+    }
     distance_fn_raw(match metric {
         StoredVectorMetric::L2 => VectorDistance::L2,
         StoredVectorMetric::Cosine => VectorDistance::Cosine,
         StoredVectorMetric::InnerProduct => VectorDistance::InnerProduct,
         StoredVectorMetric::Manhattan => VectorDistance::Manhattan,
     })
+}
+
+#[inline]
+fn l2_squared_ordering_distance(a: &[f32], b: &[f32]) -> f32 {
+    aiondb_vector::simd::dispatch::l2_squared_f32(a, b)
 }
 
 fn elapsed_micros(start: std::time::Instant) -> u64 {
