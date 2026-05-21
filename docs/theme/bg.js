@@ -269,11 +269,18 @@
   var uMilk = gl.getUniformLocation(prog, 'u_milk');
 
   function resize() {
-    var dpr = Math.min(window.devicePixelRatio || 1, 2);
-    c.width = Math.floor(window.innerWidth * dpr);
-    c.height = Math.floor(window.innerHeight * dpr);
-    c.style.width = window.innerWidth + 'px';
-    c.style.height = window.innerHeight + 'px';
+    var width = window.innerWidth;
+    var height = window.innerHeight;
+    var dpr = Math.min(window.devicePixelRatio || 1, 1);
+    var pixels = width * height * dpr * dpr;
+    var maxPixels = 900000;
+    if (pixels > maxPixels) {
+      dpr *= Math.sqrt(maxPixels / pixels);
+    }
+    c.width = Math.max(1, Math.floor(width * dpr));
+    c.height = Math.max(1, Math.floor(height * dpr));
+    c.style.width = width + 'px';
+    c.style.height = height + 'px';
     gl.viewport(0, 0, c.width, c.height);
   }
   window.addEventListener('resize', resize, { passive: true });
@@ -302,8 +309,10 @@
     startMs = Date.now();
   }
 
+  var rafId = 0;
   var last = 0;
-  var INTERVAL = 1000 / 30; /* throttle to 30fps */
+  var running = false;
+  var INTERVAL = 1000 / 12; /* keep the ambient background cheap */
 
   /* Render once synchronously so the first frame is correct before rAF kicks in */
   function render(t) {
@@ -322,20 +331,42 @@
   var initial = prefersReduced ? 0 : (Date.now() - startMs) / 1000;
   render(initial);
 
+  function shouldRun() {
+    return !prefersReduced && !document.hidden;
+  }
+
   function frame(now) {
+    if (!running) return;
     if (now - last >= INTERVAL) {
       last = now;
       applyTheme(Date.now(), false);
-      var t = prefersReduced ? 0 : (Date.now() - startMs) / 1000;
+      var t = (Date.now() - startMs) / 1000;
       render(t);
     }
-    requestAnimationFrame(frame);
+    rafId = requestAnimationFrame(frame);
   }
-  requestAnimationFrame(frame);
 
-  /* Pause work when the tab is hidden, resume on visibility */
+  function start() {
+    if (running || !shouldRun()) return;
+    running = true;
+    last = 0;
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+  }
+
+  start();
+
+  /* Stop requesting frames while hidden; resume only when visible again. */
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) last = 0;
+    if (shouldRun()) start();
+    else stop();
   });
 
 })();

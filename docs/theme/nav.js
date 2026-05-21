@@ -19,11 +19,22 @@
   var NAV_SEL = '.top-nav';
 
   var cache = Object.create(null);
+  var cacheOrder = [];
+  var MAX_CACHE_PAGES = 12;
   var inflight = null;
 
   function normalizePath(path) {
     var u = new URL(path, window.location.origin);
     return u.pathname + u.search;
+  }
+
+  function remember(key, html) {
+    if (!cache[key]) cacheOrder.push(key);
+    cache[key] = html;
+    while (cacheOrder.length > MAX_CACHE_PAGES) {
+      var old = cacheOrder.shift();
+      if (old !== key) delete cache[old];
+    }
   }
 
   function swap(html, url) {
@@ -88,7 +99,7 @@
         return r.text();
       })
       .then(function (html) {
-        cache[key] = html;
+        remember(key, html);
         if (push) window.history.pushState({ url: url }, '', url);
         swap(html, url);
         document.dispatchEvent(new CustomEvent('aion:navigated', { detail: { url: url } }));
@@ -100,45 +111,15 @@
   }
 
   /*
-   * Idle-time prefetch.
-   * Reads /manifest.json (emitted by build.py) and warms the cache for every
-   * page. Subsequent navigations resolve synchronously from memory.
+   * Keep the current document available for back/forward without warming the
+   * whole documentation tree. The old eager prefetch kept every generated page
+   * in memory, which made long browsing sessions heavier than needed.
    */
-  function prefetchAll() {
-    /* Seed the cache with the page we are currently on */
+  function seedCurrentPage() {
     try {
       var here = window.location.pathname + window.location.search;
-      cache[here] = '<!doctype html>' + document.documentElement.outerHTML;
+      remember(here, '<!doctype html>' + document.documentElement.outerHTML);
     } catch (_) { /* fine */ }
-
-    var idle = window.requestIdleCallback || function (cb) {
-      return setTimeout(function () { cb({ timeRemaining: function () { return 50; } }); }, 60);
-    };
-
-    fetch('/manifest.json', { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (list) {
-        if (!Array.isArray(list)) return;
-
-        var i = 0;
-        function step() {
-          if (i >= list.length) return;
-          idle(function () {
-            var url = list[i++];
-            var key = normalizePath(url);
-            if (cache[key]) { step(); return; }
-            fetch(url, { credentials: 'same-origin' })
-              .then(function (r) { return r.ok ? r.text() : null; })
-              .then(function (html) {
-                if (html) cache[key] = html;
-                step();
-              })
-              .catch(step);
-          });
-        }
-        step();
-      })
-      .catch(function () { /* manifest missing - prefetch off */ });
   }
 
   function handleClick(e) {
@@ -181,7 +162,7 @@
     loadPath(u, false);
   });
 
-  /* Kick off prefetch after first paint */
-  if (document.readyState === 'complete') prefetchAll();
-  else window.addEventListener('load', prefetchAll, { once: true });
+  /* Seed after first paint without preloading the entire site. */
+  if (document.readyState === 'complete') seedCurrentPage();
+  else window.addEventListener('load', seedCurrentPage, { once: true });
 })();
