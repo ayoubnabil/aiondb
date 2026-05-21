@@ -60,7 +60,30 @@ fn make_index_desc() -> IndexStorageDescriptor {
         }],
         include_columns: vec![],
         hnsw_options: None,
-            ivf_flat_options: None,
+        ivf_flat_options: None,
+    }
+}
+
+#[test]
+fn default_pq_subspaces_prefers_balanced_accuracy_for_common_dims() {
+    assert_eq!(DEFAULT_PQ_CENTROIDS, 256);
+    assert_eq!(default_pq_subspaces(96), 16);
+    assert_eq!(default_pq_subspaces(384), 64);
+}
+
+#[test]
+fn pq_training_sample_slices_are_capped_and_borrowed() {
+    let len = MAX_BULK_PQ_TRAINING_SAMPLES * 2 + 17;
+    let entries = (0..len)
+        .map(|idx| (TupleId::new(idx as u64 + 1), vec![idx as f32]))
+        .collect::<Vec<_>>();
+    let samples = collect_pq_training_sample_slices(&entries);
+    assert_eq!(samples.len(), MAX_BULK_PQ_TRAINING_SAMPLES);
+
+    for &sample_idx in &[0usize, MAX_BULK_PQ_TRAINING_SAMPLES / 2, samples.len() - 1] {
+        let entry_idx = sample_idx.saturating_mul(len) / MAX_BULK_PQ_TRAINING_SAMPLES;
+        assert_eq!(samples[sample_idx], entries[entry_idx].1.as_slice());
+        assert_eq!(samples[sample_idx].as_ptr(), entries[entry_idx].1.as_ptr());
     }
 }
 
@@ -1088,6 +1111,57 @@ fn quantization_declared_but_storage_uses_raw() {
 }
 
 #[test]
+fn scalar_and_product_build_graph_with_exact_distance() {
+    use aiondb_storage_api::{HnswStorageOptions, StoredQuantizationKind, StoredVectorMetric};
+
+    for quantization in [
+        StoredQuantizationKind::Scalar,
+        StoredQuantizationKind::Product,
+    ] {
+        let mut desc = make_index_desc();
+        desc.hnsw_options = Some(HnswStorageOptions {
+            m: 4,
+            ef_construction: 20,
+            distance_metric: StoredVectorMetric::L2,
+            quantization,
+            prenormalised: false,
+        });
+        let index = HnswIndex::from_descriptor(desc);
+        assert_eq!(
+            index.graph_build_quantization(),
+            StoredQuantizationKind::None
+        );
+    }
+}
+
+#[test]
+fn product_rescore_uses_full_candidate_set_when_ef_is_wider() {
+    use aiondb_storage_api::{HnswStorageOptions, StoredQuantizationKind, StoredVectorMetric};
+
+    let mut desc = make_index_desc();
+    desc.hnsw_options = Some(HnswStorageOptions {
+        m: 4,
+        ef_construction: 20,
+        distance_metric: StoredVectorMetric::L2,
+        quantization: StoredQuantizationKind::Product,
+        prenormalised: false,
+    });
+    let product = HnswIndex::from_descriptor(desc);
+    assert_eq!(product.rescore_candidate_limit(120, 160), 160);
+
+    let mut desc = make_index_desc();
+    desc.hnsw_options = Some(HnswStorageOptions {
+        m: 4,
+        ef_construction: 20,
+        distance_metric: StoredVectorMetric::L2,
+        quantization: StoredQuantizationKind::Scalar,
+        prenormalised: false,
+    });
+    let scalar = HnswIndex::from_descriptor(desc);
+    assert_eq!(scalar.rescore_candidate_limit(120, 160), 120);
+}
+
+#[test]
 fn binary_quantization_stores_codes_and_drops_raw_vectors() {
     use aiondb_storage_api::{HnswStorageOptions, StoredQuantizationKind, StoredVectorMetric};
     let table_desc = make_table_desc();
@@ -1412,10 +1486,7 @@ fn assert_lazy_training_back_fills_codes(
 
 #[test]
 fn lazy_training_trains_scalar_quantizer_after_threshold_inserts() {
-    assert_lazy_training_back_fills_codes(
-        aiondb_storage_api::StoredQuantizationKind::Scalar,
-        0.85,
-    );
+    assert_lazy_training_back_fills_codes(aiondb_storage_api::StoredQuantizationKind::Scalar, 0.85);
 }
 
 #[test]
@@ -1455,7 +1526,10 @@ fn search_stats_report_quantization_and_rescored_candidates() {
         .collect::<Vec<_>>();
     let index = HnswIndex::from_rows_with_options(&index_desc, &table_desc, rows).unwrap();
     let (results, stats) = index.search(&dataset[0], 5, 64);
-    assert!(!results.is_empty(), "scalar-quantized search returned no rows");
+    assert!(
+        !results.is_empty(),
+        "scalar-quantized search returned no rows"
+    );
     assert_eq!(
         stats.quantization,
         aiondb_storage_api::StoredQuantizationKind::Scalar,
@@ -1571,9 +1645,9 @@ fn search_stats_report_oversample_factor_for_quantized_index() {
         stats.quantization,
         aiondb_storage_api::StoredQuantizationKind::Product,
     );
-    assert_eq!(stats.oversample_factor, 5);
+    assert_eq!(stats.oversample_factor, 12);
     assert!(
-        stats.effective_ef_search >= 50,
+        stats.effective_ef_search >= 120,
         "PQ search should widen ef_search to at least k * oversample (got {})",
         stats.effective_ef_search,
     );
