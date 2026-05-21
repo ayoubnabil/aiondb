@@ -554,10 +554,24 @@ impl IvfFlatIndex {
             self.distance_fn,
         );
         self.centroids = centroids;
-        self.lists = vec![Vec::new(); self.centroids.len()];
+        let distance_fn = self.distance_fn;
+        let assigned: Vec<(usize, TupleId, Vec<f32>)> = entries
+            .into_par_iter()
+            .map(|(tid, vector)| {
+                let list_id = nearest_centroid_in(&self.centroids, distance_fn, &vector);
+                (list_id, tid, vector)
+            })
+            .collect();
+        let mut list_sizes = vec![0usize; self.centroids.len()];
+        for (list_id, _, _) in &assigned {
+            list_sizes[*list_id] += 1;
+        }
+        self.lists = list_sizes
+            .into_iter()
+            .map(Vec::with_capacity)
+            .collect();
         self.tuple_index.clear();
-        for (tid, vector) in entries {
-            let list_id = self.nearest_centroid(&vector);
+        for (list_id, tid, vector) in assigned {
             let position = self.lists[list_id].len();
             self.lists[list_id].push(ListEntry {
                 tuple_id: tid,
@@ -580,6 +594,19 @@ impl IvfFlatIndex {
         }
         best
     }
+}
+
+fn nearest_centroid_in(centroids: &[Vec<f32>], distance_fn: DistanceFn, vector: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_dist = f32::INFINITY;
+    for (idx, centroid) in centroids.iter().enumerate() {
+        let d = distance_fn(centroid, vector);
+        if d < best_dist {
+            best_dist = d;
+            best = idx;
+        }
+    }
+    best
 }
 
 fn validate_options(options: &IvfFlatStorageOptions) -> DbResult<()> {
