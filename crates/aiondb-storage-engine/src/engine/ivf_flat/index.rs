@@ -387,19 +387,32 @@ impl IvfFlatIndex {
             .iter()
             .filter_map(|id| self.lists.get(*id).map(|list| list.len()))
             .sum();
-        let mut scored: Vec<(TupleId, f32)> = Vec::with_capacity(total_candidates);
-        for list_id in probe_lists {
-            let Some(list) = self.lists.get(list_id) else {
-                continue;
-            };
-            stats.distance_computations = stats
-                .distance_computations
-                .saturating_add(list.len() as u64);
-            for entry in list {
-                let d = distance_fn(&entry.vector, query);
-                scored.push((entry.tuple_id, d));
+        stats.distance_computations = stats
+            .distance_computations
+            .saturating_add(total_candidates as u64);
+        const PARALLEL_SCAN_THRESHOLD: usize = 16_384;
+        let mut scored: Vec<(TupleId, f32)> = if total_candidates >= PARALLEL_SCAN_THRESHOLD {
+            probe_lists
+                .par_iter()
+                .filter_map(|list_id| self.lists.get(*list_id))
+                .flat_map_iter(|list| {
+                    list.iter()
+                        .map(move |entry| (entry.tuple_id, distance_fn(&entry.vector, query)))
+                })
+                .collect()
+        } else {
+            let mut out = Vec::with_capacity(total_candidates);
+            for list_id in probe_lists {
+                let Some(list) = self.lists.get(list_id) else {
+                    continue;
+                };
+                for entry in list {
+                    let d = distance_fn(&entry.vector, query);
+                    out.push((entry.tuple_id, d));
+                }
             }
-        }
+            out
+        };
         let keep = k.min(scored.len());
         if keep < scored.len() {
             scored.select_nth_unstable_by(keep, |a, b| {
