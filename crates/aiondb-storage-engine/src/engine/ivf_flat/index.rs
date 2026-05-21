@@ -360,9 +360,14 @@ impl IvfFlatIndex {
             .map(|(idx, centroid)| (idx, (self.distance_fn)(centroid, query)))
             .collect();
         stats.centroids_evaluated = usize_to_u64_saturating(centroid_distances.len());
-        centroid_distances.sort_unstable_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if nprobe < centroid_distances.len() {
+            centroid_distances.select_nth_unstable_by(nprobe, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            centroid_distances.truncate(nprobe);
+        }
+        centroid_distances
+            .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let probe_lists: Vec<usize> = centroid_distances
             .iter()
             .take(nprobe)
@@ -370,22 +375,39 @@ impl IvfFlatIndex {
             .collect();
         stats.lists_scanned = usize_to_u64_saturating(probe_lists.len());
 
-        let mut scored: Vec<(TupleId, f32)> = Vec::new();
+        // Single-pass scan: each list contributes to a flat scored Vec,
+        // then a single sort_unstable + take(k) yields the result.
+        // Benchmarks against a per-candidate top-k heap showed the heap
+        // pattern is theoretically faster (O(n log k)) but actually
+        // slower in practice at typical (nlist, nprobe) settings because
+        // sort_unstable vectorizes the comparison much better than the
+        // branch-heavy NaN-safe heap pop / push.
         let distance_fn = self.distance_fn;
+        let total_candidates: usize = probe_lists
+            .iter()
+            .filter_map(|id| self.lists.get(*id).map(|list| list.len()))
+            .sum();
+        let mut scored: Vec<(TupleId, f32)> = Vec::with_capacity(total_candidates);
         for list_id in probe_lists {
             let Some(list) = self.lists.get(list_id) else {
                 continue;
             };
-            stats.distance_computations =
-                stats.distance_computations.saturating_add(list.len() as u64);
+            stats.distance_computations = stats
+                .distance_computations
+                .saturating_add(list.len() as u64);
             for entry in list {
                 let d = distance_fn(&entry.vector, query);
                 scored.push((entry.tuple_id, d));
             }
         }
-        scored.sort_unstable_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let keep = k.min(scored.len());
+        if keep < scored.len() {
+            scored.select_nth_unstable_by(keep, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(keep);
+        }
+        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let ids: Vec<TupleId> = scored.into_iter().take(k).map(|(id, _)| id).collect();
 
         stats.duration_micros = elapsed_micros(start);

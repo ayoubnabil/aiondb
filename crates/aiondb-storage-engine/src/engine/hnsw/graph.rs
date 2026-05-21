@@ -244,6 +244,48 @@ impl DistanceContext<'_> {
             }
             return;
         }
+        if let Self::RawF32 {
+            query, distance_fn, ..
+        } = self
+        {
+            out.reserve(nodes.len());
+            for (idx, (node, tid)) in nodes.iter().enumerate() {
+                if let Some((next_node, _)) = nodes.get(idx + 1) {
+                    prefetch_node_for_distance(next_node);
+                }
+                out.push((*tid, distance_fn(&node.vector, query)));
+            }
+            return;
+        }
+        if let Self::Raw {
+            query,
+            distance_fn,
+            element_type,
+            decode_scratch,
+            ..
+        } = self
+        {
+            let query = query.as_ref();
+            out.reserve(nodes.len());
+            let mut scratch = decode_scratch.borrow_mut();
+            for (idx, (node, tid)) in nodes.iter().enumerate() {
+                if let Some((next_node, _)) = nodes.get(idx + 1) {
+                    prefetch_node_for_distance(next_node);
+                }
+                let dist = if let Some(compact) = &node.compact_vector {
+                    aiondb_core::vector_storage::decode_vector_into(
+                        compact,
+                        *element_type,
+                        &mut scratch,
+                    );
+                    distance_fn(&scratch, query)
+                } else {
+                    distance_fn(&node.vector, query)
+                };
+                out.push((*tid, dist));
+            }
+            return;
+        }
         // CPU-batch fallback: scalar `evaluate` per node, but with software
         // prefetch of the next node's vector to overlap L2/L3 latency with
         // compute. Binary mode also benefits from prefetching the next
