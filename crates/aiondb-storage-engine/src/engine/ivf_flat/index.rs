@@ -373,13 +373,6 @@ impl IvfFlatIndex {
             .collect();
         stats.lists_scanned = usize_to_u64_saturating(probe_lists.len());
 
-        // Single-pass scan: each list contributes to a flat scored Vec,
-        // then a single sort_unstable + take(k) yields the result.
-        // Benchmarks against a per-candidate top-k heap showed the heap
-        // pattern is theoretically faster (O(n log k)) but actually
-        // slower in practice at typical (nlist, nprobe) settings because
-        // sort_unstable vectorizes the comparison much better than the
-        // branch-heavy NaN-safe heap pop / push.
         let distance_fn = self.distance_fn;
         let total_candidates: usize = probe_lists
             .iter()
@@ -390,14 +383,24 @@ impl IvfFlatIndex {
             .saturating_add(total_candidates as u64);
         const PARALLEL_SCAN_THRESHOLD: usize = 16_384;
         let mut scored: Vec<(TupleId, f32)> = if total_candidates >= PARALLEL_SCAN_THRESHOLD {
-            probe_lists
+            let partials: Vec<Vec<(TupleId, f32)>> = probe_lists
                 .par_iter()
                 .filter_map(|list_id| self.lists.get(*list_id))
-                .flat_map_iter(|list| {
-                    list.iter()
+                .map(|list| {
+                    let mut local: Vec<(TupleId, f32)> = list
+                        .iter()
                         .map(move |entry| (entry.tuple_id, distance_fn(&entry.vector, query)))
+                        .collect();
+                    truncate_scored_to_k(&mut local, k);
+                    local
                 })
-                .collect()
+                .collect();
+            let shortlist_len = partials.iter().map(Vec::len).sum();
+            let mut out = Vec::with_capacity(shortlist_len);
+            for partial in partials {
+                out.extend(partial);
+            }
+            out
         } else {
             let mut out = Vec::with_capacity(total_candidates);
             for list_id in probe_lists {
@@ -411,13 +414,7 @@ impl IvfFlatIndex {
             }
             out
         };
-        let keep = k.min(scored.len());
-        if keep < scored.len() {
-            scored.select_nth_unstable_by(keep, |a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            scored.truncate(keep);
-        }
+        truncate_scored_to_k(&mut scored, k);
         scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let ids: Vec<TupleId> = scored.into_iter().take(k).map(|(id, _)| id).collect();
 
@@ -627,6 +624,16 @@ fn resolve_distance_fn(metric: StoredVectorMetric) -> DistanceFn {
 
 fn elapsed_micros(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn truncate_scored_to_k(scored: &mut Vec<(TupleId, f32)>, k: usize) {
+    let keep = k.min(scored.len());
+    if keep < scored.len() {
+        scored.select_nth_unstable_by(keep, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(keep);
+    }
 }
 
 /// Deterministic Lloyd's k-means over an arbitrary slice iterator.
