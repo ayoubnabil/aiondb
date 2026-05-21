@@ -366,8 +366,6 @@ impl IvfFlatIndex {
             });
             centroid_distances.truncate(nprobe);
         }
-        centroid_distances
-            .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let probe_lists: Vec<usize> = centroid_distances
             .iter()
             .take(nprobe)
