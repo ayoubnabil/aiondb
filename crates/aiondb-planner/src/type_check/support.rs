@@ -20,6 +20,9 @@ pub(super) use self::support_relation_helpers::{
 
 pub(super) fn resolve_arithmetic_type(left: &DataType, right: &DataType) -> DbResult<DataType> {
     match (left, right) {
+        (DataType::Vector { .. }, DataType::Vector { .. }) => {
+            Ok(resolve_vector_result_type(left, right, false))
+        }
         (DataType::Int, DataType::Int) => Ok(DataType::Int),
         (DataType::Int, DataType::BigInt) | (DataType::BigInt, DataType::Int) => {
             Ok(DataType::BigInt)
@@ -158,6 +161,44 @@ pub(super) fn resolve_arithmetic_type(left: &DataType, right: &DataType) -> DbRe
             format!("cannot perform arithmetic on {left} and {right}"),
         )))),
     }
+}
+
+pub(super) fn resolve_vector_result_type(
+    left: &DataType,
+    right: &DataType,
+    concatenate: bool,
+) -> DataType {
+    let (
+        DataType::Vector {
+            dims: left_dims,
+            element_type: left_element_type,
+        },
+        DataType::Vector {
+            dims: right_dims,
+            element_type: right_element_type,
+        },
+    ) = (left, right)
+    else {
+        return DataType::Vector {
+            dims: 0,
+            element_type: aiondb_core::VectorElementType::Float32,
+        };
+    };
+    let dims = if concatenate {
+        left_dims.checked_add(*right_dims).unwrap_or(0)
+    } else if left_dims == right_dims || *right_dims == 0 {
+        *left_dims
+    } else if *left_dims == 0 {
+        *right_dims
+    } else {
+        0
+    };
+    let element_type = if left_element_type == right_element_type {
+        *left_element_type
+    } else {
+        aiondb_core::VectorElementType::Float32
+    };
+    DataType::Vector { dims, element_type }
 }
 
 pub(super) fn resolve_set_operation_type(

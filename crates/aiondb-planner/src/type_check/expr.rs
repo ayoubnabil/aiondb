@@ -1073,6 +1073,34 @@ pub(super) fn infer_expr(
                     ),
                 )));
             }
+            if matches!(
+                (&left_typed.data_type, &right_typed.data_type),
+                (DataType::Vector { .. }, DataType::Vector { .. })
+            ) && !matches!(
+                op,
+                BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul
+            ) {
+                let op_symbol = match op {
+                    BinaryOperator::Div => "/",
+                    BinaryOperator::Mod => "%",
+                    _ => unreachable!("arithmetic match arm only receives arithmetic operators"),
+                };
+                return Err(DbError::Bind(Box::new(
+                    ErrorReport::new(
+                        SqlState::UndefinedFunction,
+                        format!(
+                            "operator does not exist: {} {} {}",
+                            left_typed.data_type.pg_type_name(),
+                            op_symbol,
+                            right_typed.data_type.pg_type_name()
+                        ),
+                    )
+                    .with_position(binary_operator_position(left, right))
+                    .with_client_hint(
+                        "No operator matches the given name and argument types. You might need to add explicit type casts.",
+                    ),
+                )));
+            }
             let result_type = if text_is_network_literal
                 && ((matches!(left_typed.data_type, DataType::Text)
                     && is_numeric(&right_typed.data_type))
@@ -1154,6 +1182,17 @@ pub(super) fn infer_expr(
         } => {
             let left_typed = infer_expr(left, relation, params, sq, uf)?;
             let right_typed = infer_expr(right, relation, params, sq, uf)?;
+            if matches!(left_typed.data_type, DataType::Vector { .. })
+                && matches!(right_typed.data_type, DataType::Vector { .. })
+            {
+                let result_type =
+                    resolve_vector_result_type(&left_typed.data_type, &right_typed.data_type, true);
+                return Ok(TypedExpr::concat_typed(
+                    left_typed,
+                    right_typed,
+                    result_type,
+                ));
+            }
             // Array concatenation: arr || arr, arr || elem, elem || arr
             let left_is_array = matches!(left_typed.data_type, DataType::Array(_));
             let right_is_array = matches!(right_typed.data_type, DataType::Array(_));

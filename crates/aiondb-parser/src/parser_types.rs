@@ -567,7 +567,7 @@ impl Parser {
                         }
                         self.expect_token(&TokenKind::RParen)?;
                     }
-                    DataType::Int
+                    DataType::Text
                 }
             }
             // VARBIT with optional (n) length
@@ -579,7 +579,7 @@ impl Parser {
                     }
                     self.expect_token(&TokenKind::RParen)?;
                 }
-                DataType::Int
+                DataType::Text
             }
             // Registry / OID-alias types
             "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
@@ -591,23 +591,8 @@ impl Parser {
             "HALFVEC" => {
                 self.parse_pgvector_named_type(aiondb_core::VectorElementType::Float16, "HALFVEC")?
             }
-            "SPARSEVEC" => {
-                self.advance();
-                if self.consume_kind(&TokenKind::LParen) {
-                    match self.current().kind {
-                        TokenKind::Integer(n) if n > 0 => {
-                            self.advance();
-                        }
-                        _ => {
-                            return self.syntax_error_current(
-                                "expected positive integer for SPARSEVEC dimension",
-                            );
-                        }
-                    }
-                    self.expect_token(&TokenKind::RParen)?;
-                }
-                DataType::Text
-            }
+            "SPARSEVEC" => self
+                .parse_pgvector_named_type(aiondb_core::VectorElementType::Float32, "SPARSEVEC")?,
             "TSVECTOR" | "TSQUERY" => {
                 self.advance_span();
                 DataType::Text
@@ -810,6 +795,10 @@ impl Parser {
             "HALFVEC" => DataType::Vector {
                 dims: 0,
                 element_type: aiondb_core::VectorElementType::Float16,
+            },
+            "SPARSEVEC" => DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
             },
             _ => DataType::Text,
         }

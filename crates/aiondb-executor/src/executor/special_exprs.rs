@@ -1198,9 +1198,20 @@ struct VectorTopKOptionOverrides {
     distance_threshold: Option<f64>,
     exact: Option<bool>,
     score_threshold: Option<f64>,
+    limit: Option<usize>,
     offset: Option<usize>,
     prefetch_candidate_cap: Option<usize>,
+    with_payload: Option<VectorTopKPayloadSelection>,
+    with_vector: Option<bool>,
     filter: Option<VectorTopKFilterSpec>,
+}
+
+#[derive(Clone, Debug)]
+enum VectorTopKPayloadSelection {
+    All,
+    None,
+    Include(Vec<String>),
+    Exclude(Vec<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -1212,6 +1223,13 @@ struct VectorTopKFilterCondition {
 #[derive(Clone, Debug)]
 enum VectorTopKFilterPredicateSpec {
     Match(serde_json::Value),
+    MatchAny(Vec<serde_json::Value>),
+    MatchExcept(Vec<serde_json::Value>),
+    MatchText(String),
+    IsNull,
+    IsEmpty,
+    HasId(Vec<serde_json::Value>),
+    ValuesCount(VectorTopKFilterValuesCountSpec),
     Range(VectorTopKFilterRangeSpec),
 }
 
@@ -1224,10 +1242,25 @@ struct VectorTopKFilterRangeSpec {
 }
 
 #[derive(Clone, Debug, Default)]
+struct VectorTopKFilterValuesCountSpec {
+    gt: Option<usize>,
+    gte: Option<usize>,
+    lt: Option<usize>,
+    lte: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub(in crate::executor) struct VectorTopKFilterSpec {
     must: Vec<VectorTopKFilterCondition>,
     should: Vec<VectorTopKFilterCondition>,
     must_not: Vec<VectorTopKFilterCondition>,
+    min_should: Option<VectorTopKMinShouldSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct VectorTopKMinShouldSpec {
+    conditions: Vec<VectorTopKFilterCondition>,
+    min_count: usize,
 }
 
 fn expect_text_arg<'a>(value: &'a Value, arg_name: &str) -> DbResult<&'a str> {
@@ -1520,33 +1553,10 @@ fn parse_vector_top_k_options_arg(value: Option<&Value>) -> DbResult<VectorTopKO
                 options.metric = Some(parse_vector_metric_name(metric)?);
             }
             "ef_search" => {
-                let ef_search = match (raw_value.as_u64(), raw_value.as_i64()) {
-                    (Some(value), _) => usize::try_from(value).map_err(|_| {
-                        DbError::bind_error(
-                            SqlState::NumericValueOutOfRange,
-                            "vector_top_k_ids() options.ef_search is out of range",
-                        )
-                    })?,
-                    (None, Some(value)) if value >= 0 => usize::try_from(value).map_err(|_| {
-                        DbError::bind_error(
-                            SqlState::NumericValueOutOfRange,
-                            "vector_top_k_ids() options.ef_search is out of range",
-                        )
-                    })?,
-                    _ => {
-                        return Err(DbError::bind_error(
-                            SqlState::DatatypeMismatch,
-                            "vector_top_k_ids() options.ef_search must be an integer",
-                        ));
-                    }
-                };
-                if ef_search == 0 {
-                    return Err(DbError::bind_error(
-                        SqlState::InvalidParameterValue,
-                        "vector_top_k_ids() options.ef_search must be >= 1",
-                    ));
-                }
-                options.ef_search = Some(ef_search.min(aiondb_core::HNSW_MAX_EF_SEARCH));
+                options.ef_search = Some(parse_vector_top_k_ef_search_option(
+                    raw_value,
+                    "options.ef_search",
+                )?);
             }
             "distance_threshold" => {
                 let threshold = raw_value.as_f64().ok_or_else(|| {
@@ -1570,13 +1580,7 @@ fn parse_vector_top_k_options_arg(value: Option<&Value>) -> DbResult<VectorTopKO
                 options.distance_threshold = Some(threshold);
             }
             "exact" => {
-                let exact = raw_value.as_bool().ok_or_else(|| {
-                    DbError::bind_error(
-                        SqlState::DatatypeMismatch,
-                        "vector_top_k_ids() options.exact must be boolean",
-                    )
-                })?;
-                options.exact = Some(exact);
+                options.exact = Some(parse_vector_top_k_bool_option(raw_value, "options.exact")?);
             }
             "score_threshold" => {
                 let threshold = raw_value.as_f64().ok_or_else(|| {
@@ -1593,28 +1597,14 @@ fn parse_vector_top_k_options_arg(value: Option<&Value>) -> DbResult<VectorTopKO
                 }
                 options.score_threshold = Some(threshold);
             }
+            "limit" => {
+                options.limit = Some(parse_vector_top_k_usize_option(raw_value, "options.limit")?);
+            }
             "offset" => {
-                let offset = match (raw_value.as_u64(), raw_value.as_i64()) {
-                    (Some(value), _) => usize::try_from(value).map_err(|_| {
-                        DbError::bind_error(
-                            SqlState::NumericValueOutOfRange,
-                            "vector_top_k_ids() options.offset is out of range",
-                        )
-                    })?,
-                    (None, Some(value)) if value >= 0 => usize::try_from(value).map_err(|_| {
-                        DbError::bind_error(
-                            SqlState::NumericValueOutOfRange,
-                            "vector_top_k_ids() options.offset is out of range",
-                        )
-                    })?,
-                    _ => {
-                        return Err(DbError::bind_error(
-                            SqlState::DatatypeMismatch,
-                            "vector_top_k_ids() options.offset must be an integer",
-                        ));
-                    }
-                };
-                options.offset = Some(offset);
+                options.offset = Some(parse_vector_top_k_usize_option(
+                    raw_value,
+                    "options.offset",
+                )?);
             }
             "prefetch_candidate_cap" => {
                 let cap = match (raw_value.as_u64(), raw_value.as_i64()) {
@@ -1645,8 +1635,20 @@ fn parse_vector_top_k_options_arg(value: Option<&Value>) -> DbResult<VectorTopKO
                 }
                 options.prefetch_candidate_cap = Some(cap);
             }
+            "with_payload" => {
+                options.with_payload = Some(parse_vector_top_k_payload_selection(raw_value)?);
+            }
+            "with_vector" | "with_vectors" => {
+                options.with_vector = Some(parse_vector_top_k_bool_option(
+                    raw_value,
+                    "options.with_vector",
+                )?);
+            }
             "filter" => {
                 options.filter = Some(parse_vector_top_k_filter_spec(raw_value)?);
+            }
+            "params" => {
+                parse_vector_top_k_params_options(raw_value, &mut options)?;
             }
             other => {
                 return Err(DbError::bind_error(
@@ -1657,6 +1659,164 @@ fn parse_vector_top_k_options_arg(value: Option<&Value>) -> DbResult<VectorTopKO
         }
     }
     Ok(options)
+}
+
+fn parse_vector_top_k_payload_selection(
+    raw_value: &serde_json::Value,
+) -> DbResult<VectorTopKPayloadSelection> {
+    if let Some(enabled) = raw_value.as_bool() {
+        return Ok(if enabled {
+            VectorTopKPayloadSelection::All
+        } else {
+            VectorTopKPayloadSelection::None
+        });
+    }
+    if let Some(fields) = raw_value.as_array() {
+        return Ok(VectorTopKPayloadSelection::Include(
+            parse_vector_top_k_payload_selection_fields(fields)?,
+        ));
+    }
+    if let Some(object) = raw_value.as_object() {
+        if object.len() != 1 {
+            return Err(DbError::bind_error(
+                SqlState::InvalidParameterValue,
+                "vector_top_k_ids() options.with_payload object requires exactly one of include or exclude",
+            ));
+        }
+        if let Some(fields) = object.get("include") {
+            let fields = fields.as_array().ok_or_else(|| {
+                DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    "vector_top_k_ids() options.with_payload.include must be an array of strings",
+                )
+            })?;
+            return Ok(VectorTopKPayloadSelection::Include(
+                parse_vector_top_k_payload_selection_fields(fields)?,
+            ));
+        }
+        if let Some(fields) = object.get("exclude") {
+            let fields = fields.as_array().ok_or_else(|| {
+                DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    "vector_top_k_ids() options.with_payload.exclude must be an array of strings",
+                )
+            })?;
+            return Ok(VectorTopKPayloadSelection::Exclude(
+                parse_vector_top_k_payload_selection_fields(fields)?,
+            ));
+        }
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.with_payload object requires exactly one of include or exclude",
+        ));
+    }
+    Err(DbError::bind_error(
+        SqlState::InvalidParameterValue,
+        "vector_top_k_ids() options.with_payload must be boolean, an array of strings, or an include/exclude object",
+    ))
+}
+
+fn parse_vector_top_k_payload_selection_fields(
+    fields: &[serde_json::Value],
+) -> DbResult<Vec<String>> {
+    let mut parsed = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field = field.as_str().ok_or_else(|| {
+            DbError::bind_error(
+                SqlState::DatatypeMismatch,
+                "vector_top_k_ids() options.with_payload fields must be strings",
+            )
+        })?;
+        parsed.push(field.to_owned());
+    }
+    Ok(parsed)
+}
+
+fn parse_vector_top_k_params_options(
+    raw_params: &serde_json::Value,
+    options: &mut VectorTopKOptionOverrides,
+) -> DbResult<()> {
+    let object = raw_params.as_object().ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.params must be a JSON object",
+        )
+    })?;
+    for (raw_key, raw_value) in object {
+        match raw_key.to_ascii_lowercase().as_str() {
+            "hnsw_ef" | "ef_search" => {
+                options.ef_search = Some(parse_vector_top_k_ef_search_option(
+                    raw_value,
+                    "options.params.hnsw_ef",
+                )?);
+            }
+            "exact" => {
+                options.exact = Some(parse_vector_top_k_bool_option(
+                    raw_value,
+                    "options.params.exact",
+                )?);
+            }
+            other => {
+                return Err(DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    format!("vector_top_k_ids() options.params contains unknown key \"{other}\""),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_vector_top_k_ef_search_option(
+    raw_value: &serde_json::Value,
+    option_name: &str,
+) -> DbResult<usize> {
+    let ef_search = parse_vector_top_k_usize_option(raw_value, option_name)?;
+    if ef_search == 0 {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!("vector_top_k_ids() {option_name} must be >= 1"),
+        ));
+    }
+    Ok(ef_search.min(aiondb_core::HNSW_MAX_EF_SEARCH))
+}
+
+fn parse_vector_top_k_usize_option(
+    raw_value: &serde_json::Value,
+    option_name: &str,
+) -> DbResult<usize> {
+    match (raw_value.as_u64(), raw_value.as_i64()) {
+        (Some(value), _) => Ok(usize::try_from(value).map_err(|_| {
+            DbError::bind_error(
+                SqlState::NumericValueOutOfRange,
+                format!("vector_top_k_ids() {option_name} is out of range"),
+            )
+        })?),
+        (None, Some(value)) if value >= 0 => Ok(usize::try_from(value).map_err(|_| {
+            DbError::bind_error(
+                SqlState::NumericValueOutOfRange,
+                format!("vector_top_k_ids() {option_name} is out of range"),
+            )
+        })?),
+        _ => {
+            return Err(DbError::bind_error(
+                SqlState::DatatypeMismatch,
+                format!("vector_top_k_ids() {option_name} must be an integer"),
+            ));
+        }
+    }
+}
+
+fn parse_vector_top_k_bool_option(
+    raw_value: &serde_json::Value,
+    option_name: &str,
+) -> DbResult<bool> {
+    raw_value.as_bool().ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::DatatypeMismatch,
+            format!("vector_top_k_ids() {option_name} must be boolean"),
+        )
+    })
 }
 
 fn parse_vector_top_k_filter_spec(
@@ -1673,13 +1833,9 @@ fn parse_vector_top_k_filter_spec(
         key.eq_ignore_ascii_case("must")
             || key.eq_ignore_ascii_case("should")
             || key.eq_ignore_ascii_case("must_not")
+            || key.eq_ignore_ascii_case("min_should")
     });
-    let all_clause_keys = object.keys().all(|key| {
-        key.eq_ignore_ascii_case("must")
-            || key.eq_ignore_ascii_case("should")
-            || key.eq_ignore_ascii_case("must_not")
-    });
-    if has_clause_keys && all_clause_keys {
+    if has_clause_keys {
         for (raw_key, raw_value) in object {
             match raw_key.to_ascii_lowercase().as_str() {
                 "must" => {
@@ -1692,7 +1848,15 @@ fn parse_vector_top_k_filter_spec(
                     spec.must_not =
                         parse_vector_top_k_filter_clause_conditions(raw_value, "must_not")?;
                 }
-                _ => {}
+                "min_should" => {
+                    spec.min_should = Some(parse_vector_top_k_filter_min_should(raw_value)?);
+                }
+                _ => {
+                    spec.must.push(VectorTopKFilterCondition {
+                        key: raw_key.clone(),
+                        predicate: VectorTopKFilterPredicateSpec::Match(raw_value.clone()),
+                    });
+                }
             }
         }
         return Ok(spec);
@@ -1707,21 +1871,141 @@ fn parse_vector_top_k_filter_spec(
     Ok(spec)
 }
 
+fn parse_vector_top_k_filter_min_should(
+    raw_min_should: &serde_json::Value,
+) -> DbResult<VectorTopKMinShouldSpec> {
+    let object = raw_min_should.as_object().ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.filter.min_should must be a JSON object",
+        )
+    })?;
+    let mut conditions: Option<Vec<VectorTopKFilterCondition>> = None;
+    let mut min_count: Option<usize> = None;
+    for (raw_key, raw_value) in object {
+        match raw_key.as_str() {
+            "conditions" => {
+                conditions = Some(parse_vector_top_k_filter_clause_conditions(
+                    raw_value,
+                    "min_should.conditions",
+                )?);
+            }
+            "min_count" => {
+                let value = raw_value.as_u64().ok_or_else(|| {
+                    DbError::bind_error(
+                        SqlState::DatatypeMismatch,
+                        "vector_top_k_ids() options.filter.min_should.min_count must be a positive integer",
+                    )
+                })?;
+                let value = usize::try_from(value).map_err(|_| {
+                    DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        "vector_top_k_ids() options.filter.min_should.min_count is too large",
+                    )
+                })?;
+                if value == 0 {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        "vector_top_k_ids() options.filter.min_should.min_count must be >= 1",
+                    ));
+                }
+                min_count = Some(value);
+            }
+            other => {
+                return Err(DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    format!(
+                        "vector_top_k_ids() options.filter.min_should contains unsupported key \"{other}\""
+                    ),
+                ));
+            }
+        }
+    }
+    let conditions = conditions.ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.filter.min_should requires a conditions field",
+        )
+    })?;
+    if conditions.is_empty() {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.filter.min_should.conditions must not be empty",
+        ));
+    }
+    let min_count = min_count.ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.filter.min_should requires a min_count field",
+        )
+    })?;
+    if min_count > conditions.len() {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            "vector_top_k_ids() options.filter.min_should.min_count cannot exceed conditions length",
+        ));
+    }
+    Ok(VectorTopKMinShouldSpec {
+        conditions,
+        min_count,
+    })
+}
+
 fn parse_vector_top_k_filter_clause_conditions(
     raw_clause: &serde_json::Value,
     clause: &str,
 ) -> DbResult<Vec<VectorTopKFilterCondition>> {
-    let conditions = raw_clause.as_array().ok_or_else(|| {
+    if let Some(conditions) = raw_clause.as_array() {
+        let mut parsed = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            parsed.extend(parse_vector_top_k_filter_condition_entries(
+                condition, clause,
+            )?);
+        }
+        return Ok(parsed);
+    }
+    if raw_clause.is_object() {
+        return parse_vector_top_k_filter_condition_entries(raw_clause, clause);
+    }
+    Err(DbError::bind_error(
+        SqlState::InvalidParameterValue,
+        format!("vector_top_k_ids() options.filter.{clause} must be an array or JSON object"),
+    ))
+}
+
+fn parse_vector_top_k_filter_condition_entries(
+    raw_condition: &serde_json::Value,
+    clause: &str,
+) -> DbResult<Vec<VectorTopKFilterCondition>> {
+    let object = raw_condition.as_object().ok_or_else(|| {
         DbError::bind_error(
             SqlState::InvalidParameterValue,
-            format!("vector_top_k_ids() options.filter.{clause} must be an array"),
+            format!("vector_top_k_ids() options.filter.{clause} conditions must be JSON objects"),
         )
     })?;
-    let mut parsed = Vec::with_capacity(conditions.len());
-    for condition in conditions {
-        parsed.push(parse_vector_top_k_filter_condition(condition, clause)?);
+    if object
+        .keys()
+        .any(|key| is_vector_top_k_filter_condition_key(key))
+    {
+        return Ok(vec![parse_vector_top_k_filter_condition(
+            raw_condition,
+            clause,
+        )?]);
     }
-    Ok(parsed)
+    Ok(object
+        .iter()
+        .map(|(key, value)| VectorTopKFilterCondition {
+            key: key.clone(),
+            predicate: VectorTopKFilterPredicateSpec::Match(value.clone()),
+        })
+        .collect())
+}
+
+fn is_vector_top_k_filter_condition_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "key" | "match" | "value" | "range" | "values_count" | "is_null" | "is_empty" | "has_id"
+    )
 }
 
 fn parse_vector_top_k_filter_condition(
@@ -1734,20 +2018,21 @@ fn parse_vector_top_k_filter_condition(
             format!("vector_top_k_ids() options.filter.{clause} conditions must be JSON objects"),
         )
     })?;
-    let mut key: Option<&str> = None;
-    let mut match_value: Option<&serde_json::Value> = None;
+    let mut key: Option<String> = None;
+    let mut predicate: Option<VectorTopKFilterPredicateSpec> = None;
     let mut range: Option<VectorTopKFilterRangeSpec> = None;
     for (raw_key, raw_value) in object {
         match raw_key.to_ascii_lowercase().as_str() {
             "key" => {
-                key = Some(raw_value.as_str().ok_or_else(|| {
+                let condition_key = raw_value.as_str().ok_or_else(|| {
                     DbError::bind_error(
                         SqlState::DatatypeMismatch,
                         format!(
                             "vector_top_k_ids() options.filter.{clause} condition key must be a string"
                         ),
                     )
-                })?);
+                })?;
+                set_vector_top_k_filter_condition_key(&mut key, condition_key, clause)?;
             }
             "match" => {
                 let match_object = raw_value.as_object().ok_or_else(|| {
@@ -1758,21 +2043,100 @@ fn parse_vector_top_k_filter_condition(
                         ),
                     )
                 })?;
-                let Some(match_payload_value) = match_object.get("value") else {
+                let parsed_predicate =
+                    parse_vector_top_k_filter_match_payload(match_object, clause)?;
+                if predicate.replace(parsed_predicate).is_some() {
                     return Err(DbError::bind_error(
                         SqlState::InvalidParameterValue,
                         format!(
-                            "vector_top_k_ids() options.filter.{clause} condition match requires a value field"
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value or range"
                         ),
                     ));
-                };
-                match_value = Some(match_payload_value);
+                }
             }
             "value" => {
-                match_value = Some(raw_value);
+                if predicate
+                    .replace(VectorTopKFilterPredicateSpec::Match(raw_value.clone()))
+                    .is_some()
+                {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value or range"
+                        ),
+                    ));
+                }
             }
             "range" => {
                 range = Some(parse_vector_top_k_filter_range(raw_value, clause)?);
+            }
+            "values_count" => {
+                if predicate
+                    .replace(VectorTopKFilterPredicateSpec::ValuesCount(
+                        parse_vector_top_k_filter_values_count(raw_value, clause)?,
+                    ))
+                    .is_some()
+                {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value, range, values_count, is_null, is_empty, or has_id"
+                        ),
+                    ));
+                }
+            }
+            "is_null" => {
+                let nested_key =
+                    parse_vector_top_k_filter_payload_field_key(raw_value, clause, "is_null")?;
+                set_vector_top_k_filter_condition_key(&mut key, nested_key, clause)?;
+                if predicate
+                    .replace(VectorTopKFilterPredicateSpec::IsNull)
+                    .is_some()
+                {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value, range, is_null, or is_empty"
+                        ),
+                    ));
+                }
+            }
+            "is_empty" => {
+                let nested_key =
+                    parse_vector_top_k_filter_payload_field_key(raw_value, clause, "is_empty")?;
+                set_vector_top_k_filter_condition_key(&mut key, nested_key, clause)?;
+                if predicate
+                    .replace(VectorTopKFilterPredicateSpec::IsEmpty)
+                    .is_some()
+                {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value, range, is_null, or is_empty"
+                        ),
+                    ));
+                }
+            }
+            "has_id" => {
+                let ids = raw_value.as_array().ok_or_else(|| {
+                    DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition has_id must be an array"
+                        ),
+                    )
+                })?;
+                if predicate
+                    .replace(VectorTopKFilterPredicateSpec::HasId(ids.clone()))
+                    .is_some()
+                {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value, range, is_null, is_empty, or has_id"
+                        ),
+                    ));
+                }
             }
             other => {
                 return Err(DbError::bind_error(
@@ -1784,36 +2148,240 @@ fn parse_vector_top_k_filter_condition(
             }
         }
     }
-    let key = key.ok_or_else(|| {
-        DbError::bind_error(
-            SqlState::InvalidParameterValue,
-            format!("vector_top_k_ids() options.filter.{clause} condition requires a key field"),
-        )
-    })?;
-    if match_value.is_some() == range.is_some() {
+    let has_id = matches!(predicate, Some(VectorTopKFilterPredicateSpec::HasId(_)));
+    let key = if has_id {
+        if key.is_some() {
+            return Err(DbError::bind_error(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "vector_top_k_ids() options.filter.{clause} condition has_id must not include a key field"
+                ),
+            ));
+        }
+        String::new()
+    } else {
+        key.ok_or_else(|| {
+            DbError::bind_error(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "vector_top_k_ids() options.filter.{clause} condition requires a key field"
+                ),
+            )
+        })?
+    };
+    if predicate.is_some() == range.is_some() {
         return Err(DbError::bind_error(
             SqlState::InvalidParameterValue,
             format!(
-                "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value or range"
+                "vector_top_k_ids() options.filter.{clause} condition requires exactly one of match/value, range, values_count, is_null, is_empty, or has_id"
             ),
         ));
     }
     let predicate = if let Some(range) = range {
         VectorTopKFilterPredicateSpec::Range(range)
     } else {
-        VectorTopKFilterPredicateSpec::Match(match_value.cloned().ok_or_else(|| {
+        predicate.ok_or_else(|| {
             DbError::bind_error(
                 SqlState::InvalidParameterValue,
                 format!(
                     "vector_top_k_ids() options.filter.{clause} condition requires a match.value or value field"
                 ),
             )
-        })?)
+        })?
     };
-    Ok(VectorTopKFilterCondition {
-        key: key.to_owned(),
-        predicate,
+    Ok(VectorTopKFilterCondition { key, predicate })
+}
+
+fn set_vector_top_k_filter_condition_key(
+    key: &mut Option<String>,
+    new_key: &str,
+    clause: &str,
+) -> DbResult<()> {
+    if let Some(existing_key) = key {
+        if existing_key.eq_ignore_ascii_case(new_key) {
+            return Ok(());
+        }
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition contains conflicting key fields"
+            ),
+        ));
+    }
+    *key = Some(new_key.to_owned());
+    Ok(())
+}
+
+fn parse_vector_top_k_filter_payload_field_key<'a>(
+    raw_value: &'a serde_json::Value,
+    clause: &str,
+    condition_name: &str,
+) -> DbResult<&'a str> {
+    let object = raw_value.as_object().ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition {condition_name} must be an object"
+            ),
+        )
+    })?;
+    if object.len() != 1 || !object.contains_key("key") {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition {condition_name} requires only a key field"
+            ),
+        ));
+    }
+    object.get("key").and_then(serde_json::Value::as_str).ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::DatatypeMismatch,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition {condition_name}.key must be a string"
+            ),
+        )
     })
+}
+
+fn parse_vector_top_k_filter_match_payload(
+    match_object: &serde_json::Map<String, serde_json::Value>,
+    clause: &str,
+) -> DbResult<VectorTopKFilterPredicateSpec> {
+    let mut predicate: Option<VectorTopKFilterPredicateSpec> = None;
+    for (raw_key, raw_value) in match_object {
+        let parsed = match raw_key.as_str() {
+            "value" => VectorTopKFilterPredicateSpec::Match(raw_value.clone()),
+            "any" => VectorTopKFilterPredicateSpec::MatchAny(
+                raw_value
+                    .as_array()
+                    .ok_or_else(|| {
+                        DbError::bind_error(
+                            SqlState::InvalidParameterValue,
+                            format!(
+                                "vector_top_k_ids() options.filter.{clause} condition match.any must be an array"
+                            ),
+                        )
+                    })?
+                    .clone(),
+            ),
+            "except" => VectorTopKFilterPredicateSpec::MatchExcept(
+                raw_value
+                    .as_array()
+                    .ok_or_else(|| {
+                        DbError::bind_error(
+                            SqlState::InvalidParameterValue,
+                            format!(
+                                "vector_top_k_ids() options.filter.{clause} condition match.except must be an array"
+                            ),
+                        )
+                    })?
+                    .clone(),
+            ),
+            "text" => {
+                let text = raw_value.as_str().ok_or_else(|| {
+                    DbError::bind_error(
+                        SqlState::DatatypeMismatch,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition match.text must be a string"
+                        ),
+                    )
+                })?;
+                if text.is_empty() {
+                    return Err(DbError::bind_error(
+                        SqlState::InvalidParameterValue,
+                        format!(
+                            "vector_top_k_ids() options.filter.{clause} condition match.text must not be empty"
+                        ),
+                    ));
+                }
+                VectorTopKFilterPredicateSpec::MatchText(text.to_owned())
+            }
+            other => {
+                return Err(DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    format!(
+                        "vector_top_k_ids() options.filter.{clause} condition match contains unsupported key \"{other}\""
+                    ),
+                ));
+            }
+        };
+        if predicate.replace(parsed).is_some() {
+            return Err(DbError::bind_error(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "vector_top_k_ids() options.filter.{clause} condition match requires exactly one of value, any, except, or text"
+                ),
+            ));
+        }
+    }
+    predicate.ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition match requires exactly one of value, any, except, or text"
+            ),
+        )
+    })
+}
+
+fn parse_vector_top_k_filter_values_count(
+    raw_values_count: &serde_json::Value,
+    clause: &str,
+) -> DbResult<VectorTopKFilterValuesCountSpec> {
+    let object = raw_values_count.as_object().ok_or_else(|| {
+        DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition values_count must be an object"
+            ),
+        )
+    })?;
+    let mut values_count = VectorTopKFilterValuesCountSpec::default();
+    for (raw_key, raw_value) in object {
+        let bound = raw_value.as_u64().ok_or_else(|| {
+            DbError::bind_error(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "vector_top_k_ids() options.filter.{clause} condition values_count bound \"{raw_key}\" must be a non-negative integer"
+                ),
+            )
+        })?;
+        let bound = usize::try_from(bound).map_err(|_| {
+            DbError::bind_error(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "vector_top_k_ids() options.filter.{clause} condition values_count bound \"{raw_key}\" is too large"
+                ),
+            )
+        })?;
+        match raw_key.as_str() {
+            "gt" => values_count.gt = Some(bound),
+            "gte" => values_count.gte = Some(bound),
+            "lt" => values_count.lt = Some(bound),
+            "lte" => values_count.lte = Some(bound),
+            other => {
+                return Err(DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    format!(
+                        "vector_top_k_ids() options.filter.{clause} condition values_count contains unsupported key \"{other}\""
+                    ),
+                ));
+            }
+        }
+    }
+    if values_count.gt.is_none()
+        && values_count.gte.is_none()
+        && values_count.lt.is_none()
+        && values_count.lte.is_none()
+    {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter.{clause} condition values_count requires at least one bound"
+            ),
+        ));
+    }
+    Ok(values_count)
 }
 
 fn parse_vector_top_k_filter_range(

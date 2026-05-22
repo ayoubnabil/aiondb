@@ -18,12 +18,24 @@ const FULL_TEXT_MAX_RANK: f64 = 0.6;
 struct CompiledVectorTopKFilterCondition {
     ordinal: usize,
     column_id: ColumnId,
+    json_path: Vec<String>,
     predicate: CompiledVectorTopKFilterPredicate,
 }
 
 #[derive(Clone, Debug)]
 enum CompiledVectorTopKFilterPredicate {
     Match(Value),
+    MatchAny(Vec<Value>),
+    MatchExcept(Vec<Value>),
+    MatchText(String),
+    IsNull,
+    IsEmpty,
+    ValuesCount {
+        gt: Option<usize>,
+        gte: Option<usize>,
+        lt: Option<usize>,
+        lte: Option<usize>,
+    },
     Range {
         gt: Option<f64>,
         gte: Option<f64>,
@@ -37,35 +49,244 @@ pub(in crate::executor) struct CompiledVectorTopKFilter {
     must: Vec<CompiledVectorTopKFilterCondition>,
     should: Vec<CompiledVectorTopKFilterCondition>,
     must_not: Vec<CompiledVectorTopKFilterCondition>,
+    min_should: Option<CompiledVectorTopKMinShould>,
+}
+
+#[derive(Clone, Debug)]
+struct CompiledVectorTopKMinShould {
+    conditions: Vec<CompiledVectorTopKFilterCondition>,
+    min_count: usize,
 }
 
 impl CompiledVectorTopKFilterCondition {
     fn matches(&self, row: &Row) -> bool {
-        let candidate = row.values.get(self.ordinal).unwrap_or(&Value::Null);
+        let row_value = row.values.get(self.ordinal).unwrap_or(&Value::Null);
+        let extracted;
+        let candidate = if self.json_path.is_empty() {
+            row_value
+        } else {
+            extracted = vector_filter_extract_json_path(row_value, &self.json_path);
+            &extracted
+        };
         match &self.predicate {
-            CompiledVectorTopKFilterPredicate::Match(expected) => match expected {
-                Value::Null => candidate.is_null(),
-                expected => candidate == expected,
-            },
-            CompiledVectorTopKFilterPredicate::Range { gt, gte, lt, lte } => {
-                let Some(value) = vector_filter_candidate_to_f64(candidate) else {
-                    return false;
-                };
-                if gt.is_some_and(|bound| value <= bound) {
+            CompiledVectorTopKFilterPredicate::Match(expected) => {
+                vector_filter_value_matches(candidate, expected)
+            }
+            CompiledVectorTopKFilterPredicate::MatchAny(expected_values) => expected_values
+                .iter()
+                .any(|expected| vector_filter_value_matches(candidate, expected)),
+            CompiledVectorTopKFilterPredicate::MatchExcept(excluded_values) => {
+                vector_filter_value_matches_except(candidate, excluded_values)
+            }
+            CompiledVectorTopKFilterPredicate::MatchText(expected) => {
+                vector_filter_value_matches_text(candidate, expected)
+            }
+            CompiledVectorTopKFilterPredicate::IsNull => vector_filter_value_is_null(candidate),
+            CompiledVectorTopKFilterPredicate::IsEmpty => vector_filter_value_is_empty(candidate),
+            CompiledVectorTopKFilterPredicate::ValuesCount { gt, gte, lt, lte } => {
+                let count = vector_filter_value_count(candidate);
+                if gt.is_some_and(|bound| count <= bound) {
                     return false;
                 }
-                if gte.is_some_and(|bound| value < bound) {
+                if gte.is_some_and(|bound| count < bound) {
                     return false;
                 }
-                if lt.is_some_and(|bound| value >= bound) {
+                if lt.is_some_and(|bound| count >= bound) {
                     return false;
                 }
-                if lte.is_some_and(|bound| value > bound) {
+                if lte.is_some_and(|bound| count > bound) {
                     return false;
                 }
                 true
             }
+            CompiledVectorTopKFilterPredicate::Range { gt, gte, lt, lte } => {
+                vector_filter_value_matches_numeric_range(candidate, *gt, *gte, *lt, *lte)
+            }
         }
+    }
+}
+
+fn vector_filter_extract_json_path(candidate: &Value, path: &[String]) -> Value {
+    if path.is_empty() {
+        return candidate.clone();
+    }
+    let Value::Jsonb(json) = candidate else {
+        return Value::Null;
+    };
+    Value::Jsonb(vector_filter_extract_json_path_value(json, path))
+}
+
+fn vector_filter_extract_json_path_value(
+    candidate: &serde_json::Value,
+    path: &[String],
+) -> serde_json::Value {
+    if path.is_empty() {
+        return candidate.clone();
+    }
+    match candidate {
+        serde_json::Value::Object(object) => object
+            .get(&path[0])
+            .map_or(serde_json::Value::Null, |value| {
+                vector_filter_extract_json_path_value(value, &path[1..])
+            }),
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| vector_filter_extract_json_path_value(value, path))
+                .filter(|value| !value.is_null())
+                .collect(),
+        ),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn vector_filter_value_is_empty(candidate: &Value) -> bool {
+    match candidate {
+        Value::Null => true,
+        Value::Array(values) => values.is_empty(),
+        Value::Jsonb(serde_json::Value::Null) => true,
+        Value::Jsonb(serde_json::Value::Array(values)) => values.is_empty(),
+        _ => false,
+    }
+}
+
+fn vector_filter_value_count(candidate: &Value) -> usize {
+    match candidate {
+        Value::Null => 0,
+        Value::Array(values) => values.len(),
+        Value::Jsonb(serde_json::Value::Null) => 0,
+        Value::Jsonb(serde_json::Value::Array(values)) => values.len(),
+        _ => 1,
+    }
+}
+
+fn vector_filter_value_matches_numeric_range(
+    candidate: &Value,
+    gt: Option<f64>,
+    gte: Option<f64>,
+    lt: Option<f64>,
+    lte: Option<f64>,
+) -> bool {
+    match candidate {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| vector_filter_value_matches_numeric_range(value, gt, gte, lt, lte)),
+        Value::Jsonb(serde_json::Value::Array(values)) => values.iter().any(|value| {
+            let candidate = Value::Jsonb(value.clone());
+            vector_filter_value_matches_numeric_range(&candidate, gt, gte, lt, lte)
+        }),
+        candidate => {
+            let Some(value) = vector_filter_candidate_to_f64(candidate) else {
+                return false;
+            };
+            if gt.is_some_and(|bound| value <= bound) {
+                return false;
+            }
+            if gte.is_some_and(|bound| value < bound) {
+                return false;
+            }
+            if lt.is_some_and(|bound| value >= bound) {
+                return false;
+            }
+            if lte.is_some_and(|bound| value > bound) {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+fn vector_filter_value_is_null(candidate: &Value) -> bool {
+    matches!(
+        candidate,
+        Value::Null | Value::Jsonb(serde_json::Value::Null)
+    )
+}
+
+fn vector_filter_value_matches(candidate: &Value, expected: &Value) -> bool {
+    match candidate {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| vector_filter_scalar_value_matches(value, expected)),
+        Value::Jsonb(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|value| vector_filter_json_value_matches(value, expected)),
+        candidate => vector_filter_scalar_value_matches(candidate, expected),
+    }
+}
+
+fn vector_filter_value_matches_except(candidate: &Value, excluded_values: &[Value]) -> bool {
+    match candidate {
+        Value::Array(values) => values.iter().any(|value| {
+            !excluded_values
+                .iter()
+                .any(|excluded| vector_filter_scalar_value_matches(value, excluded))
+        }),
+        Value::Jsonb(serde_json::Value::Array(values)) => values.iter().any(|value| {
+            !excluded_values
+                .iter()
+                .any(|excluded| vector_filter_json_value_matches(value, excluded))
+        }),
+        candidate => !excluded_values
+            .iter()
+            .any(|excluded| vector_filter_scalar_value_matches(candidate, excluded)),
+    }
+}
+
+fn vector_filter_value_matches_text(candidate: &Value, expected: &str) -> bool {
+    match candidate {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| vector_filter_value_matches_text(value, expected)),
+        Value::Jsonb(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|value| vector_filter_json_value_matches_text(value, expected)),
+        Value::Text(candidate) => vector_filter_text_contains(candidate, expected),
+        Value::Jsonb(candidate) => vector_filter_json_value_matches_text(candidate, expected),
+        _ => false,
+    }
+}
+
+fn vector_filter_json_value_matches_text(candidate: &serde_json::Value, expected: &str) -> bool {
+    match candidate {
+        serde_json::Value::String(candidate) => vector_filter_text_contains(candidate, expected),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| vector_filter_json_value_matches_text(value, expected)),
+        _ => false,
+    }
+}
+
+fn vector_filter_text_contains(candidate: &str, expected: &str) -> bool {
+    candidate.to_lowercase().contains(&expected.to_lowercase())
+}
+
+fn vector_filter_scalar_value_matches(candidate: &Value, expected: &Value) -> bool {
+    match expected {
+        Value::Null => vector_filter_value_is_null(candidate),
+        Value::Jsonb(expected) => match candidate {
+            Value::Jsonb(candidate) => candidate == expected,
+            _ => false,
+        },
+        expected => candidate == expected,
+    }
+}
+
+fn vector_filter_json_value_matches(candidate: &serde_json::Value, expected: &Value) -> bool {
+    match expected {
+        Value::Jsonb(expected) => candidate == expected,
+        Value::Null => candidate.is_null(),
+        Value::Boolean(expected) => candidate.as_bool() == Some(*expected),
+        Value::Int(expected) => candidate.as_i64() == Some(i64::from(*expected)),
+        Value::BigInt(expected) => candidate.as_i64() == Some(*expected),
+        Value::Real(expected) => candidate
+            .as_f64()
+            .is_some_and(|candidate| (candidate - f64::from(*expected)).abs() < f64::EPSILON),
+        Value::Double(expected) => candidate
+            .as_f64()
+            .is_some_and(|candidate| (candidate - *expected).abs() < f64::EPSILON),
+        Value::Text(expected) => candidate.as_str().is_some_and(|value| value == expected),
+        expected => Value::Jsonb(candidate.clone()) == *expected,
     }
 }
 
@@ -77,7 +298,20 @@ impl CompiledVectorTopKFilter {
         if self.must_not.iter().any(|condition| condition.matches(row)) {
             return false;
         }
-        self.should.is_empty() || self.should.iter().any(|condition| condition.matches(row))
+        if !self.should.is_empty() && !self.should.iter().any(|condition| condition.matches(row)) {
+            return false;
+        }
+        if let Some(min_should) = &self.min_should {
+            let matched = min_should
+                .conditions
+                .iter()
+                .filter(|condition| condition.matches(row))
+                .count();
+            if matched < min_should.min_count {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -128,6 +362,26 @@ fn vector_filter_json_literal_to_value(value: &serde_json::Value) -> Value {
     }
 }
 
+fn coerce_vector_filter_match_value(
+    raw_match: &serde_json::Value,
+    data_type: &DataType,
+) -> DbResult<Value> {
+    let data_type = match data_type {
+        DataType::Array(element_type) => element_type.as_ref(),
+        data_type => data_type,
+    };
+    let raw_value = if matches!(data_type, DataType::Jsonb) {
+        Value::Jsonb(raw_match.clone())
+    } else {
+        vector_filter_json_literal_to_value(raw_match)
+    };
+    if matches!(raw_value, Value::Null) {
+        Ok(Value::Null)
+    } else {
+        aiondb_eval::coerce_value(raw_value, data_type)
+    }
+}
+
 fn vector_hit_json_number(value: f64) -> serde_json::Value {
     serde_json::Number::from_f64(value).map_or(serde_json::Value::Null, serde_json::Value::Number)
 }
@@ -151,7 +405,21 @@ fn vector_hit_value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
+fn vector_hit_vector_to_json(vector: &aiondb_core::VectorValue) -> serde_json::Value {
+    serde_json::Value::Array(
+        vector
+            .values
+            .iter()
+            .map(|value| vector_hit_json_number(f64::from(*value)))
+            .collect(),
+    )
+}
+
 fn vector_filter_candidate_to_f64(value: &Value) -> Option<f64> {
+    if let Value::Jsonb(json) = value {
+        let number = json.as_f64()?;
+        return number.is_finite().then_some(number);
+    }
     let coerced = aiondb_eval::coerce_value(value.clone(), &DataType::Double).ok()?;
     let Value::Double(number) = coerced else {
         return None;
@@ -1393,6 +1661,64 @@ fn vector_top_k_filter_condition_to_json(
             match_object.insert("value".to_owned(), value.clone());
             object.insert("match".to_owned(), serde_json::Value::Object(match_object));
         }
+        VectorTopKFilterPredicateSpec::MatchAny(values) => {
+            let mut match_object = serde_json::Map::new();
+            match_object.insert("any".to_owned(), serde_json::Value::Array(values.clone()));
+            object.insert("match".to_owned(), serde_json::Value::Object(match_object));
+        }
+        VectorTopKFilterPredicateSpec::MatchExcept(values) => {
+            let mut match_object = serde_json::Map::new();
+            match_object.insert(
+                "except".to_owned(),
+                serde_json::Value::Array(values.clone()),
+            );
+            object.insert("match".to_owned(), serde_json::Value::Object(match_object));
+        }
+        VectorTopKFilterPredicateSpec::MatchText(text) => {
+            let mut match_object = serde_json::Map::new();
+            match_object.insert("text".to_owned(), serde_json::Value::String(text.clone()));
+            object.insert("match".to_owned(), serde_json::Value::Object(match_object));
+        }
+        VectorTopKFilterPredicateSpec::IsNull => {
+            object.clear();
+            object.insert(
+                "is_null".to_owned(),
+                vector_top_k_payload_field_json(&condition.key),
+            );
+        }
+        VectorTopKFilterPredicateSpec::IsEmpty => {
+            object.clear();
+            object.insert(
+                "is_empty".to_owned(),
+                vector_top_k_payload_field_json(&condition.key),
+            );
+        }
+        VectorTopKFilterPredicateSpec::HasId(values) => {
+            object.clear();
+            object.insert(
+                "has_id".to_owned(),
+                serde_json::Value::Array(values.clone()),
+            );
+        }
+        VectorTopKFilterPredicateSpec::ValuesCount(values_count) => {
+            let mut values_count_object = serde_json::Map::new();
+            if let Some(value) = values_count.gt {
+                values_count_object.insert("gt".to_owned(), serde_json::Value::from(value));
+            }
+            if let Some(value) = values_count.gte {
+                values_count_object.insert("gte".to_owned(), serde_json::Value::from(value));
+            }
+            if let Some(value) = values_count.lt {
+                values_count_object.insert("lt".to_owned(), serde_json::Value::from(value));
+            }
+            if let Some(value) = values_count.lte {
+                values_count_object.insert("lte".to_owned(), serde_json::Value::from(value));
+            }
+            object.insert(
+                "values_count".to_owned(),
+                serde_json::Value::Object(values_count_object),
+            );
+        }
         VectorTopKFilterPredicateSpec::Range(range) => {
             let mut range_object = serde_json::Map::new();
             if let Some(value) = range.gt {
@@ -1410,6 +1736,12 @@ fn vector_top_k_filter_condition_to_json(
             object.insert("range".to_owned(), serde_json::Value::Object(range_object));
         }
     }
+    serde_json::Value::Object(object)
+}
+
+fn vector_top_k_payload_field_json(key: &str) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("key".to_owned(), serde_json::Value::String(key.to_owned()));
     serde_json::Value::Object(object)
 }
 
@@ -1449,6 +1781,27 @@ fn vector_top_k_filter_spec_to_json(filter: &VectorTopKFilterSpec) -> serde_json
                     .map(vector_top_k_filter_condition_to_json)
                     .collect(),
             ),
+        );
+    }
+    if let Some(min_should) = &filter.min_should {
+        let mut min_should_object = serde_json::Map::new();
+        min_should_object.insert(
+            "conditions".to_owned(),
+            serde_json::Value::Array(
+                min_should
+                    .conditions
+                    .iter()
+                    .map(vector_top_k_filter_condition_to_json)
+                    .collect(),
+            ),
+        );
+        min_should_object.insert(
+            "min_count".to_owned(),
+            serde_json::Value::from(min_should.min_count),
+        );
+        object.insert(
+            "min_should".to_owned(),
+            serde_json::Value::Object(min_should_object),
         );
     }
     serde_json::Value::Object(object)

@@ -65,6 +65,81 @@ fn eval_vector_distance(
     Ok(Value::Double(dist_fn(&a.values, &b.values)))
 }
 
+fn eval_vector_pair_map(
+    args: &[Value],
+    name: &str,
+    op: impl Fn(f32, f32) -> f32,
+) -> DbResult<Value> {
+    expect_args(args, 2, name)?;
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let (a, b) = extract_vector_pair(args, name)?;
+    let values = a
+        .values
+        .iter()
+        .zip(&b.values)
+        .map(|(left, right)| op(*left, *right))
+        .collect();
+    Ok(Value::Vector(VectorValue::new(a.dims, values)))
+}
+
+fn eval_vector_concat_impl(args: &[Value], name: &str) -> DbResult<Value> {
+    expect_args(args, 2, name)?;
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let Value::Vector(a) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{name}() requires vector arguments"
+        )));
+    };
+    let Value::Vector(b) = &args[1] else {
+        return Err(DbError::internal(format!(
+            "{name}() requires vector arguments"
+        )));
+    };
+    let mut values = Vec::with_capacity(a.values.len().saturating_add(b.values.len()));
+    values.extend_from_slice(&a.values);
+    values.extend_from_slice(&b.values);
+    Ok(Value::Vector(VectorValue::new(
+        a.dims.saturating_add(b.dims),
+        values,
+    )))
+}
+
+pub(crate) fn eval_vector_add(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "vector_add", |left, right| left + right)
+}
+
+pub(crate) fn eval_vector_sub(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "vector_sub", |left, right| left - right)
+}
+
+pub(crate) fn eval_vector_mul(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "vector_mul", |left, right| left * right)
+}
+
+pub(crate) fn eval_vector_concat(args: &[Value]) -> DbResult<Value> {
+    eval_vector_concat_impl(args, "vector_concat")
+}
+
+pub(crate) fn eval_halfvec_add(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "halfvec_add", |left, right| left + right)
+}
+
+pub(crate) fn eval_halfvec_sub(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "halfvec_sub", |left, right| left - right)
+}
+
+pub(crate) fn eval_halfvec_mul(args: &[Value]) -> DbResult<Value> {
+    eval_vector_pair_map(args, "halfvec_mul", |left, right| left * right)
+}
+
+pub(crate) fn eval_halfvec_concat(args: &[Value]) -> DbResult<Value> {
+    eval_vector_concat_impl(args, "halfvec_concat")
+}
+
 pub(crate) fn eval_vector_dims(args: &[Value]) -> DbResult<Value> {
     expect_args(args, 1, "vector_dims")?;
     if args[0].is_null() {
@@ -147,9 +222,26 @@ pub(crate) fn eval_subvector(args: &[Value]) -> DbResult<Value> {
 }
 
 pub(crate) fn eval_binary_quantize(args: &[Value]) -> DbResult<Value> {
-    expect_args(args, 1, "binary_quantize")?;
-    if args[0].is_null() {
-        return Ok(Value::Null);
+    if args.len() == 3 {
+        let Some(requested_dims) = validate_pgvector_cast_args(args, "binary_quantize")? else {
+            return Ok(Value::Null);
+        };
+        let Value::Vector(v) = &args[0] else {
+            return Err(DbError::internal(
+                "binary_quantize() requires a vector argument",
+            ));
+        };
+        if v.dims != requested_dims {
+            return Err(DbError::internal(format!(
+                "expected {requested_dims} dimensions, got {}",
+                v.dims
+            )));
+        }
+    } else {
+        expect_args(args, 1, "binary_quantize")?;
+        if args[0].is_null() {
+            return Ok(Value::Null);
+        }
     }
     let Value::Vector(v) = &args[0] else {
         return Err(DbError::internal(
@@ -161,6 +253,270 @@ pub(crate) fn eval_binary_quantize(args: &[Value]) -> DbResult<Value> {
         bits.push(if *value > 0.0 { '1' } else { '0' });
     }
     Ok(Value::Text(bits))
+}
+
+pub(crate) fn eval_vector_in(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_in(args, "vector_in", "vector")
+}
+
+pub(crate) fn eval_halfvec_in(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_in(args, "halfvec_in", "halfvec")
+}
+
+pub(crate) fn eval_sparsevec_in(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_in(args, "sparsevec_in", "sparsevec")
+}
+
+pub(crate) fn eval_vector_out(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_out(args, "vector_out")
+}
+
+pub(crate) fn eval_halfvec_out(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_out(args, "halfvec_out")
+}
+
+pub(crate) fn eval_sparsevec_out(args: &[Value]) -> DbResult<Value> {
+    expect_args(args, 1, "sparsevec_out")?;
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let Value::Vector(vector) = &args[0] else {
+        return Err(DbError::internal(
+            "sparsevec_out() requires a vector argument",
+        ));
+    };
+    Ok(Value::Text(format_sparsevec(vector)))
+}
+
+fn eval_pgvector_dense_in(
+    args: &[Value],
+    function_name: &str,
+    invalid_type_name: &str,
+) -> DbResult<Value> {
+    if args.len() == 1 {
+        expect_args(args, 1, function_name)?;
+    } else {
+        expect_args(args, 3, function_name)?;
+    }
+    if args[0].is_null() || args.len() == 3 && args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(input) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{function_name}() requires a text argument"
+        )));
+    };
+    let vector = VectorValue::parse(input)
+        .ok_or_else(|| DbError::invalid_input_syntax(invalid_type_name, input))?;
+    if args.len() == 3 {
+        let typmod = value_to_i32(&args[2])?;
+        if typmod > 0 {
+            let requested_dims = u32::try_from(typmod).map_err(|_| {
+                DbError::internal(format!(
+                    "{function_name}() requested dimensions are out of range"
+                ))
+            })?;
+            if vector.dims != requested_dims {
+                return Err(DbError::internal(format!(
+                    "expected {requested_dims} dimensions, got {}",
+                    vector.dims
+                )));
+            }
+        }
+    }
+    Ok(Value::Vector(vector))
+}
+
+fn eval_pgvector_dense_out(args: &[Value], function_name: &str) -> DbResult<Value> {
+    expect_args(args, 1, function_name)?;
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let Value::Vector(_) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{function_name}() requires a vector argument"
+        )));
+    };
+    Ok(Value::Text(args[0].to_string()))
+}
+
+fn format_sparsevec(vector: &VectorValue) -> String {
+    let mut output = String::from("{");
+    let mut emitted = 0usize;
+    for (idx, value) in vector.values.iter().enumerate() {
+        if *value == 0.0 {
+            continue;
+        }
+        if emitted > 0 {
+            output.push(',');
+        }
+        emitted += 1;
+        output.push_str(&(idx + 1).to_string());
+        output.push(':');
+        output.push_str(&value.to_string());
+    }
+    output.push_str("}/");
+    output.push_str(&vector.dims.to_string());
+    output
+}
+
+fn pgvector_cast_requested_dims(args: &[Value], function_name: &str) -> DbResult<Option<u32>> {
+    let dims = value_to_i32(&args[1])?;
+    if dims <= 0 {
+        return Ok(None);
+    }
+    u32::try_from(dims).map(Some).map_err(|_| {
+        DbError::internal(format!(
+            "{function_name}() requested dimensions are out of range"
+        ))
+    })
+}
+
+fn validate_pgvector_cast_args(args: &[Value], function_name: &str) -> DbResult<Option<u32>> {
+    expect_args(args, 3, function_name)?;
+    if args.iter().any(Value::is_null) {
+        return Ok(None);
+    }
+    if !matches!(args[2], Value::Boolean(_)) {
+        return Err(DbError::internal(format!(
+            "{function_name}() explicit flag must be boolean"
+        )));
+    }
+    pgvector_cast_requested_dims(args, function_name)
+}
+
+pub(crate) fn eval_vector_to_halfvec(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "vector_to_halfvec")
+}
+
+pub(crate) fn eval_halfvec_to_vector(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "halfvec_to_vector")
+}
+
+pub(crate) fn eval_halfvec_to_sparsevec(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "halfvec_to_sparsevec")
+}
+
+pub(crate) fn eval_sparsevec_to_vector(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "sparsevec_to_vector")
+}
+
+pub(crate) fn eval_sparsevec_to_halfvec(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "sparsevec_to_halfvec")
+}
+
+pub(crate) fn eval_vector_to_float4(args: &[Value]) -> DbResult<Value> {
+    eval_dense_vector_to_float4(args, "vector_to_float4")
+}
+
+pub(crate) fn eval_halfvec_to_float4(args: &[Value]) -> DbResult<Value> {
+    eval_dense_vector_to_float4(args, "halfvec_to_float4")
+}
+
+fn eval_dense_vector_to_float4(args: &[Value], function_name: &str) -> DbResult<Value> {
+    let Some(requested_dims) = validate_pgvector_cast_args(args, function_name)? else {
+        return Ok(Value::Null);
+    };
+    let Value::Vector(vector) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{function_name}() requires a vector argument"
+        )));
+    };
+    if vector.dims != requested_dims {
+        return Err(DbError::internal(format!(
+            "expected {requested_dims} dimensions, got {}",
+            vector.dims
+        )));
+    }
+    Ok(Value::Array(
+        vector.values.iter().copied().map(Value::Real).collect(),
+    ))
+}
+
+pub(crate) fn eval_array_to_vector(args: &[Value]) -> DbResult<Value> {
+    eval_array_to_dense_vector(args, "array_to_vector", "vector")
+}
+
+pub(crate) fn eval_array_to_halfvec(args: &[Value]) -> DbResult<Value> {
+    eval_array_to_dense_vector(args, "array_to_halfvec", "halfvec")
+}
+
+pub(crate) fn eval_vector_to_sparsevec(args: &[Value]) -> DbResult<Value> {
+    eval_pgvector_dense_identity_cast(args, "vector_to_sparsevec")
+}
+
+fn eval_pgvector_dense_identity_cast(args: &[Value], function_name: &str) -> DbResult<Value> {
+    let Some(requested_dims) = validate_pgvector_cast_args(args, function_name)? else {
+        return Ok(Value::Null);
+    };
+    let Value::Vector(vector) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{function_name}() requires a vector argument"
+        )));
+    };
+    if vector.dims != requested_dims {
+        return Err(DbError::internal(format!(
+            "expected {requested_dims} dimensions, got {}",
+            vector.dims
+        )));
+    }
+    Ok(Value::Vector(vector.clone()))
+}
+
+pub(crate) fn eval_array_to_sparsevec(args: &[Value]) -> DbResult<Value> {
+    eval_array_to_dense_vector(args, "array_to_sparsevec", "sparsevec")
+}
+
+fn eval_array_to_dense_vector(
+    args: &[Value],
+    function_name: &str,
+    invalid_type_name: &str,
+) -> DbResult<Value> {
+    let requested_dims = match validate_pgvector_cast_args(args, function_name)? {
+        Some(dims) => dims,
+        None => return Ok(Value::Null),
+    };
+    let Value::Array(elements) = &args[0] else {
+        return Err(DbError::internal(format!(
+            "{function_name}() requires an array argument"
+        )));
+    };
+    let mut values = Vec::with_capacity(elements.len());
+    for element in elements {
+        if element.is_null() || matches!(element, Value::Array(_)) {
+            return Err(DbError::invalid_input_syntax(
+                invalid_type_name,
+                &args[0].to_string(),
+            ));
+        }
+        let coerced =
+            crate::eval::cast::cast_value(element.clone(), &aiondb_core::DataType::Double)?;
+        let Value::Double(number) = coerced else {
+            return Err(DbError::invalid_input_syntax(
+                invalid_type_name,
+                &args[0].to_string(),
+            ));
+        };
+        let value = number as f32;
+        if !value.is_finite() {
+            return Err(DbError::invalid_input_syntax(
+                invalid_type_name,
+                &args[0].to_string(),
+            ));
+        }
+        values.push(value);
+    }
+    let actual_dims = u32::try_from(values.len()).map_err(|_| {
+        DbError::program_limit(format!(
+            "{invalid_type_name} dimension count is out of range"
+        ))
+    })?;
+    if actual_dims != requested_dims {
+        return Err(DbError::internal(format!(
+            "expected {requested_dims} dimensions, got {actual_dims}"
+        )));
+    }
+    Ok(Value::Vector(VectorValue::new(actual_dims, values)))
 }
 
 fn extract_bitstring_pair<'a>(

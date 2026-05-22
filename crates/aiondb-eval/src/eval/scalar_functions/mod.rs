@@ -364,6 +364,22 @@ pub(super) fn eval_scalar_function(func: &ScalarFunction, args: &[Value]) -> DbR
                 result
             } else {
                 match name.as_str() {
+                    "l2_distance" | "pg_catalog.l2_distance" => eval_l2_distance(args),
+                    "cosine_distance" | "pg_catalog.cosine_distance" => eval_cosine_distance(args),
+                    "inner_product" | "pg_catalog.inner_product" => eval_inner_product(args),
+                    "manhattan_distance"
+                    | "pg_catalog.manhattan_distance"
+                    | "l1_distance"
+                    | "pg_catalog.l1_distance" => eval_manhattan_distance(args),
+                    "negative_inner_product" | "pg_catalog.negative_inner_product" => {
+                        eval_negative_inner_product(args)
+                    }
+                    "hamming_distance" | "pg_catalog.hamming_distance" => {
+                        ext::eval_hamming_distance(args)
+                    }
+                    "jaccard_distance" | "pg_catalog.jaccard_distance" => {
+                        ext::eval_jaccard_distance(args)
+                    }
                     "multirange" => eval_generic_multirange(args),
                     "range_adjacent" => {
                         expect_args(args, 2, "range_adjacent")?;
@@ -445,6 +461,55 @@ pub(super) fn eval_scalar_function(func: &ScalarFunction, args: &[Value]) -> DbR
                     }
                     // width_bucket(operand, low, high, count) -> int
                     "width_bucket" => math::eval_width_bucket(args),
+                    "vector_in" | "pg_catalog.vector_in" => ext::eval_vector_in(args),
+                    "vector_out" | "pg_catalog.vector_out" => ext::eval_vector_out(args),
+                    "halfvec_in" | "pg_catalog.halfvec_in" => ext::eval_halfvec_in(args),
+                    "halfvec_out" | "pg_catalog.halfvec_out" => ext::eval_halfvec_out(args),
+                    "sparsevec_in" | "pg_catalog.sparsevec_in" => ext::eval_sparsevec_in(args),
+                    "sparsevec_out" | "pg_catalog.sparsevec_out" => ext::eval_sparsevec_out(args),
+                    "array_to_vector" | "pg_catalog.array_to_vector" => {
+                        ext::eval_array_to_vector(args)
+                    }
+                    "array_to_halfvec" | "pg_catalog.array_to_halfvec" => {
+                        ext::eval_array_to_halfvec(args)
+                    }
+                    "vector_to_float4" | "pg_catalog.vector_to_float4" => {
+                        ext::eval_vector_to_float4(args)
+                    }
+                    "halfvec_to_float4" | "pg_catalog.halfvec_to_float4" => {
+                        ext::eval_halfvec_to_float4(args)
+                    }
+                    "vector_to_halfvec" | "pg_catalog.vector_to_halfvec" => {
+                        ext::eval_vector_to_halfvec(args)
+                    }
+                    "halfvec_to_vector" | "pg_catalog.halfvec_to_vector" => {
+                        ext::eval_halfvec_to_vector(args)
+                    }
+                    "vector_to_sparsevec" | "pg_catalog.vector_to_sparsevec" => {
+                        ext::eval_vector_to_sparsevec(args)
+                    }
+                    "halfvec_to_sparsevec" | "pg_catalog.halfvec_to_sparsevec" => {
+                        ext::eval_halfvec_to_sparsevec(args)
+                    }
+                    "sparsevec_to_vector" | "pg_catalog.sparsevec_to_vector" => {
+                        ext::eval_sparsevec_to_vector(args)
+                    }
+                    "sparsevec_to_halfvec" | "pg_catalog.sparsevec_to_halfvec" => {
+                        ext::eval_sparsevec_to_halfvec(args)
+                    }
+                    "array_to_sparsevec" | "pg_catalog.array_to_sparsevec" => {
+                        ext::eval_array_to_sparsevec(args)
+                    }
+                    "vector_add" | "pg_catalog.vector_add" => ext::eval_vector_add(args),
+                    "vector_sub" | "pg_catalog.vector_sub" => ext::eval_vector_sub(args),
+                    "vector_mul" | "pg_catalog.vector_mul" => ext::eval_vector_mul(args),
+                    "vector_concat" | "pg_catalog.vector_concat" => ext::eval_vector_concat(args),
+                    "halfvec_add" | "pg_catalog.halfvec_add" => ext::eval_halfvec_add(args),
+                    "halfvec_sub" | "pg_catalog.halfvec_sub" => ext::eval_halfvec_sub(args),
+                    "halfvec_mul" | "pg_catalog.halfvec_mul" => ext::eval_halfvec_mul(args),
+                    "halfvec_concat" | "pg_catalog.halfvec_concat" => {
+                        ext::eval_halfvec_concat(args)
+                    }
                     "__aiondb_interval_fields" => math::eval_interval_fields(args),
                     "__aiondb_interval_precision" => math::eval_interval_precision(args),
                     "__aiondb_temporal_precision" => {

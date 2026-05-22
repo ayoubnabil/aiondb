@@ -392,6 +392,43 @@ fn pg_input_is_valid_ranges_and_network_types() {
 }
 
 #[test]
+fn pg_input_is_valid_pgvector_types() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT \
+                pg_input_is_valid('[1,2,3]', 'vector(3)'), \
+                pg_input_is_valid('[1,2]', 'vector(3)'), \
+                pg_input_is_valid('[1,2,3]', 'halfvec(3)'), \
+                pg_input_is_valid('{1:1,3:2}/4', 'sparsevec(4)'), \
+                pg_input_is_valid('{0:1}/4', 'sparsevec(4)'), \
+                pg_input_is_valid('[1,2,3]', 'pg_catalog.vector(3)')",
+        )
+        .expect("pg_input_is_valid");
+
+    match &results[0] {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values,
+                vec![
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ]
+            );
+        }
+        other => panic!("expected query, got {other:?}"),
+    }
+}
+
+#[test]
 fn generic_multirange_wraps_single_range() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");

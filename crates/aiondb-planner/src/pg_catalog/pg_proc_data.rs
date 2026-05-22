@@ -115,6 +115,12 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         prokind: "f",
     },
     PgvectorProcEntry {
+        name: "vector_in",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "2275 26 23",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
         name: "vector_out",
         rettype: 2275,
         argtypes: "80001",
@@ -127,6 +133,12 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         prokind: "f",
     },
     PgvectorProcEntry {
+        name: "halfvec_in",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "2275 26 23",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
         name: "halfvec_out",
         rettype: 2275,
         argtypes: "80003",
@@ -136,6 +148,12 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         name: "sparsevec_in",
         rettype: COMPAT_PGVECTOR_SPARSEVEC_OID,
         argtypes: "2275",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "sparsevec_in",
+        rettype: COMPAT_PGVECTOR_SPARSEVEC_OID,
+        argtypes: "2275 26 23",
         prokind: "f",
     },
     PgvectorProcEntry {
@@ -175,6 +193,30 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         prokind: "f",
     },
     PgvectorProcEntry {
+        name: "vector_add",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "80001 80001",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "vector_sub",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "80001 80001",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "vector_mul",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "80001 80001",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "vector_concat",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "80001 80001",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
         name: "l2_distance",
         rettype: 701,
         argtypes: "80003 80003",
@@ -201,6 +243,30 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
     PgvectorProcEntry {
         name: "l1_distance",
         rettype: 701,
+        argtypes: "80003 80003",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "halfvec_add",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "80003 80003",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "halfvec_sub",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "80003 80003",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "halfvec_mul",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "80003 80003",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "halfvec_concat",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
         argtypes: "80003 80003",
         prokind: "f",
     },
@@ -265,9 +331,39 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         prokind: "f",
     },
     PgvectorProcEntry {
+        name: "halfvec_to_float4",
+        rettype: 1021,
+        argtypes: "80003 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
         name: "vector_to_halfvec",
         rettype: COMPAT_PGVECTOR_HALFVEC_OID,
         argtypes: "80001 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "array_to_halfvec",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "1007 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "array_to_halfvec",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "1021 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "array_to_halfvec",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "1022 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "array_to_halfvec",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "1231 23 16",
         prokind: "f",
     },
     PgvectorProcEntry {
@@ -280,6 +376,24 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         name: "vector_to_sparsevec",
         rettype: COMPAT_PGVECTOR_SPARSEVEC_OID,
         argtypes: "80001 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "halfvec_to_sparsevec",
+        rettype: COMPAT_PGVECTOR_SPARSEVEC_OID,
+        argtypes: "80003 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "sparsevec_to_vector",
+        rettype: COMPAT_PGVECTOR_VECTOR_OID,
+        argtypes: "80005 23 16",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "sparsevec_to_halfvec",
+        rettype: COMPAT_PGVECTOR_HALFVEC_OID,
+        argtypes: "80005 23 16",
         prokind: "f",
     },
     PgvectorProcEntry {
@@ -376,6 +490,18 @@ const PGVECTOR_PROC_ENTRIES: &[PgvectorProcEntry] = &[
         name: "binary_quantize",
         rettype: COMPAT_PG_BIT_OID,
         argtypes: "80001",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "l2_norm",
+        rettype: 701,
+        argtypes: "80005",
+        prokind: "f",
+    },
+    PgvectorProcEntry {
+        name: "l2_normalize",
+        rettype: COMPAT_PGVECTOR_SPARSEVEC_OID,
+        argtypes: "80005",
         prokind: "f",
     },
     PgvectorProcEntry {

@@ -219,11 +219,78 @@ fn pgvector_catalog_rows_are_cross_referenced() {
             && row[1] == "l2_distance"
             && row[19] == format!("{COMPAT_PGVECTOR_SPARSEVEC_OID} {COMPAT_PGVECTOR_SPARSEVEC_OID}")
     }));
+    let expected_sparse_l2_norm_oid =
+        compat_pgvector_function_oid("l2_norm", &COMPAT_PGVECTOR_SPARSEVEC_OID.to_string());
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_sparse_l2_norm_oid.to_string()
+            && row[1] == "l2_norm"
+            && row[18] == "701"
+            && row[19] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+    }));
+    let expected_sparse_l2_normalize_oid =
+        compat_pgvector_function_oid("l2_normalize", &COMPAT_PGVECTOR_SPARSEVEC_OID.to_string());
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_sparse_l2_normalize_oid.to_string()
+            && row[1] == "l2_normalize"
+            && row[18] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+            && row[19] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+    }));
     let expected_sum_oid = compat_pgvector_function_oid("sum", "80001");
     assert!(proc_rows
         .iter()
         .map(|row| extract_values(row))
         .any(|row| { row[0] == expected_sum_oid.to_string() && row[1] == "sum" && row[9] == "a" }));
+    let expected_vector_in_typmod_oid = compat_pgvector_function_oid("vector_in", "2275 26 23");
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_vector_in_typmod_oid.to_string()
+            && row[1] == "vector_in"
+            && row[16] == "3"
+            && row[19] == "2275 26 23"
+    }));
+    let expected_array_to_halfvec_oid =
+        compat_pgvector_function_oid("array_to_halfvec", "1022 23 16");
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_array_to_halfvec_oid.to_string()
+            && row[1] == "array_to_halfvec"
+            && row[18] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[19] == "1022 23 16"
+    }));
+    let expected_halfvec_to_float4_oid =
+        compat_pgvector_function_oid("halfvec_to_float4", "80003 23 16");
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_halfvec_to_float4_oid.to_string()
+            && row[1] == "halfvec_to_float4"
+            && row[18] == "1021"
+            && row[19] == "80003 23 16"
+    }));
+    let expected_vector_add_oid = compat_pgvector_function_oid(
+        "vector_add",
+        &format!("{COMPAT_PGVECTOR_VECTOR_OID} {COMPAT_PGVECTOR_VECTOR_OID}"),
+    );
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_vector_add_oid.to_string()
+            && row[1] == "vector_add"
+            && row[18] == COMPAT_PGVECTOR_VECTOR_OID.to_string()
+            && row[19] == format!("{COMPAT_PGVECTOR_VECTOR_OID} {COMPAT_PGVECTOR_VECTOR_OID}")
+    }));
+    let expected_halfvec_concat_oid = compat_pgvector_function_oid(
+        "halfvec_concat",
+        &format!("{COMPAT_PGVECTOR_HALFVEC_OID} {COMPAT_PGVECTOR_HALFVEC_OID}"),
+    );
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_halfvec_concat_oid.to_string()
+            && row[1] == "halfvec_concat"
+            && row[18] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[19] == format!("{COMPAT_PGVECTOR_HALFVEC_OID} {COMPAT_PGVECTOR_HALFVEC_OID}")
+    }));
+    let expected_halfvec_binary_quantize_oid =
+        compat_pgvector_function_oid("binary_quantize", &COMPAT_PGVECTOR_HALFVEC_OID.to_string());
+    assert!(proc_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[0] == expected_halfvec_binary_quantize_oid.to_string()
+            && row[1] == "binary_quantize"
+            && row[18] == COMPAT_PG_BIT_OID.to_string()
+            && row[19] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+    }));
 
     let pg_aggregate = build_plan(&catalog, txn(), "pg_aggregate", None, None, None)
         .expect("pg_aggregate")
@@ -246,6 +313,26 @@ fn pgvector_catalog_rows_are_cross_referenced() {
         .any(|row| row[0] == expected_operator_oid.to_string()
             && row[1] == "<->"
             && row[12] == expected_l2_oid.to_string()));
+    let expected_vector_add_operator_oid =
+        compat_pgvector_operator_oid(COMPAT_PGVECTOR_VECTOR_OID, "+");
+    assert!(operator_rows
+        .iter()
+        .map(|row| extract_values(row))
+        .any(|row| row[0] == expected_vector_add_operator_oid.to_string()
+            && row[1] == "+"
+            && row[9] == COMPAT_PGVECTOR_VECTOR_OID.to_string()
+            && row[12] == expected_vector_add_oid.to_string()));
+    let expected_halfvec_concat_operator_oid =
+        compat_pgvector_operator_oid(COMPAT_PGVECTOR_HALFVEC_OID, "||");
+    assert!(operator_rows
+        .iter()
+        .map(|row| extract_values(row))
+        .any(
+            |row| row[0] == expected_halfvec_concat_operator_oid.to_string()
+                && row[1] == "||"
+                && row[9] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+                && row[12] == expected_halfvec_concat_oid.to_string(),
+        ));
 
     let pg_opclass = build_plan(&catalog, txn(), "pg_opclass", None, None, None)
         .expect("pg_opclass")
@@ -362,6 +449,54 @@ fn pgvector_cast_catalog_rows_reference_pgvector_procs() {
             && row[5] == "f"
     }));
 
+    let halfvec_to_float4_oid = compat_pgvector_function_oid("halfvec_to_float4", "80003 23 16");
+    assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[1] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[2] == "1021"
+            && row[3] == halfvec_to_float4_oid.to_string()
+            && row[4] == "a"
+            && row[5] == "f"
+    }));
+
+    let array_to_halfvec_oid = compat_pgvector_function_oid("array_to_halfvec", "1007 23 16");
+    assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[1] == "1007"
+            && row[2] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[3] == array_to_halfvec_oid.to_string()
+            && row[4] == "a"
+            && row[5] == "f"
+    }));
+
+    let halfvec_to_sparsevec_oid =
+        compat_pgvector_function_oid("halfvec_to_sparsevec", "80003 23 16");
+    assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[1] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[2] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+            && row[3] == halfvec_to_sparsevec_oid.to_string()
+            && row[4] == "i"
+            && row[5] == "f"
+    }));
+
+    let sparsevec_to_vector_oid =
+        compat_pgvector_function_oid("sparsevec_to_vector", "80005 23 16");
+    assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[1] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+            && row[2] == COMPAT_PGVECTOR_VECTOR_OID.to_string()
+            && row[3] == sparsevec_to_vector_oid.to_string()
+            && row[4] == "a"
+            && row[5] == "f"
+    }));
+
+    let sparsevec_to_halfvec_oid =
+        compat_pgvector_function_oid("sparsevec_to_halfvec", "80005 23 16");
+    assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
+        row[1] == COMPAT_PGVECTOR_SPARSEVEC_OID.to_string()
+            && row[2] == COMPAT_PGVECTOR_HALFVEC_OID.to_string()
+            && row[3] == sparsevec_to_halfvec_oid.to_string()
+            && row[4] == "a"
+            && row[5] == "f"
+    }));
+
     let array_to_sparsevec_oid = compat_pgvector_function_oid("array_to_sparsevec", "1007 23 16");
     assert!(cast_rows.iter().map(|row| extract_values(row)).any(|row| {
         row[1] == "1007"
@@ -427,37 +562,108 @@ fn pg_type_select_plan_resolves_pgvector_typmod_regtype() {
 #[test]
 fn pg_operator_select_plan_supports_pgvector_to_regoperator_filter() {
     let catalog: Arc<dyn CatalogReader> = Arc::new(crate::EmptyCatalog);
-    let stmt = parse_prepared_statement(
-        "SELECT oprname, oid \
-         FROM pg_operator \
-         WHERE oid = to_regoperator('<->(vector, vector)')",
-    )
-    .expect("parse");
-    let aiondb_parser::Statement::Select(select) = stmt else {
-        panic!("expected SELECT");
-    };
+    for (signature, name, type_oid) in [
+        ("<->(vector, vector)", "<->", COMPAT_PGVECTOR_VECTOR_OID),
+        ("+(vector, vector)", "+", COMPAT_PGVECTOR_VECTOR_OID),
+        ("||(halfvec, halfvec)", "||", COMPAT_PGVECTOR_HALFVEC_OID),
+    ] {
+        let stmt = parse_prepared_statement(&format!(
+            "SELECT oprname, oid \
+             FROM pg_operator \
+             WHERE oid = to_regoperator('{signature}')",
+        ))
+        .expect("parse");
+        let aiondb_parser::Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
 
-    let plan = build_select_plan(&catalog, txn(), &select, None, None, None)
-        .expect("plan should succeed")
-        .expect("pg_operator should be recognized");
-    let (_fields, rows) = unwrap_rows(plan);
+        let plan = build_select_plan(&catalog, txn(), &select, None, None, None)
+            .expect("plan should succeed")
+            .expect("pg_operator should be recognized");
+        let (_fields, rows) = unwrap_rows(plan);
 
-    assert_eq!(rows.len(), 1);
-    let values = extract_values(&rows[0]);
-    assert_eq!(values[0], "<->");
-    assert_eq!(
-        values[1],
-        compat_pgvector_operator_oid(COMPAT_PGVECTOR_VECTOR_OID, "<->").to_string()
-    );
+        assert_eq!(rows.len(), 1);
+        let values = extract_values(&rows[0]);
+        assert_eq!(values[0], name);
+        assert_eq!(
+            values[1],
+            compat_pgvector_operator_oid(type_oid, name).to_string()
+        );
+    }
 }
 
 #[test]
 fn pg_proc_select_plan_supports_pgvector_to_regprocedure_filter() {
     let catalog: Arc<dyn CatalogReader> = Arc::new(crate::EmptyCatalog);
+    for (signature, name, argtypes) in [
+        (
+            "l2_distance(vector, vector)",
+            "l2_distance",
+            format!("{COMPAT_PGVECTOR_VECTOR_OID} {COMPAT_PGVECTOR_VECTOR_OID}"),
+        ),
+        (
+            "vector_add(vector, vector)",
+            "vector_add",
+            format!("{COMPAT_PGVECTOR_VECTOR_OID} {COMPAT_PGVECTOR_VECTOR_OID}"),
+        ),
+        (
+            "halfvec_concat(halfvec, halfvec)",
+            "halfvec_concat",
+            format!("{COMPAT_PGVECTOR_HALFVEC_OID} {COMPAT_PGVECTOR_HALFVEC_OID}"),
+        ),
+        (
+            "l2_norm(sparsevec)",
+            "l2_norm",
+            COMPAT_PGVECTOR_SPARSEVEC_OID.to_string(),
+        ),
+        (
+            "l2_normalize(sparsevec)",
+            "l2_normalize",
+            COMPAT_PGVECTOR_SPARSEVEC_OID.to_string(),
+        ),
+        (
+            "binary_quantize(halfvec)",
+            "binary_quantize",
+            COMPAT_PGVECTOR_HALFVEC_OID.to_string(),
+        ),
+        (
+            "halfvec_to_float4(halfvec, integer, boolean)",
+            "halfvec_to_float4",
+            "80003 23 16".to_string(),
+        ),
+    ] {
+        let stmt = parse_prepared_statement(&format!(
+            "SELECT proname, oid \
+             FROM pg_proc \
+             WHERE oid = to_regprocedure('{signature}')",
+        ))
+        .expect("parse");
+        let aiondb_parser::Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+
+        let plan = build_select_plan(&catalog, txn(), &select, None, None, None)
+            .expect("plan should succeed")
+            .expect("pg_proc should be recognized");
+        let (_fields, rows) = unwrap_rows(plan);
+
+        assert_eq!(rows.len(), 1);
+        let values = extract_values(&rows[0]);
+        assert_eq!(values[0], name);
+        assert_eq!(
+            values[1],
+            compat_pgvector_function_oid(name, &argtypes).to_string()
+        );
+    }
+}
+
+#[test]
+fn pg_proc_select_plan_supports_pgvector_typmod_input_regprocedure_filter() {
+    let catalog: Arc<dyn CatalogReader> = Arc::new(crate::EmptyCatalog);
     let stmt = parse_prepared_statement(
         "SELECT proname, oid \
          FROM pg_proc \
-         WHERE oid = to_regprocedure('l2_distance(vector, vector)')",
+         WHERE oid = to_regprocedure('vector_in(cstring, oid, integer)')",
     )
     .expect("parse");
     let aiondb_parser::Statement::Select(select) = stmt else {
@@ -471,14 +677,10 @@ fn pg_proc_select_plan_supports_pgvector_to_regprocedure_filter() {
 
     assert_eq!(rows.len(), 1);
     let values = extract_values(&rows[0]);
-    assert_eq!(values[0], "l2_distance");
+    assert_eq!(values[0], "vector_in");
     assert_eq!(
         values[1],
-        compat_pgvector_function_oid(
-            "l2_distance",
-            &format!("{COMPAT_PGVECTOR_VECTOR_OID} {COMPAT_PGVECTOR_VECTOR_OID}")
-        )
-        .to_string()
+        compat_pgvector_function_oid("vector_in", "2275 26 23").to_string()
     );
 }
 

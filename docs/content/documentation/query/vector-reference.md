@@ -54,7 +54,11 @@ CREATE TABLE compact_embeddings (
 );
 ```
 
-`SPARSEVEC(n)` is recognized for pgvector migration and catalog introspection compatibility. Its pgvector function, operator, and operator-class catalog rows are exposed for tooling that inspects the extension surface. It is currently stored as text; use dense `VECTOR` or `HALFVEC` columns for executable vector distance search and ANN indexes.
+`SPARSEVEC(n)` is accepted for pgvector migration compatibility. Sparse text
+values such as `'{1:1.0,3:2.0}/4'` are expanded into AionDB's dense runtime
+vector representation, so exact distance functions and pgvector distance
+operators work. Dedicated sparse storage and sparse ANN indexes are not yet
+implemented; use `VECTOR` or `HALFVEC` for indexed dense vector workloads.
 
 ## Distance functions
 
@@ -66,6 +70,8 @@ CREATE TABLE compact_embeddings (
 | `manhattan_distance(a, b)` | L1 distance. Aliased as `l1_distance(a, b)` for pgvector compatibility. | `vector_l1_ops` |
 
 Use the same metric for indexing and querying whenever possible: HNSW and IVF-flat indexes are built around one metric, and the planner will refuse to substitute a different metric at query time.
+The pgvector distance functions are also accepted with explicit `pg_catalog.`
+qualification, which keeps ORM-generated SQL portable.
 
 ## L2 distance
 
@@ -74,6 +80,9 @@ SELECT id, doc_name, l2_distance(vec, '[1.0,0.0,0.0,0.0]') AS dist
 FROM embeddings
 ORDER BY dist ASC
 LIMIT 3;
+
+SELECT pg_catalog.l2_distance(vec, '[1.0,0.0,0.0,0.0]')
+FROM embeddings;
 ```
 
 ## Cosine distance
@@ -114,7 +123,7 @@ SELECT avg(vec) AS centroid, sum(vec) AS component_sum
 FROM embeddings;
 ```
 
-`avg(vector)` and `sum(vector)` ignore NULL rows and operate component-wise, matching pgvector's centroid-style aggregate behaviour. All non-null vectors in the group must have the same runtime dimension.
+`avg(vector)`, `sum(vector)`, `avg(halfvec)`, and `sum(halfvec)` ignore NULL rows and operate component-wise, matching pgvector's centroid-style aggregate behaviour. All non-null vectors in the group must have the same runtime dimension.
 
 ## pgvector casts
 
@@ -123,14 +132,59 @@ client introspection:
 
 ```sql
 SELECT ARRAY[1, 2, 3]::integer[]::vector(3);
+SELECT ARRAY[1, 2, 3]::integer[]::halfvec(3);
+SELECT ARRAY[1, 0, 2]::integer[]::sparsevec(3);
 SELECT embedding::real[] FROM embeddings;
 SELECT embedding::halfvec(4) FROM embeddings;
+SELECT CAST(CAST('[1.0,0.0,2.0]' AS HALFVEC(3)) AS REAL[]);
+SELECT embedding::sparsevec(4) FROM embeddings;
+SELECT CAST(CAST('{1:1.0,3:2.0}/3' AS SPARSEVEC(3)) AS VECTOR(3));
+SELECT CAST(CAST('{1:1.0,3:2.0}/3' AS SPARSEVEC(3)) AS HALFVEC(3));
+SELECT array_to_vector(ARRAY[1.0, 0.0, 2.0], 3, true);
+SELECT vector_to_float4(embedding, 4, true) FROM embeddings;
+SELECT halfvec_to_float4(CAST('[1.0,0.0,2.0]' AS HALFVEC(3)), 3, true);
+SELECT array_to_halfvec(ARRAY[1.0, 0.0, 2.0], 3, true);
+SELECT vector_to_halfvec(embedding, 4, true) FROM embeddings;
+SELECT halfvec_to_vector(embedding, 4, true) FROM embeddings;
+SELECT vector_to_sparsevec(embedding, 4, true) FROM embeddings;
+SELECT halfvec_to_sparsevec(embedding, 4, true) FROM embeddings;
+SELECT sparsevec_to_vector(embedding, 4, true) FROM embeddings;
+SELECT sparsevec_to_halfvec(embedding, 4, true) FROM embeddings;
+SELECT array_to_sparsevec(ARRAY[1.0, 0.0, 2.0], 3, true);
+SELECT l2_norm(CAST('{1:1.0,3:2.0}/3' AS SPARSEVEC(3)));
+SELECT l2_normalize(CAST('{1:1.0,3:2.0}/3' AS SPARSEVEC(3)));
+SELECT embedding + CAST('[1.0,1.0,1.0]' AS VECTOR(3)) FROM embeddings;
+SELECT embedding - CAST('[1.0,0.0,1.0]' AS VECTOR(3)) FROM embeddings;
+SELECT embedding * CAST('[2.0,1.0,0.5]' AS VECTOR(3)) FROM embeddings;
+SELECT embedding || CAST('[0.0,0.0]' AS VECTOR(2)) FROM embeddings;
+SELECT vector_add(embedding, CAST('[1.0,1.0,1.0]' AS VECTOR(3))) FROM embeddings;
+SELECT vector_sub(embedding, CAST('[1.0,0.0,1.0]' AS VECTOR(3))) FROM embeddings;
+SELECT vector_mul(embedding, CAST('[2.0,1.0,0.5]' AS VECTOR(3))) FROM embeddings;
+SELECT vector_concat(embedding, CAST('[0.0,0.0]' AS VECTOR(2))) FROM embeddings;
+SELECT halfvec_add(CAST('[1.0,2.0]' AS HALFVEC(2)), CAST('[3.0,4.0]' AS HALFVEC(2)));
+SELECT halfvec_concat(CAST('[1.0,2.0]' AS HALFVEC(2)), CAST('[3.0]' AS HALFVEC(1)));
 SELECT binary_quantize(embedding)::bit(4) FROM embeddings;
+SELECT binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS HALFVEC(4)));
+SELECT binary_quantize(embedding, 4, true) FROM embeddings;
+SELECT vector_out(vector_in('[1.0,0.0,2.0]'));
+SELECT sparsevec_out(sparsevec_in('{1:1.0,3:2.0}/3'));
+SELECT pg_input_is_valid('[1.0,0.0,2.0]', 'vector(3)');
+SELECT pg_input_is_valid('{1:1.0,3:2.0}/3', 'sparsevec(3)');
 ```
 
-The catalogs also include pgvector-compatible cast metadata for sparse vectors so
-migration tools can inspect the extension surface, but sparse vectors are still
-stored as text in the current runtime.
+The catalogs also include pgvector-compatible cast metadata for vector,
+halfvec, sparsevec, bit helper functions, and pgvector I/O functions so
+migration tools can inspect the extension surface. Runtime execution maps
+halfvec and sparsevec helpers onto AionDB's dense vector runtime; sparse vector
+text is expanded to dense vectors for exact distance operations. PostgreSQL
+input validation helpers such as `pg_input_is_valid` accept `vector(n)`,
+`halfvec(n)`, and `sparsevec(n)` type names.
+
+Vector and halfvec arithmetic functions (`vector_add`, `vector_sub`,
+`vector_mul`, `vector_concat`, `halfvec_add`, `halfvec_sub`, `halfvec_mul`,
+and `halfvec_concat`) are exposed for catalog compatibility with the matching
+operators. Addition, subtraction, and multiplication require matching runtime
+dimensions; concat appends coordinates.
 
 ## HNSW indexes
 
@@ -150,7 +204,7 @@ ON embeddings USING ivfflat (vec vector_cosine_ops)
 WITH (lists = 100);
 ```
 
-The current runtime maps this syntax onto AionDB's vector ANN index implementation while validating `lists` as a positive integer. The pgvector operator classes `vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops`, and `vector_l1_ops` select the matching distance metric for `hnsw`; `ivfflat` accepts the pgvector-compatible L2, cosine, and inner-product vector classes. The equivalent `halfvec_l2_ops`, `halfvec_cosine_ops`, `halfvec_ip_ops`, and `halfvec_l1_ops` classes are accepted for `HALFVEC` columns, and sparse/bit opclass rows are exposed in the PostgreSQL catalogs for tooling compatibility. Use `l1_distance(vec, query)` and the `<+>` operator as pgvector-compatible aliases for AionDB's `manhattan_distance(vec, query)`. The pgvector utility functions `vector_dims(vec)`, `vector_norm(vec)`, `l2_norm(vec)`, `l2_normalize(vec)`, `subvector(vec, start, count)`, `binary_quantize(vec)`, `hamming_distance(bits, bits)`, and `jaccard_distance(bits, bits)` are also available. The bit-distance operators `<~>` and `<%>` work with the text bitstrings returned by `binary_quantize(...)`.
+The current runtime maps this syntax onto AionDB's vector ANN index implementation while validating `lists` as a positive integer. The pgvector operator classes `vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops`, and `vector_l1_ops` select the matching distance metric for `hnsw`; `ivfflat` accepts the pgvector-compatible L2, cosine, and inner-product vector classes. The equivalent `halfvec_l2_ops`, `halfvec_cosine_ops`, `halfvec_ip_ops`, and `halfvec_l1_ops` classes are accepted for `HALFVEC` columns, and sparse/bit opclass rows are exposed in the PostgreSQL catalogs for tooling compatibility. Use `l1_distance(vec, query)` and the `<+>` operator as pgvector-compatible aliases for AionDB's `manhattan_distance(vec, query)`. Vector arithmetic operators `+`, `-`, `*`, and `||` are exposed in `pg_operator` for `vector` and `halfvec`, with `pg_proc` rows for the matching implementation functions. The pgvector utility functions `vector_dims(vec)`, `vector_norm(vec)`, `l2_norm(vec)`, `l2_normalize(vec)`, `subvector(vec, start, count)`, `binary_quantize(vector)`, `binary_quantize(halfvec)`, `hamming_distance(bits, bits)`, and `jaccard_distance(bits, bits)` are also available. The bit-distance operators `<~>` and `<%>` work with the text bitstrings returned by `binary_quantize(...)`.
 
 pgvector runtime settings are recognized for migration compatibility:
 
@@ -165,6 +219,17 @@ SET ivfflat.max_probes = 100;
 ```
 
 The integer and multiplier settings are validated as positive values, and iterative scan modes accept `off`, `strict_order`, or `relaxed_order`. They are visible through `SHOW`, `current_setting(...)`, and `pg_settings`. `hnsw.ef_search` is used as the default HNSW breadth for direct `ORDER BY <distance>(vec, query) LIMIT k` plans that lower to `HnswScan`, and for `vector_top_k_ids(...)`, `vector_top_k_hits(...)`, and `vector_recommend_top_k_hits(...)` when no explicit `ef_search` argument or JSON option is supplied. `hnsw.max_scan_tuples` caps adaptive HNSW widening for filtered vector helpers and filtered `HnswScan` wrappers. Explicit helper arguments still take priority.
+The vector helper JSON options also accept Qdrant-style
+`"params":{"hnsw_ef": N, "exact": true}` as aliases for AionDB's flat
+`ef_search` and `exact` options.
+`limit` and `offset` can be supplied in the same JSON options object; `limit`
+overrides the positional `k` argument.
+Hit-returning helpers accept `with_payload:false` to omit payload data, or
+`with_payload:["column_name", ...]` to include only selected payload columns.
+The Qdrant-style object forms `with_payload:{"include":[...]}` and
+`with_payload:{"exclude":[...]}` are also accepted.
+Use `with_vector:true` or `with_vectors:true` to include the matched vector in
+each hit under the `vector` key.
 
 ## Brute-force reference query
 
@@ -189,6 +254,58 @@ FROM embeddings
 WHERE doc_name LIKE 'chapter%'
 ORDER BY dist ASC
 LIMIT 5;
+```
+
+The `vector_top_k_ids(...)` and `vector_top_k_hits(...)` JSON options also accept a
+Qdrant-style `filter` object with `must`, `should`, and `must_not` arrays. Match
+clauses support `match.value`, `match.any`, `match.except`, and `match.text`;
+`match.text` performs case-insensitive substring matching over `TEXT`, JSONB
+strings, and string array elements. Range clauses support numeric `gt`, `gte`,
+`lt`, and `lte` bounds. `values_count` supports
+integer `gt`, `gte`, `lt`, and `lte` bounds over SQL arrays and JSONB arrays;
+non-array values count as 1, while SQL `NULL` and JSONB `null` count as 0.
+For SQL arrays and JSONB arrays, match clauses inspect array elements, matching
+Qdrant's payload-array semantics; range clauses also match when any numeric
+array element satisfies the bounds. JSONB columns also support dotted keys such
+as `payload.city`, `payload.score`, `payload.tags`, or bracketed array paths
+such as `payload.tags[]` and `payload.cities[].name` to filter nested fields.
+The top-level `min_should` object is supported with `conditions` and
+`min_count`. Clause fields accept either an array of conditions or a single
+condition object. Top-level shorthand field matches can be mixed with clause
+fields; they are appended to `must` conditions. Clause objects without
+condition keys can also use shorthand maps such as `"must":{"tag":"news"}`.
+`is_null` and `is_empty` payload-field conditions are also accepted for fixed
+table columns; `is_empty` matches SQL `NULL`, JSONB `null`, SQL empty arrays,
+and JSONB empty arrays.
+`has_id` filters against the first column returned by `vector_top_k_ids(...)`,
+which is AionDB's point-id equivalent for these helpers:
+
+```sql
+SELECT item_id
+FROM vector_top_k_ids(
+  'items',
+  'embedding',
+  '[1.0,0.0,0.0]',
+  10,
+  'l2',
+  64,
+  NULL,
+  NULL,
+  NULL,
+  '{"filter":{"must":[{"key":"tag","match":{"any":["news","sports"]}},
+                      {"key":"payload.city","match":{"value":"paris"}},
+                      {"key":"payload.tags[]","match":{"value":"green"}},
+                      {"key":"payload.summary","match":{"text":"release notes"}},
+                      {"has_id":[1,3,5]},
+                      {"key":"status","match":{"except":["deleted"]}}],
+              "must_not":[{"key":"source","match":{"value":"spam"}}],
+              "should":[{"key":"quality","range":{"gte":0.8}},
+                        {"key":"comments","values_count":{"gt":2}},
+                        {"is_empty":{"key":"archived_tags"}}],
+              "min_should":{"conditions":[{"key":"source","match":{"value":"web"}},
+                                          {"key":"priority","range":{"gte":3}}],
+                            "min_count":1}}}'::jsonb
+) AS hits(item_id);
 ```
 
 Filtering changes planning. A selective filter may make brute-force scoring over the filtered subset more appropriate than using a vector index first. A low-selectivity filter may favor index-first execution. Record the data distribution when reporting performance.

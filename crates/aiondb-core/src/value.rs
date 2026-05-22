@@ -71,10 +71,15 @@ impl VectorValue {
     }
 
     /// Parse a vector from text format `[f32, f32, ...]`.
+    /// Also accepts pgvector sparse text format `{idx:value, ...}/dims` and
+    /// expands it to the dense runtime representation used by AionDB today.
     /// Returns `None` if the input is malformed.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
+        if s.starts_with('{') {
+            return Self::parse_sparse(s);
+        }
         let inner = s.strip_prefix('[')?.strip_suffix(']')?;
         let trimmed = inner.trim();
         if trimmed.is_empty() {
@@ -90,6 +95,34 @@ impl VectorValue {
         }
         let dims = u32::try_from(values.len()).unwrap_or(u32::MAX);
         Some(Self::new(dims, values))
+    }
+
+    fn parse_sparse(s: &str) -> Option<Self> {
+        let (entries, dims_text) = s.rsplit_once('/')?;
+        let inner = entries.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+        let dims = dims_text.trim().parse::<usize>().ok()?;
+        if dims == 0 || dims > VECTOR_VALUE_DESERIALIZE_DIM_CAP {
+            return None;
+        }
+        let mut values = vec![0.0; dims];
+        let mut seen = vec![false; dims];
+        if !inner.is_empty() {
+            for entry in inner.split(',') {
+                let (idx_text, value_text) = entry.trim().split_once(':')?;
+                let idx = idx_text.trim().parse::<usize>().ok()?;
+                if idx == 0 || idx > dims {
+                    return None;
+                }
+                let value = value_text.trim().parse::<f32>().ok()?;
+                let ordinal = idx - 1;
+                if !value.is_finite() || seen[ordinal] {
+                    return None;
+                }
+                seen[ordinal] = true;
+                values[ordinal] = value;
+            }
+        }
+        Some(Self::new(u32::try_from(dims).ok()?, values))
     }
 }
 

@@ -6,11 +6,12 @@
   <title>{{ seo_title }}</title>
   <meta name="description" content="{{ description }}" />
   <link rel="canonical" href="{{ canonical_url }}" />
-  <meta property="og:type" content="website" />
+  <meta property="og:type" content="{{ og_type }}" />
   <meta property="og:site_name" content="AionDB" />
   <meta property="og:title" content="{{ seo_title }}" />
   <meta property="og:description" content="{{ description }}" />
   <meta property="og:url" content="{{ canonical_url }}" />
+  {{ extra_head }}
   <meta name="twitter:card" content="summary" />
   <meta name="twitter:title" content="{{ seo_title }}" />
   <meta name="twitter:description" content="{{ description }}" />
@@ -20,7 +21,7 @@
   <link rel="icon" media="(prefers-color-scheme: light)" type="image/png" href="/aiondb-logo-light.png" />
   <link rel="icon" media="(prefers-color-scheme: dark)" type="image/png" href="/aiondb-logo-dark.png" />
   <link rel="icon" type="image/png" href="/aiondb-logo-light.png" />
-  <link rel="stylesheet" href="/style.css?v=bench-ui-20260512-soft" />
+  <link rel="stylesheet" href="/style.css?v=blue-blog-20260521" />
   <script type="application/ld+json">
 {{ structured_data }}
   </script>

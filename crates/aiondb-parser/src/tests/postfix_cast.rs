@@ -122,7 +122,7 @@ fn postfix_cast_string_to_halfvec() {
 }
 
 #[test]
-fn postfix_cast_string_to_sparsevec_compat_text() {
+fn postfix_cast_string_to_sparsevec_exec_vector() {
     let expr = parse_expression("'{1:1.0}/3'::SPARSEVEC(3)").expect("parse");
     let cast_expr = match &expr {
         Expr::Cast { .. } => &expr,
@@ -136,7 +136,37 @@ fn postfix_cast_string_to_sparsevec_compat_text() {
     let Expr::Cast { data_type, .. } = cast_expr else {
         panic!("expected Cast");
     };
-    assert_eq!(*data_type, aiondb_core::DataType::Text);
+    assert_eq!(
+        *data_type,
+        aiondb_core::DataType::Vector {
+            dims: 3,
+            element_type: aiondb_core::VectorElementType::Float32
+        }
+    );
+}
+
+#[test]
+fn postfix_cast_binary_quantize_to_bit_types_stays_text_runtime() {
+    for sql in [
+        "binary_quantize(v)::BIT(4)",
+        "binary_quantize(v)::VARBIT(4)",
+        "binary_quantize(v)::BIT VARYING(4)",
+    ] {
+        let expr = parse_expression(sql).expect("parse bit cast");
+        let cast_expr = match &expr {
+            Expr::Cast { .. } => &expr,
+            Expr::FunctionCall { name, args, .. }
+                if name.parts == ["__aiondb_type_hint"] && args.len() == 2 =>
+            {
+                &args[0]
+            }
+            other => panic!("expected Cast or type-hinted Cast for {sql}, got {other:?}"),
+        };
+        let Expr::Cast { data_type, .. } = cast_expr else {
+            panic!("expected Cast for {sql}");
+        };
+        assert_eq!(*data_type, aiondb_core::DataType::Text);
+    }
 }
 
 #[test]

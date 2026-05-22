@@ -100,43 +100,48 @@ pub(super) fn lookup(name: &str) -> Option<FunctionInfo> {
             max_args: None,
         }),
         // ── Implemented vector distance functions ──
-        "l2_distance" => Some(FunctionInfo {
+        "l2_distance" | "pg_catalog.l2_distance" => Some(FunctionInfo {
             func: ScalarFunction::L2Distance,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "cosine_distance" => Some(FunctionInfo {
+        "cosine_distance" | "pg_catalog.cosine_distance" => Some(FunctionInfo {
             func: ScalarFunction::CosineDistance,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "inner_product" => Some(FunctionInfo {
+        "inner_product" | "pg_catalog.inner_product" => Some(FunctionInfo {
             func: ScalarFunction::InnerProduct,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "manhattan_distance" | "l1_distance" => Some(FunctionInfo {
+        "manhattan_distance"
+        | "pg_catalog.manhattan_distance"
+        | "l1_distance"
+        | "pg_catalog.l1_distance" => Some(FunctionInfo {
             func: ScalarFunction::ManhattanDistance,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "vector_dims" => Some(FunctionInfo {
+        "vector_dims" | "pg_catalog.vector_dims" => Some(FunctionInfo {
             func: ScalarFunction::VectorDims,
             return_type: DataType::Int,
             min_args: 1,
             max_args: Some(1),
         }),
-        "l2_norm" | "vector_norm" => Some(FunctionInfo {
-            func: ScalarFunction::L2Norm,
-            return_type: DataType::Double,
-            min_args: 1,
-            max_args: Some(1),
-        }),
-        "l2_normalize" => Some(FunctionInfo {
+        "l2_norm" | "pg_catalog.l2_norm" | "vector_norm" | "pg_catalog.vector_norm" => {
+            Some(FunctionInfo {
+                func: ScalarFunction::L2Norm,
+                return_type: DataType::Double,
+                min_args: 1,
+                max_args: Some(1),
+            })
+        }
+        "l2_normalize" | "pg_catalog.l2_normalize" => Some(FunctionInfo {
             func: ScalarFunction::L2Normalize,
             return_type: DataType::Vector {
                 dims: 0,
@@ -145,7 +150,7 @@ pub(super) fn lookup(name: &str) -> Option<FunctionInfo> {
             min_args: 1,
             max_args: Some(1),
         }),
-        "subvector" => Some(FunctionInfo {
+        "subvector" | "pg_catalog.subvector" => Some(FunctionInfo {
             func: ScalarFunction::Subvector,
             return_type: DataType::Vector {
                 dims: 0,
@@ -154,25 +159,146 @@ pub(super) fn lookup(name: &str) -> Option<FunctionInfo> {
             min_args: 3,
             max_args: Some(3),
         }),
-        "binary_quantize" => Some(FunctionInfo {
+        "binary_quantize" | "pg_catalog.binary_quantize" => Some(FunctionInfo {
             func: ScalarFunction::BinaryQuantize,
+            return_type: DataType::Text,
+            min_args: 1,
+            max_args: Some(3),
+        }),
+        "vector_in" | "pg_catalog.vector_in" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
+            },
+            min_args: 1,
+            max_args: Some(3),
+        }),
+        "halfvec_in" | "pg_catalog.halfvec_in" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float16,
+            },
+            min_args: 1,
+            max_args: Some(3),
+        }),
+        "sparsevec_in" | "pg_catalog.sparsevec_in" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
+            },
+            min_args: 1,
+            max_args: Some(3),
+        }),
+        "vector_out"
+        | "pg_catalog.vector_out"
+        | "halfvec_out"
+        | "pg_catalog.halfvec_out"
+        | "sparsevec_out"
+        | "pg_catalog.sparsevec_out" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
             return_type: DataType::Text,
             min_args: 1,
             max_args: Some(1),
         }),
-        "hamming_distance" => Some(FunctionInfo {
+        "array_to_vector"
+        | "pg_catalog.array_to_vector"
+        | "halfvec_to_vector"
+        | "pg_catalog.halfvec_to_vector"
+        | "sparsevec_to_vector"
+        | "pg_catalog.sparsevec_to_vector" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
+            },
+            min_args: 3,
+            max_args: Some(3),
+        }),
+        "vector_to_float4"
+        | "pg_catalog.vector_to_float4"
+        | "halfvec_to_float4"
+        | "pg_catalog.halfvec_to_float4" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Array(Box::new(DataType::Real)),
+            min_args: 3,
+            max_args: Some(3),
+        }),
+        "array_to_halfvec"
+        | "pg_catalog.array_to_halfvec"
+        | "vector_to_halfvec"
+        | "pg_catalog.vector_to_halfvec"
+        | "sparsevec_to_halfvec"
+        | "pg_catalog.sparsevec_to_halfvec" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float16,
+            },
+            min_args: 3,
+            max_args: Some(3),
+        }),
+        "vector_to_sparsevec"
+        | "pg_catalog.vector_to_sparsevec"
+        | "halfvec_to_sparsevec"
+        | "pg_catalog.halfvec_to_sparsevec"
+        | "array_to_sparsevec"
+        | "pg_catalog.array_to_sparsevec" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
+            },
+            min_args: 3,
+            max_args: Some(3),
+        }),
+        "vector_add"
+        | "pg_catalog.vector_add"
+        | "vector_sub"
+        | "pg_catalog.vector_sub"
+        | "vector_mul"
+        | "pg_catalog.vector_mul"
+        | "vector_concat"
+        | "pg_catalog.vector_concat" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float32,
+            },
+            min_args: 2,
+            max_args: Some(2),
+        }),
+        "halfvec_add"
+        | "pg_catalog.halfvec_add"
+        | "halfvec_sub"
+        | "pg_catalog.halfvec_sub"
+        | "halfvec_mul"
+        | "pg_catalog.halfvec_mul"
+        | "halfvec_concat"
+        | "pg_catalog.halfvec_concat" => Some(FunctionInfo {
+            func: ScalarFunction::Generic(name.to_owned()),
+            return_type: DataType::Vector {
+                dims: 0,
+                element_type: aiondb_core::VectorElementType::Float16,
+            },
+            min_args: 2,
+            max_args: Some(2),
+        }),
+        "hamming_distance" | "pg_catalog.hamming_distance" => Some(FunctionInfo {
             func: ScalarFunction::HammingDistance,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "jaccard_distance" => Some(FunctionInfo {
+        "jaccard_distance" | "pg_catalog.jaccard_distance" => Some(FunctionInfo {
             func: ScalarFunction::JaccardDistance,
             return_type: DataType::Double,
             min_args: 2,
             max_args: Some(2),
         }),
-        "negative_inner_product" => Some(FunctionInfo {
+        "negative_inner_product" | "pg_catalog.negative_inner_product" => Some(FunctionInfo {
             func: ScalarFunction::NegativeInnerProduct,
             return_type: DataType::Double,
             min_args: 2,

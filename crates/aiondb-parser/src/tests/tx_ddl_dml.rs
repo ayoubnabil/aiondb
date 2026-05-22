@@ -373,7 +373,13 @@ fn ddl_create_table_sparsevec_keeps_raw_type_name() {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(ct.columns.len(), 1);
-    assert_eq!(ct.columns[0].data_type, aiondb_core::DataType::Text);
+    assert_eq!(
+        ct.columns[0].data_type,
+        aiondb_core::DataType::Vector {
+            dims: 5,
+            element_type: aiondb_core::VectorElementType::Float32
+        }
+    );
     assert_eq!(ct.columns[0].raw_type_name.as_deref(), Some("sparsevec"));
 }
 

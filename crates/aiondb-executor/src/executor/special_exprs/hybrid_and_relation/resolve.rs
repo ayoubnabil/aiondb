@@ -8,6 +8,76 @@
 
 use super::*;
 
+fn vector_hit_payload_columns(
+    table: &TableDescriptor,
+    vector_ordinal: usize,
+    selection: Option<&VectorTopKPayloadSelection>,
+    function_name: &str,
+) -> DbResult<Option<Vec<(usize, String)>>> {
+    match selection.unwrap_or(&VectorTopKPayloadSelection::All) {
+        VectorTopKPayloadSelection::None => Ok(None),
+        VectorTopKPayloadSelection::All => Ok(Some(
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(ord, _)| *ord != 0 && *ord != vector_ordinal)
+                .map(|(ord, col)| (ord, col.name.clone()))
+                .collect(),
+        )),
+        VectorTopKPayloadSelection::Include(fields) => {
+            let mut columns = Vec::with_capacity(fields.len());
+            let mut seen = std::collections::HashSet::with_capacity(fields.len());
+            for field in fields {
+                let Some((ordinal, column)) = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, column)| column.name.eq_ignore_ascii_case(field))
+                else {
+                    return Err(DbError::bind_error(
+                        SqlState::UndefinedColumn,
+                        format!("{function_name} options.with_payload column \"{field}\" does not exist"),
+                    ));
+                };
+                if ordinal == 0 || ordinal == vector_ordinal || !seen.insert(ordinal) {
+                    continue;
+                }
+                columns.push((ordinal, column.name.clone()));
+            }
+            Ok(Some(columns))
+        }
+        VectorTopKPayloadSelection::Exclude(fields) => {
+            let mut excluded = std::collections::HashSet::with_capacity(fields.len());
+            for field in fields {
+                let Some((ordinal, _)) = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, column)| column.name.eq_ignore_ascii_case(field))
+                else {
+                    return Err(DbError::bind_error(
+                        SqlState::UndefinedColumn,
+                        format!("{function_name} options.with_payload column \"{field}\" does not exist"),
+                    ));
+                };
+                excluded.insert(ordinal);
+            }
+            Ok(Some(
+                table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(ord, _)| {
+                        *ord != 0 && *ord != vector_ordinal && !excluded.contains(ord)
+                    })
+                    .map(|(ord, col)| (ord, col.name.clone()))
+                    .collect(),
+            ))
+        }
+    }
+}
+
 impl Executor {
     pub(in crate::executor) fn resolve_vector_top_k_ids(
         &self,
@@ -28,9 +98,6 @@ impl Executor {
         let table_name = expect_text_arg(&arg_values[0], "vector_top_k_ids() table name")?;
         let vector_column = expect_text_arg(&arg_values[1], "vector_top_k_ids() column name")?;
         let k = non_negative_usize_arg(&arg_values[3], "vector_top_k_ids() k")?;
-        if k == 0 {
-            return Ok(Value::Array(Vec::new()));
-        }
         let optional_arg = |index: usize| arg_values.get(index).filter(|value| !value.is_null());
         let metric = parse_vector_metric_arg(optional_arg(4))?;
         let ef_search_override = parse_vector_ef_search_arg(optional_arg(5))?;
@@ -38,6 +105,10 @@ impl Executor {
         let exact = parse_vector_exact_arg(optional_arg(7))?;
         let score_threshold = parse_vector_score_threshold_arg(optional_arg(8))?;
         let option_overrides = parse_vector_top_k_options_arg(optional_arg(9))?;
+        let k = option_overrides.limit.unwrap_or(k);
+        if k == 0 {
+            return Ok(Value::Array(Vec::new()));
+        }
         let metric = option_overrides.metric.unwrap_or(metric);
         let ef_search_override = option_overrides.ef_search.or(ef_search_override);
         let ef_search_override = vector_ef_search_or_session_default(context, ef_search_override)?;
@@ -190,9 +261,6 @@ impl Executor {
         let table_name = expect_text_arg(&arg_values[0], "vector_top_k_hits() table name")?;
         let vector_column = expect_text_arg(&arg_values[1], "vector_top_k_hits() column name")?;
         let k = non_negative_usize_arg(&arg_values[3], "vector_top_k_hits() k")?;
-        if k == 0 {
-            return Ok(Value::Array(Vec::new()));
-        }
         let optional_arg = |index: usize| arg_values.get(index).filter(|value| !value.is_null());
         let metric = parse_vector_metric_arg(optional_arg(4))?;
         let ef_search_override = parse_vector_ef_search_arg(optional_arg(5))?;
@@ -200,6 +268,10 @@ impl Executor {
         let exact = parse_vector_exact_arg(optional_arg(7))?;
         let score_threshold = parse_vector_score_threshold_arg(optional_arg(8))?;
         let option_overrides = parse_vector_top_k_options_arg(optional_arg(9))?;
+        let k = option_overrides.limit.unwrap_or(k);
+        if k == 0 {
+            return Ok(Value::Array(Vec::new()));
+        }
         let metric = option_overrides.metric.unwrap_or(metric);
         let ef_search_override = option_overrides.ef_search.or(ef_search_override);
         let ef_search_override = vector_ef_search_or_session_default(context, ef_search_override)?;
@@ -355,13 +427,13 @@ impl Executor {
         // every column for every result row and filtered out the id /
         // vector ordinals, which is wasted work proportional to
         // (#columns × #results).
-        let payload_columns: Vec<(usize, String)> = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(ord, _)| *ord != 0 && *ord != vector_ordinal)
-            .map(|(ord, col)| (ord, col.name.clone()))
-            .collect();
+        let payload_columns = vector_hit_payload_columns(
+            &table,
+            vector_ordinal,
+            option_overrides.with_payload.as_ref(),
+            "vector_top_k_hits()",
+        )?;
+        let include_vector = option_overrides.with_vector.unwrap_or(false);
 
         // Per-id distance compute + payload build are independent. Run them
         // in parallel across rayon workers; the order is established by the
@@ -381,21 +453,30 @@ impl Executor {
                 };
                 let distance = compute_vector_distance(metric, candidate_vector, &query_vector)?;
                 let score = vector_similarity_score(metric, distance);
-                let mut payload = serde_json::Map::with_capacity(payload_columns.len().min(1024));
-                for (ordinal, name) in &payload_columns {
-                    let Some(value) = row.values.get(*ordinal) else {
-                        continue;
-                    };
-                    if value.is_null() {
-                        continue;
-                    }
-                    payload.insert(name.clone(), vector_hit_value_to_json(value));
-                }
                 let mut hit = serde_json::Map::with_capacity(4);
                 hit.insert("id".to_owned(), serde_json::Value::Number((*id).into()));
                 hit.insert("distance".to_owned(), vector_hit_json_number(distance));
                 hit.insert("score".to_owned(), vector_hit_json_number(score));
-                hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+                if include_vector {
+                    hit.insert(
+                        "vector".to_owned(),
+                        vector_hit_vector_to_json(candidate_vector),
+                    );
+                }
+                if let Some(payload_columns) = &payload_columns {
+                    let mut payload =
+                        serde_json::Map::with_capacity(payload_columns.len().min(1024));
+                    for (ordinal, name) in payload_columns {
+                        let Some(value) = row.values.get(*ordinal) else {
+                            continue;
+                        };
+                        if value.is_null() {
+                            continue;
+                        }
+                        payload.insert(name.clone(), vector_hit_value_to_json(value));
+                    }
+                    hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+                }
                 Ok(Some(Value::Jsonb(serde_json::Value::Object(hit))))
             })
             .collect::<DbResult<Vec<_>>>()?;
@@ -435,9 +516,6 @@ impl Executor {
             return Ok(Value::Array(Vec::new()));
         }
         let k = non_negative_usize_arg(&arg_values[4], "vector_prefetch_top_k_hits() k")?;
-        if k == 0 {
-            return Ok(Value::Array(Vec::new()));
-        }
         let optional_arg = |index: usize| arg_values.get(index).filter(|value| !value.is_null());
         let metric = parse_vector_metric_arg(optional_arg(5))?;
         let distance_threshold = parse_vector_distance_threshold_arg(optional_arg(6))?;
@@ -454,6 +532,10 @@ impl Executor {
                 SqlState::InvalidParameterValue,
                 "vector_prefetch_top_k_hits() does not support options.exact",
             ));
+        }
+        let k = option_overrides.limit.unwrap_or(k);
+        if k == 0 {
+            return Ok(Value::Array(Vec::new()));
         }
         let metric = option_overrides.metric.unwrap_or(metric);
         let distance_threshold = option_overrides.distance_threshold.or(distance_threshold);
@@ -541,20 +623,20 @@ impl Executor {
         let payload_filter_ref = payload_filter.as_ref();
         // Resolve payload columns once outside the per-id loop (see the
         // same pattern in `resolve_vector_top_k_hits`).
-        let payload_columns: Vec<(usize, String)> = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(ord, _)| *ord != 0 && *ord != vector_ordinal)
-            .map(|(ord, col)| (ord, col.name.clone()))
-            .collect();
+        let payload_columns = vector_hit_payload_columns(
+            &table,
+            vector_ordinal,
+            option_overrides.with_payload.as_ref(),
+            "vector_prefetch_top_k_hits()",
+        )?;
+        let include_vector = option_overrides.with_vector.unwrap_or(false);
         let scored_opts: Vec<
             Option<(
                 f64,
                 i64,
                 f64,
                 f64,
-                serde_json::Map<String, serde_json::Value>,
+                Option<serde_json::Map<String, serde_json::Value>>,
             )>,
         > = target_id_list
             .par_iter()
@@ -566,7 +648,7 @@ impl Executor {
                         i64,
                         f64,
                         f64,
-                        serde_json::Map<String, serde_json::Value>,
+                        Option<serde_json::Map<String, serde_json::Value>>,
                     )>,
                 > {
                     context.check_deadline()?;
@@ -591,17 +673,22 @@ impl Executor {
                         return Ok(None);
                     }
                     let score = vector_similarity_score(metric, distance);
-                    let mut payload =
-                        serde_json::Map::with_capacity(payload_columns.len().min(1024));
-                    for (ordinal, name) in &payload_columns {
-                        let Some(value) = row.values.get(*ordinal) else {
-                            continue;
-                        };
-                        if value.is_null() {
-                            continue;
+                    let payload = if let Some(payload_columns) = &payload_columns {
+                        let mut payload =
+                            serde_json::Map::with_capacity(payload_columns.len().min(1024));
+                        for (ordinal, name) in payload_columns {
+                            let Some(value) = row.values.get(*ordinal) else {
+                                continue;
+                            };
+                            if value.is_null() {
+                                continue;
+                            }
+                            payload.insert(name.clone(), vector_hit_value_to_json(value));
                         }
-                        payload.insert(name.clone(), vector_hit_value_to_json(value));
-                    }
+                        Some(payload)
+                    } else {
+                        None
+                    };
                     let sortable_distance = if distance.is_nan() {
                         f64::INFINITY
                     } else {
@@ -616,7 +703,7 @@ impl Executor {
             i64,
             f64,
             f64,
-            serde_json::Map<String, serde_json::Value>,
+            Option<serde_json::Map<String, serde_json::Value>>,
         )> = scored_opts.into_iter().flatten().collect();
 
         scored.sort_by(|left, right| {
@@ -634,7 +721,18 @@ impl Executor {
             hit.insert("id".to_owned(), serde_json::Value::Number(id.into()));
             hit.insert("distance".to_owned(), vector_hit_json_number(distance));
             hit.insert("score".to_owned(), vector_hit_json_number(score));
-            hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+            if include_vector {
+                let Some(row) = rows_by_id.get(&id) else {
+                    continue;
+                };
+                let Some(Value::Vector(vector)) = row.values.get(vector_ordinal) else {
+                    continue;
+                };
+                hit.insert("vector".to_owned(), vector_hit_vector_to_json(vector));
+            }
+            if let Some(payload) = payload {
+                hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+            }
             hits.push(Value::Jsonb(serde_json::Value::Object(hit)));
         }
         Ok(Value::Array(hits))
@@ -813,9 +911,6 @@ impl Executor {
         let vector_column =
             expect_text_arg(&arg_values[1], "vector_recommend_top_k_hits() column name")?;
         let k = non_negative_usize_arg(&arg_values[4], "vector_recommend_top_k_hits() k")?;
-        if k == 0 {
-            return Ok(Value::Array(Vec::new()));
-        }
         let optional_arg = |index: usize| arg_values.get(index).filter(|value| !value.is_null());
         let metric = parse_vector_metric_arg(optional_arg(5))?;
         let ef_search_override = parse_vector_ef_search_arg(optional_arg(6))?;
@@ -823,6 +918,10 @@ impl Executor {
         let exact = parse_vector_exact_arg(optional_arg(8))?;
         let score_threshold = parse_vector_score_threshold_arg(optional_arg(9))?;
         let option_overrides = parse_vector_top_k_options_arg(optional_arg(10))?;
+        let k = option_overrides.limit.unwrap_or(k);
+        if k == 0 {
+            return Ok(Value::Array(Vec::new()));
+        }
         let metric = option_overrides.metric.unwrap_or(metric);
         let ef_search_override = option_overrides.ef_search.or(ef_search_override);
         let ef_search_override = vector_ef_search_or_session_default(context, ef_search_override)?;
@@ -1038,13 +1137,13 @@ impl Executor {
 
         // Resolve payload column list once outside the per-id loop (see
         // `resolve_vector_top_k_hits`).
-        let payload_columns: Vec<(usize, String)> = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(ord, _)| *ord != 0 && *ord != vector_ordinal)
-            .map(|(ord, col)| (ord, col.name.clone()))
-            .collect();
+        let payload_columns = vector_hit_payload_columns(
+            &table,
+            vector_ordinal,
+            option_overrides.with_payload.as_ref(),
+            "vector_recommend_top_k_hits()",
+        )?;
+        let include_vector = option_overrides.with_vector.unwrap_or(false);
 
         // Parallel scoring + payload assembly, identical pattern to
         // `resolve_vector_top_k_hits`. `with_min_len(32)` guards small
@@ -1062,21 +1161,30 @@ impl Executor {
                 };
                 let distance = compute_vector_distance(metric, candidate_vector, &query_vector)?;
                 let score = vector_similarity_score(metric, distance);
-                let mut payload = serde_json::Map::with_capacity(payload_columns.len().min(1024));
-                for (ordinal, name) in &payload_columns {
-                    let Some(value) = row.values.get(*ordinal) else {
-                        continue;
-                    };
-                    if value.is_null() {
-                        continue;
-                    }
-                    payload.insert(name.clone(), vector_hit_value_to_json(value));
-                }
                 let mut hit = serde_json::Map::with_capacity(4);
                 hit.insert("id".to_owned(), serde_json::Value::Number((*id).into()));
                 hit.insert("distance".to_owned(), vector_hit_json_number(distance));
                 hit.insert("score".to_owned(), vector_hit_json_number(score));
-                hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+                if include_vector {
+                    hit.insert(
+                        "vector".to_owned(),
+                        vector_hit_vector_to_json(candidate_vector),
+                    );
+                }
+                if let Some(payload_columns) = &payload_columns {
+                    let mut payload =
+                        serde_json::Map::with_capacity(payload_columns.len().min(1024));
+                    for (ordinal, name) in payload_columns {
+                        let Some(value) = row.values.get(*ordinal) else {
+                            continue;
+                        };
+                        if value.is_null() {
+                            continue;
+                        }
+                        payload.insert(name.clone(), vector_hit_value_to_json(value));
+                    }
+                    hit.insert("payload".to_owned(), serde_json::Value::Object(payload));
+                }
                 Ok(Some(Value::Jsonb(serde_json::Value::Object(hit))))
             })
             .collect::<DbResult<Vec<_>>>()?;
@@ -1898,36 +2006,85 @@ impl Executor {
             |raw_conditions: &[VectorTopKFilterCondition]| -> DbResult<Vec<CompiledVectorTopKFilterCondition>> {
                 let mut compiled = Vec::with_capacity(raw_conditions.len());
                 for condition in raw_conditions {
-                    let Some((ordinal, column)) = table
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .find(|(_, column)| column.name.eq_ignore_ascii_case(&condition.key))
-                    else {
-                        return Err(DbError::bind_error(
-                            SqlState::UndefinedColumn,
-                            format!(
-                                "column \"{}\" does not exist on relation \"{}\"",
-                                condition.key, table.name
-                            ),
-                        ));
+                    let (ordinal, column, json_path) = if matches!(
+                        condition.predicate,
+                        VectorTopKFilterPredicateSpec::HasId(_)
+                    ) {
+                        table.columns.first().map_or_else(
+                            || {
+                                Err(DbError::bind_error(
+                                    SqlState::UndefinedColumn,
+                                    format!(
+                                        "relation \"{}\" has no id column for vector_top_k_ids() has_id filter",
+                                        table.name
+                                    ),
+                                ))
+                            },
+                            |column| Ok((0, column, Vec::new())),
+                        )?
+                    } else {
+                        resolve_vector_filter_key(table, &condition.key)?
                     };
                     let predicate = match &condition.predicate {
                         VectorTopKFilterPredicateSpec::Match(raw_match) => {
-                            let raw_value = if matches!(column.data_type, DataType::Jsonb) {
-                                Value::Jsonb(raw_match.clone())
-                            } else {
-                                vector_filter_json_literal_to_value(raw_match)
-                            };
-                            let expected = if matches!(raw_value, Value::Null) {
-                                Value::Null
-                            } else {
-                                aiondb_eval::coerce_value(raw_value, &column.data_type)?
-                            };
+                            let expected =
+                                coerce_vector_filter_match_value(raw_match, &column.data_type)?;
                             CompiledVectorTopKFilterPredicate::Match(expected)
                         }
+                        VectorTopKFilterPredicateSpec::MatchAny(raw_matches) => {
+                            let expected_values = raw_matches
+                                .iter()
+                                .map(|raw_match| {
+                                    coerce_vector_filter_match_value(
+                                        raw_match,
+                                        &column.data_type,
+                                    )
+                                })
+                                .collect::<DbResult<Vec<_>>>()?;
+                            CompiledVectorTopKFilterPredicate::MatchAny(expected_values)
+                        }
+                        VectorTopKFilterPredicateSpec::MatchExcept(raw_matches) => {
+                            let excluded_values = raw_matches
+                                .iter()
+                                .map(|raw_match| {
+                                    coerce_vector_filter_match_value(
+                                        raw_match,
+                                        &column.data_type,
+                                    )
+                                })
+                                .collect::<DbResult<Vec<_>>>()?;
+                            CompiledVectorTopKFilterPredicate::MatchExcept(excluded_values)
+                        }
+                        VectorTopKFilterPredicateSpec::MatchText(text) => {
+                            CompiledVectorTopKFilterPredicate::MatchText(text.clone())
+                        }
+                        VectorTopKFilterPredicateSpec::IsNull => {
+                            CompiledVectorTopKFilterPredicate::IsNull
+                        }
+                        VectorTopKFilterPredicateSpec::IsEmpty => {
+                            CompiledVectorTopKFilterPredicate::IsEmpty
+                        }
+                        VectorTopKFilterPredicateSpec::HasId(raw_ids) => {
+                            let expected_values = raw_ids
+                                .iter()
+                                .map(|raw_id| {
+                                    coerce_vector_filter_match_value(raw_id, &column.data_type)
+                                })
+                                .collect::<DbResult<Vec<_>>>()?;
+                            CompiledVectorTopKFilterPredicate::MatchAny(expected_values)
+                        }
+                        VectorTopKFilterPredicateSpec::ValuesCount(values_count) => {
+                            CompiledVectorTopKFilterPredicate::ValuesCount {
+                                gt: values_count.gt,
+                                gte: values_count.gte,
+                                lt: values_count.lt,
+                                lte: values_count.lte,
+                            }
+                        }
                         VectorTopKFilterPredicateSpec::Range(range) => {
-                            if !vector_filter_supports_numeric_range(&column.data_type) {
+                            if json_path.is_empty()
+                                && !vector_filter_supports_numeric_range(&column.data_type)
+                            {
                                 return Err(DbError::bind_error(
                                     SqlState::DatatypeMismatch,
                                     format!(
@@ -1947,6 +2104,7 @@ impl Executor {
                     compiled.push(CompiledVectorTopKFilterCondition {
                         ordinal,
                         column_id: column.column_id,
+                        json_path,
                         predicate,
                     });
                 }
@@ -1957,8 +2115,22 @@ impl Executor {
             must: compile_clause(&filter_spec.must)?,
             should: compile_clause(&filter_spec.should)?,
             must_not: compile_clause(&filter_spec.must_not)?,
+            min_should: filter_spec
+                .min_should
+                .as_ref()
+                .map(|min_should| {
+                    Ok(CompiledVectorTopKMinShould {
+                        conditions: compile_clause(&min_should.conditions)?,
+                        min_count: min_should.min_count,
+                    })
+                })
+                .transpose()?,
         };
-        if filter.must.is_empty() && filter.should.is_empty() && filter.must_not.is_empty() {
+        if filter.must.is_empty()
+            && filter.should.is_empty()
+            && filter.must_not.is_empty()
+            && filter.min_should.is_none()
+        {
             Ok(None)
         } else {
             Ok(Some(filter))
@@ -1986,6 +2158,9 @@ impl Executor {
             );
 
         let is_indexable = |condition: &CompiledVectorTopKFilterCondition| {
+            if !condition.json_path.is_empty() {
+                return false;
+            }
             matches!(
                 &condition.predicate,
                 CompiledVectorTopKFilterPredicate::Match(expected) if !expected.is_null()
@@ -2055,7 +2230,9 @@ impl Executor {
             excluded_ids.extend(matches);
         }
 
-        let anchored = !indexed_must.is_empty() || !indexed_should.is_empty();
+        let all_should_indexed = !payload_filter.should.is_empty()
+            && indexed_should.len() == payload_filter.should.len();
+        let anchored = !indexed_must.is_empty() || all_should_indexed;
         if !anchored {
             let mut stream = self.scan_table_locked(context, table_id, None)?;
             let mut tuple_ids = std::collections::HashSet::new();
@@ -2072,13 +2249,13 @@ impl Executor {
             should_ids
         } else if payload_filter.should.is_empty() {
             required_ids
-        } else if indexed_should.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        } else {
+        } else if all_should_indexed {
             required_ids
                 .into_iter()
                 .filter(|tuple_id| should_ids.contains(tuple_id))
                 .collect()
+        } else {
+            required_ids
         };
         if candidate_ids.is_empty() {
             return Ok(candidate_ids);
@@ -2793,4 +2970,81 @@ impl Executor {
             .saturating_add(payload_bytes)
             .saturating_add(row_count.saturating_mul(2)))
     }
+}
+
+fn resolve_vector_filter_key<'a>(
+    table: &'a TableDescriptor,
+    key: &str,
+) -> DbResult<(usize, &'a ColumnDescriptor, Vec<String>)> {
+    if let Some((ordinal, column)) = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column.name.eq_ignore_ascii_case(key))
+    {
+        return Ok((ordinal, column, Vec::new()));
+    }
+
+    if let Some(array_key) = strip_qdrant_array_marker(key) {
+        if let Some((ordinal, column)) = table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name.eq_ignore_ascii_case(array_key))
+        {
+            return Ok((ordinal, column, Vec::new()));
+        }
+    }
+
+    let Some((column_name, json_path)) = key.split_once('.') else {
+        return Err(DbError::bind_error(
+            SqlState::UndefinedColumn,
+            format!(
+                "column \"{key}\" does not exist on relation \"{}\"",
+                table.name
+            ),
+        ));
+    };
+    let column_name = strip_qdrant_array_marker(column_name).unwrap_or(column_name);
+    let Some((ordinal, column)) = table
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| column.name.eq_ignore_ascii_case(column_name))
+    else {
+        return Err(DbError::bind_error(
+            SqlState::UndefinedColumn,
+            format!(
+                "column \"{key}\" does not exist on relation \"{}\"",
+                table.name
+            ),
+        ));
+    };
+    if !matches!(column.data_type, DataType::Jsonb) {
+        return Err(DbError::bind_error(
+            SqlState::DatatypeMismatch,
+            format!(
+                "vector_top_k_ids() options.filter key \"{key}\" requires JSONB column \"{}\"",
+                column.name
+            ),
+        ));
+    }
+    let json_path = json_path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| strip_qdrant_array_marker(part).unwrap_or(part).to_owned())
+        .collect::<Vec<_>>();
+    if json_path.is_empty() || json_path.iter().any(String::is_empty) {
+        return Err(DbError::bind_error(
+            SqlState::InvalidParameterValue,
+            format!(
+                "vector_top_k_ids() options.filter key \"{key}\" requires a JSON path after the column name"
+            ),
+        ));
+    }
+    Ok((ordinal, column, json_path))
+}
+
+fn strip_qdrant_array_marker(key: &str) -> Option<&str> {
+    key.strip_suffix("[]")
 }

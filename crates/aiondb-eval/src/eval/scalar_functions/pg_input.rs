@@ -315,6 +315,9 @@ fn resolve_pg_input_type(type_name: &str) -> Option<DataType> {
         return resolve_pg_input_type(inner)
             .map(|inner_type| DataType::Array(Box::new(inner_type)));
     }
+    if let Some(vector_type) = resolve_pgvector_input_type(type_name) {
+        return Some(vector_type);
+    }
 
     match type_name {
         "int4" | "integer" | "int" => Some(DataType::Int),
@@ -342,6 +345,36 @@ fn resolve_pg_input_type(type_name: &str) -> Option<DataType> {
     }
 }
 
+fn resolve_pgvector_input_type(type_name: &str) -> Option<DataType> {
+    let type_name = type_name.strip_prefix("pg_catalog.").unwrap_or(type_name);
+    let (dims, element_type) = match type_name {
+        "vector" => (0, aiondb_core::VectorElementType::Float32),
+        "halfvec" => (0, aiondb_core::VectorElementType::Float16),
+        "sparsevec" => (0, aiondb_core::VectorElementType::Float32),
+        _ => {
+            if let Some(dims) = parse_type_modifier(type_name, &["vector"]) {
+                (
+                    u32::try_from(dims).unwrap_or(u32::MAX),
+                    aiondb_core::VectorElementType::Float32,
+                )
+            } else if let Some(dims) = parse_type_modifier(type_name, &["halfvec"]) {
+                (
+                    u32::try_from(dims).unwrap_or(u32::MAX),
+                    aiondb_core::VectorElementType::Float16,
+                )
+            } else if let Some(dims) = parse_type_modifier(type_name, &["sparsevec"]) {
+                (
+                    u32::try_from(dims).unwrap_or(u32::MAX),
+                    aiondb_core::VectorElementType::Float32,
+                )
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(DataType::Vector { dims, element_type })
+}
+
 fn validate_pg_input(input: &str, type_name: &str) -> bool {
     let input = input.trim();
     if let Some(result) = validate_special_pg_input(input, type_name) {
@@ -359,6 +392,9 @@ fn validate_pg_input(input: &str, type_name: &str) -> bool {
     if let Some(len) = parse_type_modifier(type_name, &["bit", "bit varying", "varbit"]) {
         let allow_shorter = type_name.starts_with("varbit") || type_name.starts_with("bit varying");
         return validate_pg_bit_string(input, Some(len), allow_shorter);
+    }
+    if let Some(vector_type) = resolve_pgvector_input_type(type_name) {
+        return cast_text_to_type(input, &vector_type);
     }
 
     match type_name {

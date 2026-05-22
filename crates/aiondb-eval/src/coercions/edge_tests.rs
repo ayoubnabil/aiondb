@@ -437,6 +437,22 @@ fn text_to_vector_success() {
 }
 
 #[test]
+fn text_sparsevec_to_vector_success() {
+    let result = coerce_value(
+        Value::Text("{1:1,3:2.5}/4".into()),
+        &DataType::Vector {
+            dims: 4,
+            element_type: aiondb_core::VectorElementType::Float32,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        Value::Vector(VectorValue::new(4, vec![1.0, 0.0, 2.5, 0.0]))
+    );
+}
+
+#[test]
 fn text_to_unconstrained_vector_success() {
     let result = coerce_value(
         Value::Text("[1,2,3]".into()),

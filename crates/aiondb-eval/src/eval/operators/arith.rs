@@ -371,6 +371,7 @@ pub(crate) fn eval_negate(value: &Value) -> DbResult<Value> {
 pub(crate) fn eval_arith_sub(left: &Value, right: &Value) -> DbResult<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Vector(a), Value::Vector(b)) => eval_vector_pair_op(a, b, "-", |a, b| a - b),
         // PG compatibility: i32 overflow promotes to BigInt rather than error.
         (Value::Int(a), Value::Int(b)) => match a.checked_sub(*b) {
             Some(result) => Ok(Value::Int(result)),
@@ -770,6 +771,7 @@ pub(crate) fn eval_arith_sub(left: &Value, right: &Value) -> DbResult<Value> {
 pub(crate) fn eval_arith_mul(left: &Value, right: &Value) -> DbResult<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Vector(a), Value::Vector(b)) => eval_vector_pair_op(a, b, "*", |a, b| a * b),
         // PG compatibility: i32 overflow promotes to BigInt rather than error.
         (Value::Int(a), Value::Int(b)) => match a.checked_mul(*b) {
             Some(result) => Ok(Value::Int(result)),

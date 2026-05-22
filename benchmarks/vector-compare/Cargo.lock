@@ -107,6 +107,7 @@ dependencies = [
  "aiondb-wal",
  "parking_lot",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tracing",

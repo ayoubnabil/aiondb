@@ -19,7 +19,9 @@ use self::temporal::{
     sub_interval_from_timestamp, sub_interval_from_timestamptz,
 };
 use super::scalar_functions::range::looks_like_range;
-use aiondb_core::{DbError, DbResult, ErrorReport, IntervalValue, NumericValue, SqlState, Value};
+use aiondb_core::{
+    DbError, DbResult, ErrorReport, IntervalValue, NumericValue, SqlState, Value, VectorValue,
+};
 
 use super::money::{
     money_div_f64, money_div_i64, money_mul_f64, money_mul_i64, money_out_of_range,
@@ -728,6 +730,7 @@ pub(super) fn eval_logical_not(value: &Value) -> DbResult<Value> {
 pub(super) fn eval_arith_add(left: &Value, right: &Value) -> DbResult<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Vector(a), Value::Vector(b)) => eval_vector_pair_op(a, b, "+", |a, b| a + b),
         // PG compatibility: i32 overflow promotes to BigInt rather than error.
         (Value::Int(a), Value::Int(b)) => match a.checked_add(*b) {
             Some(result) => Ok(Value::Int(result)),
@@ -1061,6 +1064,32 @@ pub(super) fn eval_arith_add(left: &Value, right: &Value) -> DbResult<Value> {
     }
 }
 
+fn eval_vector_pair_op(
+    left: &VectorValue,
+    right: &VectorValue,
+    operator: &str,
+    op: impl Fn(f32, f32) -> f32,
+) -> DbResult<Value> {
+    if left.dims != right.dims {
+        return Err(DbError::internal(format!(
+            "vector {operator}: dimension mismatch ({} vs {})",
+            left.dims, right.dims
+        )));
+    }
+    let mut values = Vec::with_capacity(left.values.len());
+    for (left, right) in left.values.iter().zip(&right.values) {
+        let value = op(*left, *right);
+        if !value.is_finite() {
+            return Err(DbError::from_report(ErrorReport::new(
+                SqlState::NumericValueOutOfRange,
+                "vector value out of range",
+            )));
+        }
+        values.push(value);
+    }
+    Ok(Value::Vector(VectorValue::new(left.dims, values)))
+}
+
 pub(super) fn eval_json_get(left: &Value, right: &Value) -> Value {
     let Value::Jsonb(json) = left else {
         return Value::Null;
@@ -1107,6 +1136,15 @@ pub(super) fn eval_json_get_text(left: &Value, right: &Value) -> Value {
 pub(super) fn eval_concat(left: &Value, right: &Value) -> DbResult<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Vector(a), Value::Vector(b)) => {
+            let dims = a.dims.checked_add(b.dims).ok_or_else(|| {
+                DbError::program_limit("vector concatenation dimension count is out of range")
+            })?;
+            let mut values = Vec::with_capacity(a.values.len() + b.values.len());
+            values.extend_from_slice(&a.values);
+            values.extend_from_slice(&b.values);
+            Ok(Value::Vector(VectorValue::new(dims, values)))
+        }
         (Value::Text(a), Value::Text(b)) => {
             let mut s = String::with_capacity(a.len() + b.len());
             s.push_str(a);

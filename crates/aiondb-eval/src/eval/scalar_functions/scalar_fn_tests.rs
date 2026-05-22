@@ -1,7 +1,401 @@
 use crate::eval::scalar_functions::*;
+use aiondb_core::VectorValue;
 
 fn eval_generic(name: &str, args: &[Value]) -> DbResult<Value> {
     eval_scalar_function(&ScalarFunction::Generic(name.to_owned()), args)
+}
+
+#[test]
+fn pgvector_io_functions_parse_and_format_vectors() {
+    let vector = eval_generic("vector_in", &[Value::Text("[1.0,0.0,2.5]".to_owned())]).unwrap();
+    assert_eq!(
+        vector,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+    assert_eq!(
+        eval_generic("vector_out", &[vector]).unwrap(),
+        Value::Text("[1,0,2.5]".to_owned())
+    );
+    assert_eq!(
+        eval_generic(
+            "vector_in",
+            &[
+                Value::Text("[1.0,0.0,2.5]".to_owned()),
+                Value::Int(0),
+                Value::Int(3),
+            ],
+        )
+        .unwrap(),
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+    assert!(eval_generic(
+        "vector_in",
+        &[Value::Text("[1.0,0.0,2.5]".to_owned()), Value::Int(0)],
+    )
+    .is_err());
+
+    let sparse = eval_generic("sparsevec_in", &[Value::Text("{1:1,3:2.5}/4".to_owned())]).unwrap();
+    assert_eq!(
+        sparse,
+        Value::Vector(VectorValue::new(4, vec![1.0, 0.0, 2.5, 0.0]))
+    );
+    assert_eq!(
+        eval_generic("sparsevec_out", &[sparse]).unwrap(),
+        Value::Text("{1:1,3:2.5}/4".to_owned())
+    );
+    assert!(eval_generic(
+        "sparsevec_in",
+        &[
+            Value::Text("{1:1,3:2.5}/4".to_owned()),
+            Value::Int(0),
+            Value::Int(3),
+        ],
+    )
+    .is_err());
+}
+
+#[test]
+fn array_to_vector_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "array_to_vector",
+        &[
+            Value::Array(vec![Value::Int(1), Value::Int(0), Value::Double(2.5)]),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn vector_to_float4_generic_returns_real_array() {
+    let value = eval_generic(
+        "vector_to_float4",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Array(vec![Value::Real(1.0), Value::Real(0.0), Value::Real(2.5)])
+    );
+}
+
+#[test]
+fn halfvec_to_float4_generic_returns_real_array() {
+    let value = eval_generic(
+        "pg_catalog.halfvec_to_float4",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Array(vec![Value::Real(1.0), Value::Real(0.0), Value::Real(2.5)])
+    );
+}
+
+#[test]
+fn array_to_halfvec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "array_to_halfvec",
+        &[
+            Value::Array(vec![Value::Int(1), Value::Int(0), Value::Double(2.5)]),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn vector_to_halfvec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "vector_to_halfvec",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn halfvec_to_vector_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "halfvec_to_vector",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn halfvec_to_sparsevec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "halfvec_to_sparsevec",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn sparsevec_to_vector_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "sparsevec_to_vector",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn sparsevec_to_halfvec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "sparsevec_to_halfvec",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn binary_quantize_pgvector_cast_signature_returns_bits() {
+    let value = eval_scalar_function(
+        &ScalarFunction::BinaryQuantize,
+        &[
+            Value::Vector(VectorValue::new(4, vec![1.0, -2.0, 0.0, 0.1])),
+            Value::Int(4),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(value, Value::Text("1001".to_owned()));
+}
+
+#[test]
+fn pg_catalog_pgvector_distance_aliases_work_as_generic_functions() {
+    let left = Value::Vector(VectorValue::new(2, vec![1.0, 2.0]));
+    let right = Value::Vector(VectorValue::new(2, vec![4.0, 6.0]));
+
+    assert_eq!(
+        eval_generic("pg_catalog.l2_distance", &[left.clone(), right.clone()]).unwrap(),
+        Value::Double(5.0)
+    );
+    assert_eq!(
+        eval_generic("pg_catalog.l1_distance", &[left.clone(), right.clone()]).unwrap(),
+        Value::Double(7.0)
+    );
+    assert_eq!(
+        eval_generic("pg_catalog.inner_product", &[left.clone(), right.clone()]).unwrap(),
+        Value::Double(16.0)
+    );
+    assert_eq!(
+        eval_generic("pg_catalog.negative_inner_product", &[left, right]).unwrap(),
+        Value::Double(-16.0)
+    );
+    assert_eq!(
+        eval_generic(
+            "pg_catalog.cosine_distance",
+            &[
+                Value::Vector(VectorValue::new(2, vec![1.0, 0.0])),
+                Value::Vector(VectorValue::new(2, vec![0.0, 1.0])),
+            ],
+        )
+        .unwrap(),
+        Value::Double(1.0)
+    );
+    assert_eq!(
+        eval_generic(
+            "pg_catalog.hamming_distance",
+            &[
+                Value::Text("1010".to_owned()),
+                Value::Text("1001".to_owned())
+            ],
+        )
+        .unwrap(),
+        Value::Double(2.0)
+    );
+}
+
+#[test]
+fn pgvector_operator_impl_functions_match_vector_arithmetic() {
+    let left = Value::Vector(VectorValue::new(3, vec![3.0, 4.0, 12.0]));
+    let right = Value::Vector(VectorValue::new(3, vec![1.0, 2.0, 3.0]));
+
+    assert_eq!(
+        eval_generic("vector_add", &[left.clone(), right.clone()]).unwrap(),
+        Value::Vector(VectorValue::new(3, vec![4.0, 6.0, 15.0]))
+    );
+    assert_eq!(
+        eval_generic("pg_catalog.vector_sub", &[left.clone(), right.clone()]).unwrap(),
+        Value::Vector(VectorValue::new(3, vec![2.0, 2.0, 9.0]))
+    );
+    assert_eq!(
+        eval_generic("vector_mul", &[left.clone(), right.clone()]).unwrap(),
+        Value::Vector(VectorValue::new(3, vec![3.0, 8.0, 36.0]))
+    );
+    assert_eq!(
+        eval_generic(
+            "vector_concat",
+            &[left, Value::Vector(VectorValue::new(2, vec![1.0, 2.0]))],
+        )
+        .unwrap(),
+        Value::Vector(VectorValue::new(5, vec![3.0, 4.0, 12.0, 1.0, 2.0]))
+    );
+
+    assert_eq!(
+        eval_generic(
+            "halfvec_add",
+            &[
+                Value::Vector(VectorValue::new(3, vec![1.0, 2.0, 3.0])),
+                Value::Vector(VectorValue::new(3, vec![3.0, 2.0, 1.0])),
+            ],
+        )
+        .unwrap(),
+        Value::Vector(VectorValue::new(3, vec![4.0, 4.0, 4.0]))
+    );
+    assert_eq!(
+        eval_generic(
+            "pg_catalog.halfvec_concat",
+            &[
+                Value::Vector(VectorValue::new(2, vec![1.0, 2.0])),
+                Value::Vector(VectorValue::new(1, vec![3.0])),
+            ],
+        )
+        .unwrap(),
+        Value::Vector(VectorValue::new(3, vec![1.0, 2.0, 3.0]))
+    );
+}
+
+#[test]
+fn vector_to_sparsevec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "vector_to_sparsevec",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn pg_catalog_vector_to_sparsevec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "pg_catalog.vector_to_sparsevec",
+        &[
+            Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5])),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn array_to_sparsevec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "array_to_sparsevec",
+        &[
+            Value::Array(vec![Value::Int(1), Value::Int(0), Value::Double(2.5)]),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn pg_catalog_array_to_sparsevec_generic_returns_dense_runtime_vector() {
+    let value = eval_generic(
+        "pg_catalog.array_to_sparsevec",
+        &[
+            Value::Array(vec![Value::Int(1), Value::Int(0), Value::Double(2.5)]),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        Value::Vector(VectorValue::new(3, vec![1.0, 0.0, 2.5]))
+    );
+}
+
+#[test]
+fn array_to_sparsevec_rejects_dimension_mismatch() {
+    let err = eval_generic(
+        "array_to_sparsevec",
+        &[
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Int(3),
+            Value::Boolean(true),
+        ],
+    )
+    .expect_err("dimension mismatch should fail");
+    assert!(err.to_string().contains("expected 3 dimensions"), "{err}");
 }
 
 #[test]

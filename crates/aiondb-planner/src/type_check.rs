@@ -68,8 +68,8 @@ use self::support::{
     compat_relation_with_system_columns, contextualize_null, default_column_name,
     ensure_comparable_for_eq, ensure_orderable_comparison, ensure_orderable_sort_expr,
     expr_contains_parameter, is_system_column, relation_with_alias_columns,
-    resolve_arithmetic_type, resolve_set_operation_type, rewrite_table_aliases, undefined_column,
-    validate_assignment_expr, validate_update_assignment,
+    resolve_arithmetic_type, resolve_set_operation_type, resolve_vector_result_type,
+    rewrite_table_aliases, undefined_column, validate_assignment_expr, validate_update_assignment,
 };
 pub use self::typed::{
     TypedAlterRole, TypedAlterTable, TypedAlterTableAddColumn, TypedAlterTableAddConstraint,

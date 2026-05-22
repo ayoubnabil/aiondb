@@ -213,6 +213,18 @@ fn to_regprocedure_resolves_pgvector_signatures() {
             "l2_distance(vector,vector)",
         ),
         (
+            "vector_in(cstring, oid, integer)",
+            "vector_in(cstring,oid,integer)",
+        ),
+        (
+            "halfvec_in(cstring, oid, int4)",
+            "halfvec_in(cstring,oid,integer)",
+        ),
+        (
+            "sparsevec_in(cstring, oid, integer)",
+            "sparsevec_in(cstring,oid,integer)",
+        ),
+        (
             "negative_inner_product(sparsevec, sparsevec)",
             "negative_inner_product(sparsevec,sparsevec)",
         ),
@@ -225,8 +237,51 @@ fn to_regprocedure_resolves_pgvector_signatures() {
             "array_to_vector(integer[],integer,boolean)",
         ),
         (
+            "array_to_halfvec(double precision[], integer, boolean)",
+            "array_to_halfvec(double precision[],integer,boolean)",
+        ),
+        (
+            "halfvec_to_float4(halfvec, integer, boolean)",
+            "halfvec_to_float4(halfvec,integer,boolean)",
+        ),
+        (
             "vector_to_halfvec(vector, integer, boolean)",
             "vector_to_halfvec(vector,integer,boolean)",
+        ),
+        ("vector_add(vector, vector)", "vector_add(vector,vector)"),
+        ("vector_sub(vector, vector)", "vector_sub(vector,vector)"),
+        ("vector_mul(vector, vector)", "vector_mul(vector,vector)"),
+        (
+            "vector_concat(vector, vector)",
+            "vector_concat(vector,vector)",
+        ),
+        (
+            "halfvec_to_sparsevec(halfvec, integer, boolean)",
+            "halfvec_to_sparsevec(halfvec,integer,boolean)",
+        ),
+        (
+            "halfvec_add(halfvec, halfvec)",
+            "halfvec_add(halfvec,halfvec)",
+        ),
+        (
+            "halfvec_sub(halfvec, halfvec)",
+            "halfvec_sub(halfvec,halfvec)",
+        ),
+        (
+            "halfvec_mul(halfvec, halfvec)",
+            "halfvec_mul(halfvec,halfvec)",
+        ),
+        (
+            "halfvec_concat(halfvec, halfvec)",
+            "halfvec_concat(halfvec,halfvec)",
+        ),
+        (
+            "sparsevec_to_vector(sparsevec, integer, boolean)",
+            "sparsevec_to_vector(sparsevec,integer,boolean)",
+        ),
+        (
+            "sparsevec_to_halfvec(sparsevec, integer, boolean)",
+            "sparsevec_to_halfvec(sparsevec,integer,boolean)",
         ),
         (
             "array_to_sparsevec(double precision[], integer, boolean)",
@@ -236,6 +291,9 @@ fn to_regprocedure_resolves_pgvector_signatures() {
             "binary_quantize(vector, integer, boolean)",
             "binary_quantize(vector,integer,boolean)",
         ),
+        ("binary_quantize(halfvec)", "binary_quantize(halfvec)"),
+        ("l2_norm(sparsevec)", "l2_norm(sparsevec)"),
+        ("l2_normalize(sparsevec)", "l2_normalize(sparsevec)"),
     ] {
         let expr = TypedExpr::scalar_function(
             aiondb_plan::ScalarFunction::Generic("to_regprocedure".to_owned()),
@@ -250,6 +308,10 @@ fn to_regprocedure_resolves_pgvector_signatures() {
 #[test]
 fn to_regoperator_resolves_pgvector_operators() {
     for (signature, canonical) in [
+        ("+(vector, vector)", "+(vector,vector)"),
+        ("-(vector, vector)", "-(vector,vector)"),
+        ("*(halfvec, halfvec)", "*(halfvec,halfvec)"),
+        ("pg_catalog.||(halfvec, halfvec)", "||(halfvec,halfvec)"),
         ("pg_catalog.<->(vector, vector)", "<->(vector,vector)"),
         ("<#>(halfvec,halfvec)", "<#>(halfvec,halfvec)"),
         ("<=>(sparsevec, sparsevec)", "<=>(sparsevec,sparsevec)"),

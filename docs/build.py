@@ -298,6 +298,10 @@ class Page:
         "description",
         "lang",
         "order",
+        "date",
+        "author",
+        "image",
+        "tags",
         "html_body",
         "section",
     )
@@ -311,6 +315,10 @@ class Page:
         description: str,
         lang: str,
         order: int,
+        date: str,
+        author: str,
+        image: str,
+        tags: list[str],
         body: str,
         section: str,
     ):
@@ -321,6 +329,10 @@ class Page:
         self.description = description
         self.lang = lang
         self.order = order
+        self.date = date
+        self.author = author
+        self.image = image
+        self.tags = tags
         self.html_body = body
         self.section = section
 
@@ -340,9 +352,33 @@ def collect_pages() -> list[Page]:
         description = meta.get("description") or default_description(title)
         lang = meta.get("lang") or "en"
         order = int(meta.get("order", "100"))
+        date = meta.get("date", "")
+        author = meta.get("author", "AionDB")
+        image = meta.get("image", "/aiondb-logo-light.png")
+        tags = [
+            tag.strip()
+            for tag in meta.get("tags", "").split(",")
+            if tag.strip()
+        ]
         section = rel.parts[0] if len(rel.parts) > 1 else ""
         rendered = render_markdown(body)
-        pages.append(Page(md, url, title, seo_title, description, lang, order, rendered, section))
+        pages.append(
+            Page(
+                md,
+                url,
+                title,
+                seo_title,
+                description,
+                lang,
+                order,
+                date,
+                author,
+                image,
+                tags,
+                rendered,
+                section,
+            )
+        )
     return pages
 
 
@@ -456,6 +492,8 @@ def render_sidebar_link(page: Page, current: Page) -> str:
 def build_sidebar(pages: list[Page], current: Page) -> str:
     if not current.section:
         return ""
+    if current.section == "blog":
+        return ""
     section_pages = [p for p in pages if p.section == current.section]
     section_pages.sort(key=lambda p: (p.order, p.title))
 
@@ -503,31 +541,93 @@ def canonical_url(page: Page) -> str:
 
 
 def structured_data(page: Page) -> str:
-    data = {
+    site = {
+        "@type": "WebSite",
+        "name": "AionDB",
+        "url": f"{SITE_URL}/",
+    }
+    data: dict[str, object] = {
         "@context": "https://schema.org",
         "@type": "WebPage",
         "name": page.title,
         "headline": page.seo_title,
         "description": page.description,
         "url": canonical_url(page),
-        "isPartOf": {
-            "@type": "WebSite",
-            "name": "AionDB",
-            "url": f"{SITE_URL}/",
-        },
+        "isPartOf": site,
     }
+    if page.section == "blog" and not page.rel_url.endswith("/"):
+        data = {
+            "@context": "https://schema.org",
+            "@type": "BlogPosting",
+            "mainEntityOfPage": {
+                "@type": "WebPage",
+                "@id": canonical_url(page),
+            },
+            "headline": page.title,
+            "description": page.description,
+            "url": canonical_url(page),
+            "datePublished": page.date,
+            "dateModified": page.date,
+            "author": {
+                "@type": "Organization",
+                "name": page.author,
+                "url": f"{SITE_URL}/",
+            },
+            "publisher": {
+                "@type": "Organization",
+                "name": "AionDB",
+                "logo": {
+                    "@type": "ImageObject",
+                    "url": f"{SITE_URL}/aiondb-logo-light.png",
+                },
+            },
+            "image": [f"{SITE_URL}{page.image}"],
+            "keywords": page.tags,
+            "isPartOf": site,
+        }
     return json.dumps(data, ensure_ascii=False, indent=2).replace("</", "<\\/")
 
 
+def extra_head(page: Page) -> str:
+    parts: list[str] = []
+    if page.image:
+        image_url = SITE_URL + page.image
+        parts.append(
+            f'<meta property="og:image" content="{html.escape(image_url, quote=True)}" />'
+        )
+        parts.append(
+            f'<meta name="twitter:image" content="{html.escape(image_url, quote=True)}" />'
+        )
+    if page.section == "blog" and not page.rel_url.endswith("/"):
+        if page.date:
+            parts.append(
+                f'<meta property="article:published_time" content="{html.escape(page.date, quote=True)}" />'
+            )
+            parts.append(
+                f'<meta property="article:modified_time" content="{html.escape(page.date, quote=True)}" />'
+            )
+        for tag in page.tags:
+            parts.append(
+                f'<meta property="article:tag" content="{html.escape(tag, quote=True)}" />'
+            )
+    return "\n  ".join(parts)
+
+
 def render_layout(template: str, page: Page, top_nav: str, sidebar: str) -> str:
+    is_blog_post = page.section == "blog" and not page.rel_url.endswith("/")
     body_class = "has-sidebar" if sidebar else "no-sidebar"
+    body_class = f"{body_class} section-{page.section or 'root'}"
+    if is_blog_post:
+        body_class = f"{body_class} blog-post-layout"
     return (
         template.replace("{{ title }}", html.escape(page.title))
         .replace("{{ seo_title }}", html.escape(page.seo_title))
         .replace("{{ description }}", html.escape(page.description, quote=True))
         .replace("{{ canonical_url }}", html.escape(canonical_url(page), quote=True))
         .replace("{{ lang }}", html.escape(page.lang, quote=True))
+        .replace("{{ og_type }}", "article" if is_blog_post else "website")
         .replace("{{ structured_data }}", structured_data(page))
+        .replace("{{ extra_head }}", extra_head(page))
         .replace("{{ top_nav }}", top_nav)
         .replace("{{ sidebar }}", sidebar)
         .replace("{{ content }}", page.html_body)
@@ -589,12 +689,17 @@ def build(out_dir: Path) -> None:
 
 
 def write_sitemap(out_dir: Path, pages: list[Page]) -> None:
-    urls = "\n".join(
-        "  <url><loc>"
-        + html.escape(canonical_url(page), quote=True)
-        + "</loc></url>"
-        for page in sorted(pages, key=lambda p: p.rel_url)
-    )
+    rows: list[str] = []
+    for page in sorted(pages, key=lambda p: p.rel_url):
+        lastmod = ""
+        if page.date:
+            lastmod = f"<lastmod>{html.escape(page.date, quote=True)}</lastmod>"
+        rows.append(
+            "  <url><loc>"
+            + html.escape(canonical_url(page), quote=True)
+            + f"</loc>{lastmod}</url>"
+        )
+    urls = "\n".join(rows)
     sitemap = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'

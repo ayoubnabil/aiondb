@@ -112,6 +112,20 @@ fn data_type_vector_zero_dims() {
     );
 }
 
+#[test]
+fn vector_value_parse_sparse_pgvector_text() {
+    let vv = VectorValue::parse("{1:1.5,3:-2}/4").expect("sparse vector parse");
+    assert_eq!(vv, VectorValue::new(4, vec![1.5, 0.0, -2.0, 0.0]));
+}
+
+#[test]
+fn vector_value_parse_sparse_rejects_bad_indices() {
+    assert!(VectorValue::parse("{}/0").is_none());
+    assert!(VectorValue::parse("{0:1}/4").is_none());
+    assert!(VectorValue::parse("{5:1}/4").is_none());
+    assert!(VectorValue::parse("{1:1,1:2}/4").is_none());
+}
+
 // ---------------------------------------------------------------
 // is_null()
 // ---------------------------------------------------------------

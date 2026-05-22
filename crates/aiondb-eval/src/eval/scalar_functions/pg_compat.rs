@@ -2464,10 +2464,19 @@ pub(crate) fn lookup_regprocedure_name(input: &str) -> DbResult<String> {
 fn lookup_pgvector_regprocedure_signature(compact: &str) -> Option<&'static str> {
     match compact.strip_prefix("pg_catalog.").unwrap_or(compact) {
         "vector_in(cstring)" => Some("vector_in(cstring)"),
+        "vector_in(cstring,oid,integer)" | "vector_in(cstring,oid,int4)" => {
+            Some("vector_in(cstring,oid,integer)")
+        }
         "vector_out(vector)" => Some("vector_out(vector)"),
         "halfvec_in(cstring)" => Some("halfvec_in(cstring)"),
+        "halfvec_in(cstring,oid,integer)" | "halfvec_in(cstring,oid,int4)" => {
+            Some("halfvec_in(cstring,oid,integer)")
+        }
         "halfvec_out(halfvec)" => Some("halfvec_out(halfvec)"),
         "sparsevec_in(cstring)" => Some("sparsevec_in(cstring)"),
+        "sparsevec_in(cstring,oid,integer)" | "sparsevec_in(cstring,oid,int4)" => {
+            Some("sparsevec_in(cstring,oid,integer)")
+        }
         "sparsevec_out(sparsevec)" => Some("sparsevec_out(sparsevec)"),
         "l2_distance(vector,vector)" => Some("l2_distance(vector,vector)"),
         "cosine_distance(vector,vector)" => Some("cosine_distance(vector,vector)"),
@@ -2504,11 +2513,47 @@ fn lookup_pgvector_regprocedure_signature(compact: &str) -> Option<&'static str>
         "vector_to_float4(vector,integer,boolean)" | "vector_to_float4(vector,int4,bool)" => {
             Some("vector_to_float4(vector,integer,boolean)")
         }
+        "halfvec_to_float4(halfvec,integer,boolean)" | "halfvec_to_float4(halfvec,int4,bool)" => {
+            Some("halfvec_to_float4(halfvec,integer,boolean)")
+        }
+        "vector_add(vector,vector)" => Some("vector_add(vector,vector)"),
+        "vector_sub(vector,vector)" => Some("vector_sub(vector,vector)"),
+        "vector_mul(vector,vector)" => Some("vector_mul(vector,vector)"),
+        "vector_concat(vector,vector)" => Some("vector_concat(vector,vector)"),
+        "array_to_halfvec(integer[],integer,boolean)" | "array_to_halfvec(int4[],int4,bool)" => {
+            Some("array_to_halfvec(integer[],integer,boolean)")
+        }
+        "array_to_halfvec(real[],integer,boolean)" | "array_to_halfvec(float4[],int4,bool)" => {
+            Some("array_to_halfvec(real[],integer,boolean)")
+        }
+        "array_to_halfvec(doubleprecision[],integer,boolean)"
+        | "array_to_halfvec(float8[],int4,bool)" => {
+            Some("array_to_halfvec(double precision[],integer,boolean)")
+        }
+        "array_to_halfvec(numeric[],integer,boolean)" | "array_to_halfvec(decimal[],int4,bool)" => {
+            Some("array_to_halfvec(numeric[],integer,boolean)")
+        }
         "vector_to_halfvec(vector,integer,boolean)" | "vector_to_halfvec(vector,int4,bool)" => {
             Some("vector_to_halfvec(vector,integer,boolean)")
         }
         "halfvec_to_vector(halfvec,integer,boolean)" | "halfvec_to_vector(halfvec,int4,bool)" => {
             Some("halfvec_to_vector(halfvec,integer,boolean)")
+        }
+        "halfvec_add(halfvec,halfvec)" => Some("halfvec_add(halfvec,halfvec)"),
+        "halfvec_sub(halfvec,halfvec)" => Some("halfvec_sub(halfvec,halfvec)"),
+        "halfvec_mul(halfvec,halfvec)" => Some("halfvec_mul(halfvec,halfvec)"),
+        "halfvec_concat(halfvec,halfvec)" => Some("halfvec_concat(halfvec,halfvec)"),
+        "halfvec_to_sparsevec(halfvec,integer,boolean)"
+        | "halfvec_to_sparsevec(halfvec,int4,bool)" => {
+            Some("halfvec_to_sparsevec(halfvec,integer,boolean)")
+        }
+        "sparsevec_to_vector(sparsevec,integer,boolean)"
+        | "sparsevec_to_vector(sparsevec,int4,bool)" => {
+            Some("sparsevec_to_vector(sparsevec,integer,boolean)")
+        }
+        "sparsevec_to_halfvec(sparsevec,integer,boolean)"
+        | "sparsevec_to_halfvec(sparsevec,int4,bool)" => {
+            Some("sparsevec_to_halfvec(sparsevec,integer,boolean)")
         }
         "vector_to_sparsevec(vector,integer,boolean)" | "vector_to_sparsevec(vector,int4,bool)" => {
             Some("vector_to_sparsevec(vector,integer,boolean)")
@@ -2536,8 +2581,10 @@ fn lookup_pgvector_regprocedure_signature(compact: &str) -> Option<&'static str>
         "vector_norm(vector)" => Some("vector_norm(vector)"),
         "l2_norm(vector)" => Some("l2_norm(vector)"),
         "l2_norm(halfvec)" => Some("l2_norm(halfvec)"),
+        "l2_norm(sparsevec)" => Some("l2_norm(sparsevec)"),
         "l2_normalize(vector)" => Some("l2_normalize(vector)"),
         "l2_normalize(halfvec)" => Some("l2_normalize(halfvec)"),
+        "l2_normalize(sparsevec)" => Some("l2_normalize(sparsevec)"),
         "subvector(vector,int4,int4)" | "subvector(vector,integer,integer)" => {
             Some("subvector(vector,integer,integer)")
         }
@@ -2591,6 +2638,10 @@ pub(crate) fn lookup_regoperator_name(input: &str) -> DbResult<String> {
         .collect::<String>();
     match compact.as_str() {
         "+(int4,int4)" | "pg_catalog.+(int4,int4)" => Ok("+(integer,integer)".to_owned()),
+        "+(vector,vector)" | "pg_catalog.+(vector,vector)" => Ok("+(vector,vector)".to_owned()),
+        "-(vector,vector)" | "pg_catalog.-(vector,vector)" => Ok("-(vector,vector)".to_owned()),
+        "*(vector,vector)" | "pg_catalog.*(vector,vector)" => Ok("*(vector,vector)".to_owned()),
+        "||(vector,vector)" | "pg_catalog.||(vector,vector)" => Ok("||(vector,vector)".to_owned()),
         "<->(vector,vector)" | "pg_catalog.<->(vector,vector)" => {
             Ok("<->(vector,vector)".to_owned())
         }
@@ -2602,6 +2653,18 @@ pub(crate) fn lookup_regoperator_name(input: &str) -> DbResult<String> {
         }
         "<+>(vector,vector)" | "pg_catalog.<+>(vector,vector)" => {
             Ok("<+>(vector,vector)".to_owned())
+        }
+        "+(halfvec,halfvec)" | "pg_catalog.+(halfvec,halfvec)" => {
+            Ok("+(halfvec,halfvec)".to_owned())
+        }
+        "-(halfvec,halfvec)" | "pg_catalog.-(halfvec,halfvec)" => {
+            Ok("-(halfvec,halfvec)".to_owned())
+        }
+        "*(halfvec,halfvec)" | "pg_catalog.*(halfvec,halfvec)" => {
+            Ok("*(halfvec,halfvec)".to_owned())
+        }
+        "||(halfvec,halfvec)" | "pg_catalog.||(halfvec,halfvec)" => {
+            Ok("||(halfvec,halfvec)".to_owned())
         }
         "<->(halfvec,halfvec)" | "pg_catalog.<->(halfvec,halfvec)" => {
             Ok("<->(halfvec,halfvec)".to_owned())

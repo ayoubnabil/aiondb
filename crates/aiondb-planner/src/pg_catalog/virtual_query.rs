@@ -1015,15 +1015,21 @@ fn resolve_regoperator_oid(name: &str) -> Option<i32> {
     if left_oid != right_oid {
         return None;
     }
-    let vector_operator = matches!(operator, "<->" | "<#>" | "<=>" | "<+>")
+    let vector_distance_operator = matches!(operator, "<->" | "<#>" | "<=>" | "<+>")
         && matches!(
             left_oid,
             COMPAT_PGVECTOR_VECTOR_OID
                 | COMPAT_PGVECTOR_HALFVEC_OID
                 | COMPAT_PGVECTOR_SPARSEVEC_OID
         );
+    let vector_arithmetic_operator = matches!(operator, "+" | "-" | "*" | "||")
+        && matches!(
+            left_oid,
+            COMPAT_PGVECTOR_VECTOR_OID | COMPAT_PGVECTOR_HALFVEC_OID
+        );
     let bit_operator = matches!(operator, "<~>" | "<%>") && left_oid == COMPAT_PG_BIT_OID;
-    (vector_operator || bit_operator).then(|| compat_pgvector_operator_oid(left_oid, operator))
+    (vector_distance_operator || vector_arithmetic_operator || bit_operator)
+        .then(|| compat_pgvector_operator_oid(left_oid, operator))
 }
 
 fn resolve_regprocedure_oid(name: &str) -> Option<i32> {
@@ -1060,19 +1066,33 @@ fn resolve_pgvector_regprocedure_arg_oid(name: &str) -> Option<i32> {
     match name {
         "cstring" => Some(2275),
         "integer" => Some(23),
+        "int4" => Some(23),
+        "oid" => Some(26),
         _ => resolve_regtype_oid(name),
     }
 }
 
 fn pgvector_regprocedure_signature_supported(proc_name: &str, arg_oids: &[i32]) -> bool {
     let vector_array_cast = matches!(arg_oids, [1007 | 1021 | 1022 | 1231, 23, 16])
-        && matches!(proc_name, "array_to_vector" | "array_to_sparsevec");
+        && matches!(
+            proc_name,
+            "array_to_vector" | "array_to_halfvec" | "array_to_sparsevec"
+        );
     let vector_cast = matches!(
         (proc_name, arg_oids),
         (
             "vector_to_float4" | "vector_to_halfvec" | "vector_to_sparsevec" | "binary_quantize",
             [COMPAT_PGVECTOR_VECTOR_OID, 23, 16]
-        ) | ("halfvec_to_vector", [COMPAT_PGVECTOR_HALFVEC_OID, 23, 16])
+        ) | ("halfvec_to_float4", [COMPAT_PGVECTOR_HALFVEC_OID, 23, 16])
+            | ("halfvec_to_vector", [COMPAT_PGVECTOR_HALFVEC_OID, 23, 16])
+            | (
+                "halfvec_to_sparsevec",
+                [COMPAT_PGVECTOR_HALFVEC_OID, 23, 16]
+            )
+            | (
+                "sparsevec_to_vector" | "sparsevec_to_halfvec",
+                [COMPAT_PGVECTOR_SPARSEVEC_OID, 23, 16]
+            )
     );
     let vector_binary = matches!(
         arg_oids,
@@ -1086,6 +1106,16 @@ fn pgvector_regprocedure_signature_supported(proc_name: &str, arg_oids: &[i32]) 
             | "inner_product"
             | "negative_inner_product"
             | "l1_distance"
+    );
+    let vector_operator_impl = matches!(
+        (proc_name, arg_oids),
+        (
+            "vector_add" | "vector_sub" | "vector_mul" | "vector_concat",
+            [COMPAT_PGVECTOR_VECTOR_OID, COMPAT_PGVECTOR_VECTOR_OID]
+        ) | (
+            "halfvec_add" | "halfvec_sub" | "halfvec_mul" | "halfvec_concat",
+            [COMPAT_PGVECTOR_HALFVEC_OID, COMPAT_PGVECTOR_HALFVEC_OID]
+        )
     );
     let vector_unary = matches!(arg_oids, [COMPAT_PGVECTOR_VECTOR_OID])
         && matches!(
@@ -1103,14 +1133,19 @@ fn pgvector_regprocedure_signature_supported(proc_name: &str, arg_oids: &[i32]) 
             proc_name,
             "vector_dims" | "l2_norm" | "l2_normalize" | "binary_quantize" | "sum" | "avg"
         );
+    let sparsevec_unary = matches!(arg_oids, [COMPAT_PGVECTOR_SPARSEVEC_OID])
+        && matches!(proc_name, "l2_norm" | "l2_normalize");
     vector_array_cast
         || vector_cast
         || vector_binary
+        || vector_operator_impl
         || vector_unary
         || halfvec_unary
+        || sparsevec_unary
         || matches!(
             (proc_name, arg_oids),
             ("vector_in" | "halfvec_in" | "sparsevec_in", [2275])
+                | ("vector_in" | "halfvec_in" | "sparsevec_in", [2275, 26, 23])
                 | ("vector_out", [COMPAT_PGVECTOR_VECTOR_OID])
                 | ("halfvec_out", [COMPAT_PGVECTOR_HALFVEC_OID])
                 | ("sparsevec_out", [COMPAT_PGVECTOR_SPARSEVEC_OID])

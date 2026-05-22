@@ -86,6 +86,66 @@ fn halfvec_type_accepts_pgvector_syntax_and_hnsw_opclass() {
     assert_eq!(rows[0].values[1], aiondb_core::Value::Int(3));
 }
 
+#[test]
+fn sparsevec_type_accepts_pgvector_text_and_exact_distance() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, embedding SPARSEVEC(4)); \
+             INSERT INTO items VALUES \
+                 (1, '{1:1.0,3:2.0}/4'), \
+                 (2, '{2:1.0}/4'); \
+             SELECT id, vector_dims(embedding), l2_distance(embedding, '[1.0,0.0,2.0,0.0]') AS dist \
+             FROM items \
+             ORDER BY embedding <-> CAST('{1:1.0,3:2.0}/4' AS SPARSEVEC(4)) \
+             LIMIT 1",
+        )
+        .expect("sparsevec pgvector syntax");
+
+    let StatementResult::Query { rows, .. } = results.last().unwrap() else {
+        panic!("expected query result");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], aiondb_core::Value::Int(1));
+    assert_eq!(rows[0].values[1], aiondb_core::Value::Int(4));
+    assert_eq!(rows[0].values[2], aiondb_core::Value::Double(0.0));
+}
+
+#[test]
+fn pgvector_io_functions_execute() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT \
+                vector_out(vector_in('[1.0,0.0,2.5]')), \
+                vector_dims(vector_in('[1.0,0.0,2.5]', 0, 3)), \
+                halfvec_out(halfvec_in('[1.0,0.0,2.5]')), \
+                vector_dims(halfvec_in('[1.0,0.0,2.5]', 0, 3)), \
+                sparsevec_out(sparsevec_in('{1:1.0,3:2.5}/4')), \
+                vector_dims(sparsevec_in('{1:1.0,3:2.5}/4', 0, 4))",
+        )
+        .expect("pgvector io functions");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::Text("[1,0,2.5]".to_owned()));
+            assert_eq!(rows[0].values[1], Value::Int(3));
+            assert_eq!(rows[0].values[2], Value::Text("[1,0,2.5]".to_owned()));
+            assert_eq!(rows[0].values[3], Value::Int(3));
+            assert_eq!(rows[0].values[4], Value::Text("{1:1,3:2.5}/4".to_owned()));
+            assert_eq!(rows[0].values[5], Value::Int(4));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
 // =====================================================================
 // 2. INSERT vector data using text literal '[1.0,2.0,3.0]'
 // =====================================================================
@@ -1140,10 +1200,40 @@ fn vector_pgvector_utility_functions() {
                 vector_dims(subvector(v, 2, 2)), \
                 subvector(v, 2, 2), \
                 binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)), \
+                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR), 4, true), \
+                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR))::bit(4), \
+                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR))::varbit(4), \
                 hamming_distance(binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)), '1011'), \
                 jaccard_distance(binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)), '1011'), \
                 binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)) <~> '1011', \
-                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)) <%> '1011' \
+                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)) <%> '1011', \
+                vector_dims(array_to_vector(ARRAY[3.0,4.0,12.0], 3, true)), \
+                vector_to_float4(v, 3, true), \
+                vector_dims(array_to_halfvec(ARRAY[3.0,4.0,12.0], 3, true)), \
+                vector_dims(vector_to_halfvec(v, 3, true)), \
+                vector_dims(halfvec_to_vector(v, 3, true)), \
+                vector_dims(halfvec_to_sparsevec(CAST('[3.0,4.0,12.0]' AS HALFVEC(3)), 3, true)), \
+                vector_dims(sparsevec_to_vector(CAST('{1:3.0,2:4.0,3:12.0}/3' AS SPARSEVEC(3)), 3, true)), \
+                vector_dims(sparsevec_to_halfvec(CAST('{1:3.0,2:4.0,3:12.0}/3' AS SPARSEVEC(3)), 3, true)), \
+                vector_dims(vector_to_sparsevec(v, 3, true)), \
+                l2_distance(vector_to_sparsevec(v, 3, true), CAST('{1:3.0,2:4.0,3:12.0}/3' AS SPARSEVEC(3))), \
+                vector_dims(array_to_sparsevec(ARRAY[3.0,4.0,12.0], 3, true)), \
+                l2_distance(array_to_sparsevec(ARRAY[3.0,4.0,12.0], 3, true), v), \
+                pg_catalog.vector_dims(v), \
+                pg_catalog.l2_norm(v), \
+                pg_catalog.binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS VECTOR)), \
+                l2_norm(CAST('{1:3.0,2:4.0,3:12.0}/3' AS SPARSEVEC(3))), \
+                l2_norm(l2_normalize(CAST('{1:3.0,2:4.0,3:12.0}/3' AS SPARSEVEC(3)))), \
+                v + CAST('[1.0,1.0,1.0]' AS VECTOR(3)), \
+                v - CAST('[1.0,2.0,3.0]' AS VECTOR(3)), \
+                v * CAST('[2.0,0.5,1.0]' AS VECTOR(3)), \
+                vector_dims(v || CAST('[1.0,2.0]' AS VECTOR(2))), \
+                vector_add(v, CAST('[1.0,1.0,1.0]' AS VECTOR(3))), \
+                pg_catalog.vector_sub(v, CAST('[1.0,2.0,3.0]' AS VECTOR(3))), \
+                vector_mul(v, CAST('[2.0,0.5,1.0]' AS VECTOR(3))), \
+                vector_dims(vector_concat(v, CAST('[1.0,2.0]' AS VECTOR(2)))), \
+                halfvec_add(CAST('[1.0,2.0,3.0]' AS HALFVEC(3)), CAST('[3.0,2.0,1.0]' AS HALFVEC(3))), \
+                vector_dims(pg_catalog.halfvec_concat(CAST('[1.0,2.0]' AS HALFVEC(2)), CAST('[3.0]' AS HALFVEC(1)))) \
              FROM items WHERE id = 1",
         )
         .expect("pgvector utility functions");
@@ -1171,20 +1261,189 @@ fn vector_pgvector_utility_functions() {
                 rows[0].values[6],
                 aiondb_core::Value::Text("1001".to_owned())
             );
-            assert_eq!(rows[0].values[7], aiondb_core::Value::Double(1.0));
-            match rows[0].values[8] {
+            assert_eq!(
+                rows[0].values[7],
+                aiondb_core::Value::Text("1001".to_owned())
+            );
+            assert_eq!(
+                rows[0].values[8],
+                aiondb_core::Value::Text("1001".to_owned())
+            );
+            assert_eq!(
+                rows[0].values[9],
+                aiondb_core::Value::Text("1001".to_owned())
+            );
+            assert_eq!(rows[0].values[10], aiondb_core::Value::Double(1.0));
+            match rows[0].values[11] {
                 aiondb_core::Value::Double(distance) => {
                     assert!((distance - (1.0 / 3.0)).abs() < 1e-9);
                 }
                 ref other => panic!("expected Double, got {other:?}"),
             }
-            assert_eq!(rows[0].values[9], aiondb_core::Value::Double(1.0));
-            match rows[0].values[10] {
+            assert_eq!(rows[0].values[12], aiondb_core::Value::Double(1.0));
+            match rows[0].values[13] {
                 aiondb_core::Value::Double(distance) => {
                     assert!((distance - (1.0 / 3.0)).abs() < 1e-9);
                 }
                 ref other => panic!("expected Double, got {other:?}"),
             }
+            assert_eq!(rows[0].values[14], aiondb_core::Value::Int(3));
+            assert_eq!(
+                rows[0].values[15],
+                aiondb_core::Value::Array(vec![
+                    aiondb_core::Value::Real(3.0),
+                    aiondb_core::Value::Real(4.0),
+                    aiondb_core::Value::Real(12.0)
+                ])
+            );
+            assert_eq!(rows[0].values[16], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[17], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[18], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[19], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[20], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[21], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[22], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[23], aiondb_core::Value::Double(0.0));
+            assert_eq!(rows[0].values[24], aiondb_core::Value::Int(3));
+            assert_eq!(rows[0].values[25], aiondb_core::Value::Double(0.0));
+            assert_eq!(rows[0].values[26], aiondb_core::Value::Int(3));
+            match rows[0].values[27] {
+                aiondb_core::Value::Double(norm) => assert!((norm - 13.0).abs() < 1e-6),
+                ref other => panic!("expected Double, got {other:?}"),
+            }
+            assert_eq!(
+                rows[0].values[28],
+                aiondb_core::Value::Text("1001".to_owned())
+            );
+            match rows[0].values[29] {
+                aiondb_core::Value::Double(norm) => assert!((norm - 13.0).abs() < 1e-6),
+                ref other => panic!("expected Double, got {other:?}"),
+            }
+            match rows[0].values[30] {
+                aiondb_core::Value::Double(norm) => assert!((norm - 1.0).abs() < 1e-6),
+                ref other => panic!("expected Double, got {other:?}"),
+            }
+            assert_eq!(
+                rows[0].values[31],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![4.0, 5.0, 13.0]))
+            );
+            assert_eq!(
+                rows[0].values[32],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![2.0, 2.0, 9.0]))
+            );
+            assert_eq!(
+                rows[0].values[33],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![6.0, 2.0, 12.0]))
+            );
+            assert_eq!(rows[0].values[34], aiondb_core::Value::Int(5));
+            assert_eq!(
+                rows[0].values[35],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![4.0, 5.0, 13.0]))
+            );
+            assert_eq!(
+                rows[0].values[36],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![2.0, 2.0, 9.0]))
+            );
+            assert_eq!(
+                rows[0].values[37],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![6.0, 2.0, 12.0]))
+            );
+            assert_eq!(rows[0].values[38], aiondb_core::Value::Int(5));
+            assert_eq!(
+                rows[0].values[39],
+                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![4.0, 4.0, 4.0]))
+            );
+            assert_eq!(rows[0].values[40], aiondb_core::Value::Int(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn binary_quantize_halfvec_pgvector_compat() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT \
+                binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS HALFVEC(4))), \
+                pg_catalog.binary_quantize(CAST('[1.0,-2.0,0.0,0.1]' AS HALFVEC(4)))",
+        )
+        .expect("halfvec binary quantize");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values,
+                vec![
+                    aiondb_core::Value::Text("1001".to_owned()),
+                    aiondb_core::Value::Text("1001".to_owned()),
+                ]
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn halfvec_to_float4_pgvector_compat() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT \
+                halfvec_to_float4(CAST('[1.0,0.0,2.5]' AS HALFVEC(3)), 3, true), \
+                pg_catalog.halfvec_to_float4(CAST('[1.0,0.0,2.5]' AS HALFVEC(3)), 3, true), \
+                CAST(CAST('[1.0,0.0,2.5]' AS HALFVEC(3)) AS REAL[])",
+        )
+        .expect("halfvec_to_float4");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let expected = aiondb_core::Value::Array(vec![
+                aiondb_core::Value::Real(1.0),
+                aiondb_core::Value::Real(0.0),
+                aiondb_core::Value::Real(2.5),
+            ]);
+            assert_eq!(rows[0].values[0], expected);
+            assert_eq!(rows[0].values[1], expected);
+            assert_eq!(rows[0].values[2], expected);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn pg_catalog_pgvector_distance_aliases_execute() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT \
+                pg_catalog.l2_distance(CAST('[1.0,2.0]' AS VECTOR(2)), CAST('[4.0,6.0]' AS VECTOR(2))), \
+                pg_catalog.cosine_distance(CAST('[1.0,0.0]' AS HALFVEC(2)), CAST('[0.0,1.0]' AS HALFVEC(2))), \
+                pg_catalog.inner_product(CAST('{1:1.0,3:2.0}/3' AS SPARSEVEC(3)), CAST('{1:3.0,3:4.0}/3' AS SPARSEVEC(3))), \
+                pg_catalog.negative_inner_product(CAST('[1.0,2.0]' AS VECTOR(2)), CAST('[4.0,6.0]' AS VECTOR(2))), \
+                pg_catalog.hamming_distance('1010', '1001')",
+        )
+        .expect("pg_catalog pgvector distances");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], aiondb_core::Value::Double(5.0));
+            assert_eq!(rows[0].values[1], aiondb_core::Value::Double(1.0));
+            assert_eq!(rows[0].values[2], aiondb_core::Value::Double(11.0));
+            assert_eq!(rows[0].values[3], aiondb_core::Value::Double(-16.0));
+            assert_eq!(rows[0].values[4], aiondb_core::Value::Double(2.0));
         }
         other => panic!("expected Query, got {other:?}"),
     }
@@ -1258,22 +1517,45 @@ fn vector_sum_and_avg_aggregates_pgvector_compat() {
                  (3, NULL)",
         )
         .expect("setup");
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE half_items (id INT, v HALFVEC(3)); \
+             INSERT INTO half_items VALUES \
+                 (1, '[1.0,2.0,3.0]'), \
+                 (2, '[4.0,5.0,6.0]'), \
+                 (3, NULL)",
+        )
+        .expect("halfvec setup");
 
     let results = engine
-        .execute_sql(&session, "SELECT sum(v), avg(v) FROM items")
+        .execute_sql(
+            &session,
+            "SELECT sum(v), avg(v) FROM items \
+             UNION ALL \
+             SELECT sum(v), avg(v) FROM half_items",
+        )
         .expect("vector aggregates");
 
     match results.last().unwrap() {
         StatementResult::Query { rows, .. } => {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].values[0],
-                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![5.0, 7.0, 9.0]))
-            );
-            assert_eq!(
-                rows[0].values[1],
-                aiondb_core::Value::Vector(aiondb_core::VectorValue::new(3, vec![2.5, 3.5, 4.5]))
-            );
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(
+                    row.values[0],
+                    aiondb_core::Value::Vector(aiondb_core::VectorValue::new(
+                        3,
+                        vec![5.0, 7.0, 9.0]
+                    ))
+                );
+                assert_eq!(
+                    row.values[1],
+                    aiondb_core::Value::Vector(aiondb_core::VectorValue::new(
+                        3,
+                        vec![2.5, 3.5, 4.5]
+                    ))
+                );
+            }
         }
         other => panic!("expected Query, got {other:?}"),
     }
@@ -2797,6 +3079,134 @@ fn vector_top_k_ids_text_options_json_is_supported() {
 }
 
 #[test]
+fn vector_top_k_ids_json_options_qdrant_params_are_supported() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, v VECTOR(2)); \
+             CREATE INDEX idx_v_l2 ON items USING hnsw (v); \
+             INSERT INTO items VALUES \
+                 (1, '[1.0,0.0]'), \
+                 (2, '[1.2,0.0]'), \
+                 (3, '[4.0,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    1, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"params\":{\"exact\":true,\"hnsw_ef\":16},\"distance_threshold\":0.5}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids qdrant params options");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_limit_overrides_k_argument() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, '[1.0,0.0]'), \
+                 (2, '[1.1,0.0]'), \
+                 (3, '[2.0,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    0, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"limit\":2}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids options limit override");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_qdrant_params_reject_invalid_hnsw_ef() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"params\":{\"hnsw_ef\":0}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("params.hnsw_ef=0 should be rejected");
+    assert!(
+        err.to_string().contains("hnsw_ef"),
+        "expected params.hnsw_ef validation error, got {err}"
+    );
+}
+
+#[test]
 fn vector_top_k_ids_json_options_reject_unknown_keys() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -3012,6 +3422,52 @@ fn vector_top_k_ids_json_options_filter_object_applies_to_exact_results() {
 }
 
 #[test]
+fn vector_top_k_ids_json_options_filter_mixes_qdrant_clauses_and_shorthand_must() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, source TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', 'web', '[1.0,0.0]'), \
+                 (2, 'news', 'spam', '[1.1,0.0]'), \
+                 (3, 'sports', 'web', '[1.2,0.0]'), \
+                 (4, 'news', 'web', '[3.0,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"source\",\"match\":{\"value\":\"web\"}}],\"tag\":\"news\"}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids mixed qdrant and shorthand filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(4));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
 fn vector_top_k_ids_json_options_filter_qdrant_must_widens_hnsw_search() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -3197,6 +3653,978 @@ fn vector_top_k_ids_json_options_filter_qdrant_range_applies_to_exact_results() 
 }
 
 #[test]
+fn vector_top_k_ids_json_options_filter_qdrant_match_any_and_except_apply_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', '[1.00,0.0]'), \
+                 (2, 'drop', '[1.01,0.0]'), \
+                 (3, 'sports', '[1.02,0.0]'), \
+                 (4, 'other', '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let any_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tag\",\"match\":{\"any\":[\"news\",\"sports\"]}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact match.any filter");
+
+    match any_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let except_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tag\",\"match\":{\"except\":[\"drop\"]}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact match.except filter");
+
+    match except_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+            assert_eq!(rows[2].values[0], Value::BigInt(4));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_match_text_applies_to_strings_and_json_arrays() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, body TEXT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'The Quick Brown Fox', '{\"notes\":[\"vector filters\",\"pg\"]}', '[1.00,0.0]'), \
+                 (2, 'quick brown only', '{\"notes\":[\"other\"]}', '[1.01,0.0]'), \
+                 (3, 'vector filters only', '{\"notes\":[\"vector filters\"]}', '[1.02,0.0]'), \
+                 (4, 'the quick brown fox', '{\"notes\":[\"VECTOR FILTERS\"]}', '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"body\",\"match\":{\"text\":\"quick brown\"}},{\"key\":\"payload.notes[]\",\"match\":{\"text\":\"vector\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids match.text filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(4));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_match_clauses_apply_to_json_arrays() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tags JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, CAST('[\"news\",\"green\"]' AS JSONB), '[1.00,0.0]'), \
+                 (2, CAST('[\"sports\",\"red\"]' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('[\"other\",\"green\"]' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('[\"black\",\"yellow\"]' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let match_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tags\",\"match\":{\"value\":\"green\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact array match filter");
+
+    match match_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let any_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tags\",\"match\":{\"any\":[\"news\",\"sports\"]}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact array match.any filter");
+
+    match any_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let except_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"tags\",\"match\":{\"except\":[\"black\",\"yellow\"]}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact array match.except filter");
+
+    match except_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+            assert_eq!(rows[2].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_nested_json_key_applies_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, CAST('{\"city\":\"paris\",\"score\":3,\"tags\":[\"news\",\"green\"]}' AS JSONB), '[1.00,0.0]'), \
+                 (2, CAST('{\"city\":\"berlin\",\"score\":7,\"tags\":[\"sports\",\"red\"]}' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('{\"city\":\"paris\",\"score\":9,\"tags\":[\"other\",\"green\"]}' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('{\"city\":\"rome\",\"score\":1,\"tags\":[]}' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let city_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.city\",\"match\":{\"value\":\"paris\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact nested json key match");
+
+    match city_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let range_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.score\",\"range\":{\"gte\":5}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact nested json range");
+
+    match range_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(2));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let tags_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.tags\",\"match\":{\"value\":\"green\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact nested json array match");
+
+    match tags_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_bracket_array_keys_apply_to_json_arrays() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, CAST('{\"tags\":[\"news\",\"green\"],\"cities\":[{\"name\":\"paris\"},{\"name\":\"lyon\"}]}' AS JSONB), '[1.00,0.0]'), \
+                 (2, CAST('{\"tags\":[\"sports\",\"red\"],\"cities\":[{\"name\":\"berlin\"}]}' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('{\"tags\":[\"other\",\"green\"],\"cities\":[{\"name\":\"paris\"}]}' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('{\"tags\":[],\"cities\":[]}' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let tags_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.tags[]\",\"match\":{\"value\":\"green\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact json array bracket match");
+
+    match tags_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let city_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.cities[].name\",\"match\":{\"value\":\"paris\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact json nested array bracket match");
+
+    match city_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_range_applies_to_json_array_elements() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, CAST('{\"scores\":[1,4]}' AS JSONB), '[1.00,0.0]'), \
+                 (2, CAST('{\"scores\":[2,8]}' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('{\"scores\":[9]}' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('{\"scores\":[]}' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"payload.scores[]\",\"range\":{\"gte\":5,\"lt\":9}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact json array range filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_min_should_applies_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, source TEXT, priority INT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'story', 'web', 5, '[1.00,0.0]'), \
+                 (2, 'story', 'api', 2, '[1.01,0.0]'), \
+                 (3, 'story', 'web', 1, '[1.02,0.0]'), \
+                 (4, 'other', 'web', 5, '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"category\",\"match\":{\"value\":\"story\"}}],\"min_should\":{\"conditions\":[{\"key\":\"source\",\"match\":{\"value\":\"web\"}},{\"key\":\"priority\",\"range\":{\"gte\":3}}],\"min_count\":2}}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact min_should filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_clause_singletons_are_accepted() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, source TEXT, priority INT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'story', 'web', 5, '[1.00,0.0]'), \
+                 (2, 'story', 'api', 2, '[1.01,0.0]'), \
+                 (3, 'other', 'web', 5, '[1.02,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":{\"key\":\"category\",\"match\":{\"value\":\"story\"}},\"must_not\":{\"key\":\"source\",\"match\":{\"value\":\"api\"}},\"min_should\":{\"conditions\":{\"key\":\"priority\",\"range\":{\"gte\":3}},\"min_count\":1}}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids singleton filter clauses");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_clause_shorthand_maps_are_accepted() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, source TEXT, priority INT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'story', 'web', 5, '[1.00,0.0]'), \
+                 (2, 'story', 'api', 4, '[1.01,0.0]'), \
+                 (3, 'story', 'web', 2, '[1.02,0.0]'), \
+                 (4, 'note', 'web', 5, '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":{\"category\":\"story\",\"source\":\"web\"},\"should\":[{\"priority\":5},{\"priority\":4}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids shorthand clause maps");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_min_should_rejects_zero_min_count() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, 'story', '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"min_should\":{\"conditions\":[{\"key\":\"category\",\"match\":{\"value\":\"story\"}}],\"min_count\":0}}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("min_should min_count must be positive");
+    assert!(
+        err.to_string()
+            .contains("min_should.min_count must be >= 1"),
+        "expected min_should min_count error, got {err}"
+    );
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_min_should_rejects_impossible_min_count() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, 'story', '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"min_should\":{\"conditions\":[{\"key\":\"category\",\"match\":{\"value\":\"story\"}}],\"min_count\":2}}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("min_should min_count cannot exceed conditions length");
+    assert!(
+        err.to_string()
+            .contains("min_should.min_count cannot exceed conditions length"),
+        "expected min_should impossible min_count error, got {err}"
+    );
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_match_any_rejects_non_array() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, 'news', '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"must\":[{\"key\":\"tag\",\"match\":{\"any\":\"news\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("match.any payload must be an array");
+    assert!(
+        err.to_string().contains("match.any must be an array"),
+        "expected match.any array error, got {err}"
+    );
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_is_null_and_is_empty_apply_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, NULL, '[1.00,0.0]'), \
+                 (2, CAST('null' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('[]' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('[\"tag\"]' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let is_null_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"is_null\":{\"key\":\"payload\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact is_null filter");
+
+    match is_null_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let is_empty_results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"is_empty\":{\"key\":\"payload\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact is_empty filter");
+
+    match is_empty_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+            assert_eq!(rows[2].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_is_null_rejects_invalid_payload() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, NULL, '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"must\":[{\"is_null\":{\"field\":\"payload\"}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("is_null payload requires a key field");
+    assert!(
+        err.to_string()
+            .contains("is_null requires only a key field"),
+        "expected is_null key error, got {err}"
+    );
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_has_id_applies_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'keep', '[1.00,0.0]'), \
+                 (2, 'drop', '[1.01,0.0]'), \
+                 (3, 'keep', '[1.02,0.0]'), \
+                 (4, 'drop', '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"has_id\":[3,1]}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact has_id filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(3));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_has_id_rejects_key_field() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"must\":[{\"key\":\"id\",\"has_id\":[1]}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("has_id must not include key");
+    assert!(
+        err.to_string().contains("has_id must not include a key"),
+        "expected has_id key error, got {err}"
+    );
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_qdrant_values_count_applies_to_exact_results() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, comments JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, CAST('[\"good\",\"ok\"]' AS JSONB), '[1.00,0.0]'), \
+                 (2, CAST('[\"good\",\"ok\",\"again\"]' AS JSONB), '[1.01,0.0]'), \
+                 (3, CAST('\"single\"' AS JSONB), '[1.02,0.0]'), \
+                 (4, CAST('null' AS JSONB), '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    4, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":[{\"key\":\"comments\",\"values_count\":{\"gt\":1,\"lte\":3}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids exact values_count filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values[0], Value::BigInt(1));
+            assert_eq!(rows[1].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_ids_json_options_filter_values_count_rejects_non_integer_bound() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, comments JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES (1, CAST('[\"ok\"]' AS JSONB), '[1.0,0.0]')",
+        )
+        .expect("setup");
+
+    let err = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"must\":[{\"key\":\"comments\",\"values_count\":{\"gt\":1.5}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect_err("values_count bound must be an integer");
+    assert!(
+        err.to_string()
+            .contains("values_count bound \"gt\" must be a non-negative integer"),
+        "expected values_count integer-bound error, got {err}"
+    );
+}
+
+#[test]
 fn vector_top_k_ids_json_options_filter_range_rejects_non_numeric_column() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -3330,6 +4758,53 @@ fn vector_top_k_ids_qdrant_filter_hnsw_with_btree_prefilter_match_clauses() {
 }
 
 #[test]
+fn vector_top_k_ids_hnsw_prefilter_keeps_non_indexed_should_matches() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, category TEXT, bucket INT, v VECTOR(2)); \
+             CREATE INDEX idx_v_l2 ON items USING hnsw (v); \
+             CREATE INDEX idx_items_category ON items (category); \
+             INSERT INTO items VALUES \
+                 (1, 'news', 1, '[1.00,0.0]'), \
+                 (2, 'news', 7, '[1.01,0.0]'), \
+                 (3, 'news', 3, '[1.02,0.0]'), \
+                 (4, 'other', 7, '[1.03,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT item_id \
+             FROM vector_top_k_ids( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    2, \
+                    'l2', \
+                    2, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"filter\":{\"must\":[{\"key\":\"category\",\"match\":{\"value\":\"news\"}}],\"should\":[{\"key\":\"bucket\",\"range\":{\"gte\":5}}]}}'::jsonb \
+                ) AS seeds(item_id)",
+        )
+        .expect("vector_top_k_ids hnsw filter with mixed-index should");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::BigInt(2));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
 fn vector_top_k_hits_returns_distance_score_and_payload_in_exact_mode() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -3416,6 +4891,232 @@ fn vector_top_k_hits_returns_distance_score_and_payload_in_exact_mode() {
 }
 
 #[test]
+fn vector_top_k_hits_with_payload_option_controls_payload_output() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, source TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', 'web', '[1.0,0.0]'), \
+                 (2, 'sports', 'api', '[2.0,0.0]')",
+        )
+        .expect("setup");
+
+    let without_payload = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"with_payload\":false}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits without payload");
+
+    match without_payload.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let Value::Jsonb(hit) = &rows[0].values[0] else {
+                panic!("expected jsonb hit");
+            };
+            assert!(hit.get("payload").is_none());
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let selected_payload = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"with_payload\":[\"source\"]}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits selected payload");
+
+    match selected_payload.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let Value::Jsonb(hit) = &rows[0].values[0] else {
+                panic!("expected jsonb hit");
+            };
+            let payload = hit
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .expect("payload object");
+            assert_eq!(payload.len(), 1);
+            assert_eq!(
+                payload.get("source").and_then(serde_json::Value::as_str),
+                Some("web")
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_hits_with_payload_object_include_and_exclude_are_supported() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, source TEXT, bucket INT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', 'web', 7, '[1.0,0.0]'), \
+                 (2, 'sports', 'api', 9, '[2.0,0.0]')",
+        )
+        .expect("setup");
+
+    let include_results = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"with_payload\":{\"include\":[\"tag\",\"bucket\"]}}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits payload include object");
+
+    match include_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let Value::Jsonb(hit) = &rows[0].values[0] else {
+                panic!("expected jsonb hit");
+            };
+            let payload = hit
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .expect("payload object");
+            assert_eq!(payload.len(), 2);
+            assert!(payload.contains_key("tag"));
+            assert!(payload.contains_key("bucket"));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    let exclude_results = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"with_payload\":{\"exclude\":[\"source\"]}}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits payload exclude object");
+
+    match exclude_results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let Value::Jsonb(hit) = &rows[0].values[0] else {
+                panic!("expected jsonb hit");
+            };
+            let payload = hit
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .expect("payload object");
+            assert!(payload.contains_key("tag"));
+            assert!(payload.contains_key("bucket"));
+            assert!(!payload.contains_key("source"));
+            assert!(!payload.contains_key("v"));
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_hits_with_vector_option_includes_vector_output() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', '[1.0,0.0]'), \
+                 (2, 'sports', '[2.0,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    1, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"with_payload\":false,\"with_vector\":true}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits with vector output");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            let Value::Jsonb(hit) = &rows[0].values[0] else {
+                panic!("expected jsonb hit");
+            };
+            assert!(hit.get("payload").is_none());
+            assert_eq!(
+                hit.get("vector").and_then(serde_json::Value::as_array),
+                Some(&vec![
+                    serde_json::Value::from(1.0),
+                    serde_json::Value::from(0.0)
+                ])
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
 fn vector_top_k_hits_filter_qdrant_must_widens_hnsw_search() {
     let engine = EngineBuilder::for_testing().build().unwrap();
     let (session, _) = engine.startup(startup_params()).expect("startup");
@@ -3472,6 +5173,62 @@ fn vector_top_k_hits_filter_qdrant_must_widens_hnsw_search() {
                 })
                 .collect();
             assert_eq!(ids, vec![4, 5]);
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+#[test]
+fn vector_top_k_hits_filter_qdrant_mixed_shorthand_and_match_text() {
+    let engine = EngineBuilder::for_testing().build().unwrap();
+    let (session, _) = engine.startup(startup_params()).expect("startup");
+
+    engine
+        .execute_sql(
+            &session,
+            "CREATE TABLE items (id INT, tag TEXT, payload JSONB, v VECTOR(2)); \
+             INSERT INTO items VALUES \
+                 (1, 'news', '{\"notes\":[\"Vector filters are ready\"]}', '[1.0,0.0]'), \
+                 (2, 'news', '{\"notes\":[\"other\"]}', '[1.1,0.0]'), \
+                 (3, 'sports', '{\"notes\":[\"vector filters\"]}', '[1.2,0.0]'), \
+                 (4, 'news', '{\"notes\":[\"VECTOR FILTERS\"]}', '[3.0,0.0]')",
+        )
+        .expect("setup");
+
+    let results = engine
+        .execute_sql(
+            &session,
+            "SELECT hit \
+             FROM vector_top_k_hits( \
+                    'items', \
+                    'v', \
+                    '[1.0,0.0]', \
+                    3, \
+                    'l2', \
+                    64, \
+                    10.0, \
+                    false, \
+                    -10.0, \
+                    '{\"exact\":true,\"filter\":{\"must\":{\"key\":\"payload.notes[]\",\"match\":{\"text\":\"vector filters\"}},\"tag\":\"news\"}}'::jsonb \
+                ) AS hits(hit)",
+        )
+        .expect("vector_top_k_hits mixed qdrant filter");
+
+    match results.last().unwrap() {
+        StatementResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            let ids: Vec<i64> = rows
+                .iter()
+                .map(|row| {
+                    let Value::Jsonb(hit) = &row.values[0] else {
+                        panic!("expected jsonb hit");
+                    };
+                    hit.get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert_eq!(ids, vec![1, 4]);
         }
         other => panic!("expected Query, got {other:?}"),
     }
