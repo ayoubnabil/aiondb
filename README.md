@@ -23,9 +23,9 @@ It keeps tables as the source of truth, exposes a PostgreSQL wire surface for
 existing tools, and adds graph and vector capabilities in the same engine and
 catalog.
 
-Status: **v0.2 graph update**. AionDB is intended for evaluation, local
-experiments, driver compatibility work, benchmarks, and architecture review.
-It is not yet a production replacement for mature database systems.
+Status: **v0.3 vector update**. AionDB now brings PostgreSQL-facing SQL,
+graph relationships, pgvector-style vector types, HNSW, IVF-flat, and
+Qdrant-style filtered retrieval into one Rust engine.
 
 ## What It Provides
 
@@ -33,7 +33,9 @@ It is not yet a production replacement for mature database systems.
 - Embedded Rust API for in-process use.
 - SQL-first relational model.
 - Graph node and edge labels over ordinary tables.
-- Fixed-dimension vector columns, distance functions, and HNSW index DDL.
+- pgvector-style vector, halfvec, sparsevec, and bit helper coverage.
+- HNSW and IVF-flat vector index paths.
+- Qdrant-style filtered vector helper options for metadata-aware retrieval.
 - Local benchmark and compatibility harnesses.
 
 ## Quick Start
@@ -127,7 +129,8 @@ Start here:
 - [Installation](docs/content/documentation/start/installation.md)
 - [Tutorial](docs/content/documentation/start/tutorial.md)
 - [Core Concepts](docs/content/documentation/learn/core-concepts.md)
-- [Limitations](docs/content/documentation/evaluate/limitations.md)
+- [What's New in v0.3](docs/content/documentation/project/whats-new-v0-3.md)
+- [v0.3 Vector Performance](docs/content/documentation/evaluate/v0-3-vector-performance.md)
 - [Benchmarks](docs/content/documentation/evaluate/benchmarks.md)
 
 Build the documentation site locally:
@@ -139,7 +142,7 @@ python3 docs/build.py --serve
 
 ## Operations Surface
 
-The v0.2 local operations surface includes:
+The v0.3 local operations surface includes:
 
 - `GET /livez`, `GET /healthz`, `GET /readyz`, `GET /metrics`, and `GET /info`
 - `aiondb doctor --data-dir <path>`
