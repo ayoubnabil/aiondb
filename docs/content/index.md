@@ -9,11 +9,11 @@ order: 0
 <div class="hero-copy">
 <p class="hero-kicker">PostgreSQL wire / ORM-compatible / SQL + graph + vector</p>
 <h1>AionDB</h1>
-<p class="lede">PostgreSQL tooling for applications that need relational records, graph relationships, and vector search in one Rust engine.</p>
+<p class="lede">AionDB v0.3 brings pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, graph relationships, and relational records into one Rust engine.</p>
 <p class="hero-actions">
-  <a class="button" href="/documentation/">Read the docs</a>
+  <a class="button" href="/documentation/project/whats-new-v0-3.html">v0.3 vector update</a>
+  <a class="button secondary" href="/documentation/evaluate/v0-3-vector-performance.html">Vector benchmarks</a>
   <a class="button secondary" href="/presentation.html">Project overview</a>
-  <a class="button secondary" href="/multimodal-database.html">Multimodal database</a>
 </p>
 </div>
 
@@ -32,6 +32,17 @@ order: 0
 <span class="tok-key">LIMIT</span> 5;</code></pre>
 <h2>Normal app stack.</h2>
 <p>pgwire, ORMs, migrations, psql, pgAdmin.</p>
+</div>
+</div>
+
+<div class="home-section">
+<p class="section-kicker">&gt;&gt; v0.3 vector update</p>
+<h2>Vector search is now a first-class AionDB surface.</h2>
+<div class="feature-grid">
+<div class="feature-card"><h3>HNSW</h3><p>Raw vector search reaches 0.996 recall@10 in the default v0.3 vector benchmark.</p></div>
+<div class="feature-card"><h3>HNSW PQ</h3><p>Product-quantized search keeps 0.994 recall@10 while exercising compressed candidate search and exact rescoring.</p></div>
+<div class="feature-card"><h3>IVF-flat</h3><p>The default dataset builds in about 416-418 ms, with nprobe=32 reaching 0.863 recall@10 around 2.57 ms mean latency.</p></div>
+<div class="feature-card"><h3>Filtered retrieval</h3><p>Qdrant-style JSON filters bring tenant, permission, metadata, payload, and nested JSONB controls into vector helper calls.</p></div>
 </div>
 </div>
 
@@ -76,20 +87,9 @@ order: 0
 
 <div class="home-section">
 <div class="performance-position">
-<p class="section-kicker">&gt;&gt; Measured, not universal claims</p>
+<p class="section-kicker">&gt;&gt; Benchmarked product direction</p>
 <h2>Performance position</h2>
-<p>AionDB is not presented as universally faster than mature single-purpose systems. The useful claim is narrower: it already performs competitively on many measured SQL workloads, is often materially faster than SurrealDB on the measured SQL, graph, and hybrid workloads in the public harnesses, and publishes the raw benchmark snapshots used by the docs.</p>
-<p>See <a href="/documentation/evaluate/benchmarks.html">Benchmarks</a> and <a href="/documentation/evaluate/benchmark-results.html">Benchmark Results</a> for exact measured cases.</p>
-</div>
-</div>
-
-<div class="home-section">
-<p class="section-kicker">&gt;&gt; Alpha boundaries</p>
-<h2>What AionDB does not claim.</h2>
-<div class="claim-grid">
-<div class="claim-card"><h3>PostgreSQL replacement</h3><p>No. PostgreSQL remains the compatibility and operational maturity reference.</p></div>
-<div class="claim-card"><h3>Production-ready cluster</h3><p>No. Distributed and HA modules are internal or experimental in v0.1.</p></div>
-<div class="claim-card"><h3>Every ORM works</h3><p>No. Many harnesses pass now, but every app still needs feature-by-feature validation.</p></div>
-<div class="claim-card"><h3>Best on every benchmark</h3><p>No. The project publishes reproducible benchmark snapshots instead of universal speed claims.</p></div>
+<p>v0.3 makes vector performance visible: high-recall HNSW, fast-building IVF-flat, exact recall reference, and published commands. The benchmark path sits beside the existing SQL, graph, and hybrid harnesses so product claims stay tied to reproducible runs.</p>
+<p>See <a href="/documentation/evaluate/v0-3-vector-performance.html">v0.3 Vector Performance</a>, <a href="/documentation/evaluate/benchmarks.html">Benchmarks</a>, and <a href="/documentation/evaluate/benchmark-results.html">Benchmark Results</a>.</p>
 </div>
 </div>

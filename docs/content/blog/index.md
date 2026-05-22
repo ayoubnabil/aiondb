@@ -12,6 +12,14 @@ order: 3
 </div>
 
 <div class="blog-list">
+<a class="blog-card-link" href="/blog/aiondb-v0-3-vector-update.html">
+  <article class="blog-card">
+    <p class="blog-card-kicker">v0.3 vector update</p>
+    <h2>AionDB v0.3 turns vector search into a first-class engine feature</h2>
+    <p>HNSW, IVF-flat, pgvector-style SQL, Qdrant-style filters, and reproducible vector benchmarks now sit inside the same SQL, graph, and vector engine.</p>
+    <span>Read the v0.3 vector update</span>
+  </article>
+</a>
 <a class="blog-card-link" href="/blog/why-aiondb-beats-surrealdb-by-113x-on-graph-scans.html">
   <article class="blog-card">
     <p class="blog-card-kicker">Graph benchmark / SurrealDB comparison</p>

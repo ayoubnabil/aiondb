@@ -64,7 +64,7 @@ The benchmark comes from the AionDB `surreal-suite` harness, which mirrors publi
 - SurrealDB uses WebSocket JSON-RPC.
 - The benchmark runs on durable local storage.
 
-The full benchmark documentation is published in [Benchmark Results](/documentation/evaluate/benchmark-results.html) and [v0.2 Performance Snapshot](/documentation/evaluate/v0-2-performance.html).
+The full benchmark documentation is published in [Benchmark Results](/documentation/evaluate/benchmark-results.html), and the current vector release is covered in [v0.3 Vector Performance](/documentation/evaluate/v0-3-vector-performance.html).
 
 ## Why graph scans matter for RAG
 

@@ -5,12 +5,10 @@ order: 70
 
 # Benchmarks
 
-AionDB includes local benchmark harnesses under `benchmarks/`. They are intended to make performance claims reproducible and tied to a specific commit, dataset, and machine.
+AionDB includes local benchmark harnesses under `benchmarks/`. They make performance work reproducible and tied to a specific commit, dataset, and machine.
 
-The benchmark docs are deliberately conservative. A fast number without the command, dataset size, durability mode, hardware, and raw output should not be treated as a product claim.
-
-For the short product-facing read on the current v0.2 snapshots, use
-[v0.2 Performance Snapshot](/documentation/evaluate/v0-2-performance.html).
+For the v0.3 vector update, start with
+[v0.3 Vector Performance](/documentation/evaluate/v0-3-vector-performance.html).
 
 ## Available harnesses
 
@@ -20,6 +18,7 @@ benchmarks/run.sh --help
 
 Current benchmark families:
 
+- `vector-compare` for HNSW raw, HNSW PQ, IVF-flat, and brute-force vector search recall/latency.
 - `pgbench` for OLTP microbenchmarks.
 - `surreal-suite` for SurrealDB 3 article-style CRUD, scan, graph, index, full-text, and vector tests against SurrealDB WS, AionDB pgwire, and PostgreSQL with pgvector/AGE.
 - `ultra-compare` for a long composite run that stitches together `neo4j-graph`, `surreal-graph`, and `surreal-suite` under one run id and one consolidated report.
@@ -27,7 +26,7 @@ Current benchmark families:
 - `tpcds` for analytical SQL workloads.
 - `job` for join-heavy workloads based on the Join Order Benchmark.
 
-The harnesses are tools, not claims. A benchmark family being present means the repository has a path to run it; it does not mean every query shape is optimized or that AionDB should be expected to win.
+The v0.3 vector harness is the headline benchmark for the vector release. It reports build time, recall@k, mean latency, p50, p95, and p99 in one self-contained run.
 
 ## Basic usage
 
@@ -47,6 +46,13 @@ Run only PostgreSQL:
 
 ```bash
 BENCH_ENGINES=pg benchmarks/run.sh pgbench
+```
+
+Run the v0.3 vector comparison:
+
+```bash
+cd benchmarks/vector-compare
+cargo run --release
 ```
 
 Run the SurrealDB 3 article-style comparison:
@@ -107,6 +113,7 @@ The heavier benchmarks may require external tools or datasets. Read the output b
 | Write-path comparison | `pgbench` with disclosed WAL policy |
 | SurrealDB 3 article-style comparison | `surreal-suite` with raw output retained |
 | Long AionDB / Neo4j / SurrealDB comparison | `ultra-compare` with a consolidated report |
+| Vector ANN build/search | `vector-compare` |
 | Analytical scans | TPC-H or TPC-DS subset |
 | Join optimizer pressure | Join Order Benchmark |
 | Hybrid graph/vector claim | custom schema with published SQL |

@@ -7,7 +7,7 @@ order: 61
 
 AionDB starts an HTTP observability server for local health and metrics.
 
-> New in v0.2: graph observability is materially richer, including graph summaries, clause and pattern detail, drift signals, and versioned `EXPLAIN JSON` payloads. See [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+> New in v0.3: AionDB now presents SQL, graph, and vector retrieval as one engine story, backed by pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, and reproducible vector benchmarks. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 ## Defaults
 

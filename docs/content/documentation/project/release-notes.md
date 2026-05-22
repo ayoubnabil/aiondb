@@ -5,7 +5,43 @@ order: 90
 
 # Release Notes
 
-> New in v0.2: for the product-facing delta instead of the raw alpha release framing, start with [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+> New in v0.3: the vector update is live. Start with [What's New in v0.3](/documentation/project/whats-new-v0-3.html) and [v0.3 Vector Performance](/documentation/evaluate/v0-3-vector-performance.html).
+
+## v0.3 vector update
+
+AionDB v0.3 turns vector search into a first-class product surface. The release combines pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, PostgreSQL ecosystem compatibility work, and a reproducible vector benchmark harness.
+
+### Highlights
+
+- pgvector-facing SQL for vector, halfvec, sparsevec, bit helpers, casts, and distance functions.
+- HNSW raw and HNSW product-quantized search paths.
+- IVF-flat indexing with pgvector-style DDL, configurable probe counts, parallel work, and fast builds.
+- Qdrant-style JSON filters for metadata-aware vector retrieval.
+- A benchmark harness that reports build time, recall@k, mean latency, p50, p95, and p99.
+- Stronger PostgreSQL ecosystem compatibility for ORMs, migrations, catalog lookup, and generated SQL.
+
+### Vector benchmark snapshot
+
+Default run:
+
+```bash
+cd benchmarks/vector-compare
+cargo run --release
+```
+
+| Backend | Build ms | Recall@10 | Mean us | p50 us | p95 us | p99 us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AionDB HNSW raw | 36571 | 0.996 | 9423 | 8790 | 15674 | 17233 |
+| AionDB HNSW PQ | 74742 | 0.994 | 13072 | 12355 | 17659 | 18471 |
+| AionDB IVF-flat nprobe=8 | 418 | 0.466 | 809 | 827 | 1223 | 1766 |
+| AionDB IVF-flat nprobe=32 | 416 | 0.863 | 2572 | 2474 | 3603 | 3977 |
+| Brute-force exact | 0 | 1.000 | 9930 | 9520 | 14293 | 18991 |
+
+The release message is now simple: AionDB gives builders SQL, graph, and vector retrieval in one local Rust engine.
+
+## v0.2 graph and observability update
+
+v0.2 strengthened graph observability, `EXPLAIN (FORMAT JSON)`, storage/WAL documentation, and Neo4j-oriented compatibility evidence. The full product-facing delta is in [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
 
 ## v0.1 alpha
 

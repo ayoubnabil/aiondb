@@ -7,7 +7,7 @@ order: 62
 
 AionDB exposes a structured `EXPLAIN` payload for graph and hybrid queries.
 
-> New in v0.2: `EXPLAIN (FORMAT JSON)` and `EXPLAIN (ANALYZE, FORMAT JSON)` are now explicit supported surfaces with a versioned contract for graph tooling. See [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+> New in v0.3: vector search joins the same product story as SQL and graph, with pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, and benchmarked recall/latency. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 Supported forms:
 

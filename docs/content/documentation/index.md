@@ -7,7 +7,7 @@ order: 3
 
 AionDB is a PostgreSQL-wire database engine that keeps relational tables, graph labels, and vector search in one local system. These pages focus on using and evaluating the product. Implementation notes live separately.
 
-> New in v0.2: graph observability is now much stronger, `EXPLAIN (FORMAT JSON)` is a supported versioned surface, and Neo4j-oriented compatibility now has real grouped smoke evidence. Start with [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+> New in v0.3: AionDB now ships the vector update: pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered helpers, PostgreSQL ecosystem compatibility work, and a reproducible vector benchmark harness. Start with [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 Crate-by-crate implementation notes live in [Advanced Specification](/specification-avancee/). They are useful for contributors, but they are not the recommended starting point for users evaluating the database.
 
@@ -21,19 +21,17 @@ Crate-by-crate implementation notes live in [Advanced Specification](/specificat
 | Test graph/vector features | [Graph and Vector](/documentation/query/graph-and-vector.html), [Graph Reference](/documentation/query/graph-reference.html), [Vector Reference](/documentation/query/vector-reference.html) |
 | Connect an app | [Interfaces](/documentation/connect/interfaces.html), [Client Drivers](/documentation/connect/client-drivers.html), [PostgreSQL Compatibility](/documentation/connect/postgresql-compatibility.html), [Ecosystem Integrations](/documentation/connect/ecosystem-integrations.html) |
 | Evaluate seriously | [Evaluation Checklist](/documentation/evaluate/evaluation-checklist.html), [Product Hardening Plan](/documentation/evaluate/product-hardening-plan.html), [Limitations](/documentation/evaluate/limitations.html), [Benchmarks](/documentation/evaluate/benchmarks.html) |
-| Review the v0.2 delta | [What's New in v0.2](/documentation/project/whats-new-v0-2.html), then [v0.2 Evidence](/documentation/evaluate/v0-2-evidence.html) |
+| Review the v0.3 vector update | [What's New in v0.3](/documentation/project/whats-new-v0-3.html), then [v0.3 Vector Performance](/documentation/evaluate/v0-3-vector-performance.html) |
 
-## Status model
+## v0.3 At A Glance
 
-AionDB v0.1 is an alpha. The documentation uses conservative language on purpose:
+v0.3 is the release where vector search becomes a major AionDB product surface:
 
-- examples are intended to be runnable;
-- unsupported behavior should be stated clearly;
-- benchmark claims need reproduction details;
-- PostgreSQL compatibility is feature-by-feature;
-- graph and vector planning are still evolving.
-
-If a page sounds too broad, prefer the narrower interpretation and validate with a small script.
+- HNSW raw reaches `0.996` recall@10 in the default vector benchmark.
+- HNSW PQ reaches `0.994` recall@10.
+- IVF-flat builds the default 50k-vector dataset in about `416-418 ms`.
+- IVF-flat with `nprobe=32` reaches `0.863` recall@10 at about `2.57 ms` mean query latency.
+- Qdrant-style JSON filters bring metadata-aware retrieval into the vector helper layer.
 
 ## Start
 
@@ -44,9 +42,9 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 
 ## Learn
 
-- [Core Concepts](/documentation/learn/core-concepts.html): the mental model behind tables, labels, vectors, catalog state, and alpha boundaries.
+- [Core Concepts](/documentation/learn/core-concepts.html): the mental model behind tables, labels, vectors, and catalog state.
 - [Architecture](/documentation/learn/architecture.html): how the server, engine, catalog, storage, and WAL fit together.
-- [Storage Format](/documentation/learn/storage-format.html) and [WAL Contract](/documentation/learn/wal-contract.html): the v0.2 storage and write-ahead-log contracts.
+- [Storage Format](/documentation/learn/storage-format.html) and [WAL Contract](/documentation/learn/wal-contract.html): the current storage and write-ahead-log contracts.
 - [Query Lifecycle](/documentation/learn/query-lifecycle.html): what happens between a client query and execution.
 - [Tradeoffs](/documentation/learn/tradeoffs.html): workloads where AionDB is a good fit, and workloads where it is not.
 
@@ -65,14 +63,13 @@ If a page sounds too broad, prefer the narrower interpretation and validate with
 
 ## Evaluate
 
-- [Benchmarks](/documentation/evaluate/benchmarks.html), [Benchmark Results](/documentation/evaluate/benchmark-results.html), [Benchmark Reproducibility](/documentation/evaluate/benchmark-reproducibility.html), and [Performance Tuning](/documentation/evaluate/performance-tuning.html): running fair local comparisons and reading visual result snapshots.
-- [v0.2 Evidence](/documentation/evaluate/v0-2-evidence.html): the storage, WAL, driver, type, and baseline benchmark evidence expected before broad v0.2 claims.
+- [v0.3 Vector Performance](/documentation/evaluate/v0-3-vector-performance.html), [Benchmarks](/documentation/evaluate/benchmarks.html), [Benchmark Results](/documentation/evaluate/benchmark-results.html), [Benchmark Reproducibility](/documentation/evaluate/benchmark-reproducibility.html), and [Performance Tuning](/documentation/evaluate/performance-tuning.html): running vector, graph, SQL, and hybrid performance checks.
 - [Testing](/documentation/evaluate/testing.html), [Evaluation Checklist](/documentation/evaluate/evaluation-checklist.html), [Product Hardening Plan](/documentation/evaluate/product-hardening-plan.html), and [Migration Guide](/documentation/evaluate/migration-guide.html): deciding whether a workload is ready to try.
 - [Limitations](/documentation/evaluate/limitations.html), [Error Reference](/documentation/evaluate/error-reference.html), [FAQ](/documentation/evaluate/faq.html), and [Glossary](/documentation/evaluate/glossary.html): boundaries and terminology.
 
 ## Project
 
-- [What's New in v0.2](/documentation/project/whats-new-v0-2.html), [Roadmap](/documentation/project/roadmap.html), [Roadmap to v1](/documentation/project/roadmap-v1.html), [Governance](/documentation/project/governance.html), [GTM Evidence](/documentation/project/gtm-evidence.html), [Release Notes](/documentation/project/release-notes.html), and [Release Process](/documentation/project/release-process.html): where the project is going, how decisions are made, what evidence supports claims, and how releases are described.
+- [What's New in v0.3](/documentation/project/whats-new-v0-3.html), [Roadmap](/documentation/project/roadmap.html), [Roadmap to v1](/documentation/project/roadmap-v1.html), [Governance](/documentation/project/governance.html), [GTM Evidence](/documentation/project/gtm-evidence.html), [Release Notes](/documentation/project/release-notes.html), and [Release Process](/documentation/project/release-process.html): where the product is going, how decisions are made, what evidence supports claims, and how releases are described.
 - [Contributing](/documentation/project/contributing.html): how to work on the codebase without starting from crate-level internals.
 
 ## Reading order for reviewers

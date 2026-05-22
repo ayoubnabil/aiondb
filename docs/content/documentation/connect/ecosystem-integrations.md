@@ -7,7 +7,7 @@ order: 56
 
 AionDB should feel like a PostgreSQL-facing database before it asks users to learn AionDB-specific features. The integration strategy is therefore pgwire first, then AionDB extensions for graph and vector workflows.
 
-> New in v0.2: Neo4j-oriented compatibility is now backed by grouped smoke evidence for Bolt (`neo4j-p0`), Query API HTTP (`neo4j-http-p1`), and Browser preflight (`neo4j-browser-p0`). See [What's New in v0.2](/documentation/project/whats-new-v0-2.html).
+> New in v0.3: the PostgreSQL ecosystem path now includes a stronger vector surface with pgvector-style SQL, catalog-facing vector helpers, and Qdrant-style filtered retrieval. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 ## Current Public Integrations
 
