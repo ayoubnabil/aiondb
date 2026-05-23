@@ -1,44 +1,128 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/theme/aiondb-logo-dark.png">
-    <img src="docs/theme/aiondb-logo-light.png" alt="AionDB logo" width="160">
+    <img src="docs/theme/aiondb-logo-light.png" alt="AionDB logo" width="170">
   </picture>
 </p>
 
 <h1 align="center">AionDB</h1>
 
 <p align="center">
-  PostgreSQL-compatible SQL, graph, and vector database written in Rust.
+  <strong>PostgreSQL-compatible SQL, vector search, and graph queries in one Rust database.</strong>
 </p>
 
 <p align="center">
   <a href="https://aiondb.xyz/">Website</a>
+  ·
+  <a href="docs/content/documentation/start/getting-started.md">Getting Started</a>
+  ·
+  <a href="docs/content/documentation/query/vector-reference.md">Vector Reference</a>
+  ·
+  <a href="docs/content/documentation/evaluate/benchmark-results.md">Benchmarks</a>
 </p>
 
-AionDB is a source-available database engine built around one practical idea:
-application data should not need to be split across a relational database, a
-graph database, and a vector store just to support modern workloads.
+<p align="center">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-database-orange">
+  <img alt="PostgreSQL wire" src="https://img.shields.io/badge/PostgreSQL-wire%20compatible-336791">
+  <img alt="Vector search" src="https://img.shields.io/badge/vector-HNSW%20%2B%20IVF-4f46e5">
+  <img alt="License" src="https://img.shields.io/badge/license-BSL%201.1-blue">
+</p>
 
-It keeps tables as the source of truth, exposes a PostgreSQL wire surface for
-existing tools, and adds graph and vector capabilities in the same engine and
-catalog.
+AionDB is built around a simple product thesis: modern applications should not
+have to split the same data across PostgreSQL, a vector database, a graph
+database, and a cache layer just to answer one intelligent query.
 
-Status: **v0.2 graph update**. AionDB is intended for evaluation, local
-experiments, driver compatibility work, benchmarks, and architecture review.
-It is not yet a production replacement for mature database systems.
+The engine keeps tables as the source of truth, exposes a PostgreSQL-compatible
+wire surface for existing tools, and adds vector and graph capabilities around
+the same catalog and execution pipeline.
 
-## What It Provides
+**Current release focus:** v0.3 vector update.
 
-- PostgreSQL wire server for existing drivers, tools, and ORMs.
-- Embedded Rust API for in-process use.
-- SQL-first relational model.
-- Graph node and edge labels over ordinary tables.
-- Fixed-dimension vector columns, distance functions, and HNSW index DDL.
-- Local benchmark and compatibility harnesses.
+**Current development focus:** v0.4 general optimization: planner quality,
+joins, graph execution, memory use, and large workload performance.
+
+## Why AionDB
+
+Most AI applications eventually need more than nearest-neighbor search:
+
+- filter documents by tenant, permissions, timestamps, or business state;
+- rank candidates by vector similarity;
+- traverse relationships between records;
+- keep the canonical data model queryable through SQL;
+- avoid syncing the same objects into three different systems.
+
+AionDB is designed for that shape.
+
+```sql
+CREATE TABLE documents (
+    id INT PRIMARY KEY,
+    tenant_id INT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    embedding VECTOR(768)
+);
+
+CREATE INDEX documents_embedding_hnsw
+ON documents USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, title
+FROM documents
+WHERE tenant_id = 42
+ORDER BY cosine_distance(embedding, $1) ASC
+LIMIT 10;
+```
+
+That query stays relational, filterable, indexable, and vector-aware. The
+application does not need a separate vector payload store just to keep metadata
+beside embeddings.
+
+## What You Get
+
+| Area | AionDB surface |
+| --- | --- |
+| SQL | Tables, predicates, joins, functions, transactions, indexes, and PostgreSQL-style catalogs |
+| PostgreSQL compatibility | PostgreSQL wire protocol, `psql`, common drivers, ORM-oriented compatibility work |
+| Vector search | `VECTOR(n)`, `HALFVEC(n)`, pgvector-compatible casts/functions, HNSW, IVF-flat syntax, filtered top-k helpers |
+| Hybrid search | SQL filters and vector ranking over the same rows |
+| Graph | Node labels and edge labels over ordinary tables, graph traversal paths, graph-oriented execution |
+| Operations | Health endpoints, metrics, doctor, upgrade, dump, restore, Docker Compose, reproducible benchmark harnesses |
+| Engine | Rust workspace, embedded API, storage engine, optimizer, executor, pgwire server, docs site |
+
+## Product Shape
+
+AionDB is not a vector-only system and it is not a graph database bolted beside
+SQL. It treats relational records, vector embeddings, and graph relationships as
+different access paths over the same application state.
+
+```sql
+CREATE TABLE docs (
+    id INT PRIMARY KEY,
+    title TEXT,
+    embedding VECTOR(3)
+);
+
+CREATE TABLE doc_links (
+    source_id INT NOT NULL,
+    target_id INT NOT NULL,
+    relation TEXT
+);
+
+CREATE NODE LABEL doc ON docs;
+CREATE EDGE LABEL related_doc ON doc_links SOURCE doc TARGET doc;
+
+SELECT id, title, l2_distance(embedding, '[1.0,0.0,0.0]') AS distance
+FROM docs
+ORDER BY distance ASC
+LIMIT 10;
+```
+
+The important part is not only syntax. The model lets one engine reason about
+structured filters, vector ranking, and relationships together.
 
 ## Quick Start
 
-Clone the repository, write a local `.env`, then start the prebuilt containers:
+Clone the repository, create a local environment file, then start AionDB and
+Studio with prebuilt images:
 
 ```bash
 git clone https://github.com/ayoubnabil/aiondb.git
@@ -47,14 +131,13 @@ cp quickstart.env .env
 docker compose --profile studio up
 ```
 
-Compose pulls prebuilt images from GitHub Container Registry by default, so this
-path does not build AionDB locally. Every push to `main` publishes
-`ghcr.io/ayoubnabil/aiondb:main` and
-`ghcr.io/ayoubnabil/aiondb-studio:main`; use `docker-compose.build.yml` only
-when changing Dockerfiles or testing unpublished images. After the first pull,
-startup should only be container creation and health checks.
+Open Studio:
 
-Open Studio at `http://127.0.0.1:8082`, or connect with `psql`:
+```text
+http://127.0.0.1:8082
+```
+
+Or connect with `psql`:
 
 ```bash
 source .env
@@ -62,7 +145,7 @@ PGPASSWORD="$AIONDB_BOOTSTRAP_PASSWORD" \
 psql "host=127.0.0.1 port=${AIONDB_PGWIRE_PORT:-5432} dbname=default user=$AIONDB_BOOTSTRAP_USER sslmode=disable"
 ```
 
-Run a quick SQL smoke:
+Run a quick smoke test:
 
 ```sql
 CREATE TABLE tickets (
@@ -80,44 +163,75 @@ FROM tickets
 WHERE priority = 'high';
 ```
 
-Build the release binary directly when developing AionDB itself:
+Compose pulls prebuilt images from GitHub Container Registry by default:
+
+- `ghcr.io/ayoubnabil/aiondb:main`
+- `ghcr.io/ayoubnabil/aiondb-studio:main`
+
+Use the local Docker build file only when changing Dockerfiles or testing
+unpublished images:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml --profile studio up --build
+```
+
+For engine development, build the release binary directly:
 
 ```bash
 cargo build --release -p aiondb-server --bin aiondb
 target/release/aiondb --version
 ```
 
-Build the local container images only when you need to test Dockerfile changes:
+## Vector Search
 
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml --profile studio up --build
-```
-
-## Product Shape
-
-AionDB models graph and vector data over ordinary tables:
+AionDB accepts pgvector-style extension setup and vector DDL:
 
 ```sql
-CREATE TABLE docs (
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE embeddings (
     id INT PRIMARY KEY,
-    title TEXT,
-    embedding VECTOR(2)
+    source TEXT,
+    vec VECTOR(4)
 );
 
-CREATE TABLE doc_links (
-    source_id INT NOT NULL,
-    target_id INT NOT NULL,
-    relation TEXT
-);
+CREATE INDEX embeddings_vec_hnsw
+ON embeddings USING hnsw (vec vector_l2_ops);
 
-CREATE NODE LABEL doc ON docs;
-CREATE EDGE LABEL related_doc ON doc_links SOURCE doc TARGET doc;
-
-SELECT id, title, l2_distance(embedding, '[1.0,0.0]') AS dist
-FROM docs
-ORDER BY dist ASC
-LIMIT 10;
+SELECT id, source
+FROM embeddings
+ORDER BY vec <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
 ```
+
+The vector surface includes:
+
+- fixed-dimension `VECTOR(n)` columns;
+- pgvector-compatible casts and helper functions;
+- HNSW and IVF-flat index syntax;
+- L2, cosine, inner-product, and L1/manhattan distance support;
+- filtered vector search helpers with Qdrant-style JSON filter options;
+- query planner work for choosing between vector-first and filter-first plans.
+
+Read the [Vector Reference](docs/content/documentation/query/vector-reference.md)
+for exact syntax and compatibility details.
+
+## Benchmarks
+
+AionDB keeps benchmark harnesses in the repository so performance claims can be
+tied to a command, commit, dataset, and machine.
+
+```bash
+benchmarks/run.sh --help
+benchmarks/run.sh surreal-suite
+```
+
+The benchmark docs include SQL, graph, vector, full-text, and hybrid workloads,
+plus generated result snapshots:
+
+- [Benchmarks](docs/content/documentation/evaluate/benchmarks.md)
+- [Benchmark Results](docs/content/documentation/evaluate/benchmark-results.md)
+- [Benchmark Reproducibility](docs/content/documentation/evaluate/benchmark-reproducibility.md)
 
 ## Documentation
 
@@ -126,9 +240,13 @@ Start here:
 - [Getting Started](docs/content/documentation/start/getting-started.md)
 - [Installation](docs/content/documentation/start/installation.md)
 - [Tutorial](docs/content/documentation/start/tutorial.md)
+- [Example Workloads](docs/content/documentation/start/example-workloads.md)
 - [Core Concepts](docs/content/documentation/learn/core-concepts.md)
-- [Limitations](docs/content/documentation/evaluate/limitations.md)
-- [Benchmarks](docs/content/documentation/evaluate/benchmarks.md)
+- [Architecture](docs/content/documentation/learn/architecture.md)
+- [SQL Reference](docs/content/documentation/query/sql.md)
+- [Graph and Vector](docs/content/documentation/query/graph-and-vector.md)
+- [Vector Reference](docs/content/documentation/query/vector-reference.md)
+- [Operations](docs/content/documentation/manage/operations.md)
 
 Build the documentation site locally:
 
@@ -139,15 +257,33 @@ python3 docs/build.py --serve
 
 ## Operations Surface
 
-The v0.2 local operations surface includes:
+The local operations surface includes:
 
-- `GET /livez`, `GET /healthz`, `GET /readyz`, `GET /metrics`, and `GET /info`
-- `aiondb doctor --data-dir <path>`
-- `aiondb upgrade --data-dir <path>`
-- `aiondb dump` and `aiondb restore` (require `AIONDB_BOOTSTRAP_USER` and
-  `AIONDB_BOOTSTRAP_PASSWORD` env vars; output and input paths are relative to
-  `./backups/` in the current working directory, not to `--data-dir`)
-- `make product-smoke`
+- `GET /livez`, `GET /healthz`, `GET /readyz`, `GET /metrics`, and `GET /info`;
+- `aiondb doctor --data-dir <path>`;
+- `aiondb upgrade --data-dir <path>`;
+- `aiondb dump` and `aiondb restore`;
+- `make product-smoke`;
+- Docker Compose profiles for server and Studio;
+- benchmark harnesses under `benchmarks/`.
+
+`aiondb dump` and `aiondb restore` require `AIONDB_BOOTSTRAP_USER` and
+`AIONDB_BOOTSTRAP_PASSWORD`. Backup paths are relative to `./backups/` in the
+current working directory.
+
+## Repository Layout
+
+```text
+crates/
+  aiondb-server          pgwire server and HTTP control surface
+  aiondb-optimizer       logical and physical planning
+  aiondb-executor        query execution
+  aiondb-storage-engine  storage, HNSW, IVF, and index internals
+  aiondb-vector          vector planner/runtime integration
+  aiondb-graph           graph data structures and path support
+docs/                    documentation site
+benchmarks/              reproducible benchmark harnesses
+```
 
 ## License
 
