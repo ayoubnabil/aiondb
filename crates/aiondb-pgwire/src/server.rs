@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex, MutexGuard,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use aiondb_config::{
     pgwire::{DEFAULT_PGWIRE_BIND_ADDRESS, DEFAULT_PGWIRE_PORT},
@@ -40,7 +40,6 @@ use crate::tls::{self, NegotiatedStream, TlsConfig};
 /// Default timeout when waiting for active connections during shutdown.
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_READ_BUFFER_BYTES: usize = 16 * 1024;
-static FALLBACK_CANCEL_SECRET_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 type CancelRegistryMap = HashMap<(u32, u32), SessionHandle>;
 type ConnectionSlots = HashMap<String, u32>;
@@ -100,41 +99,24 @@ fn checked_deadline_after(timeout: Duration, timeout_name: &str) -> Option<tokio
     }
 }
 
-/// Generate a cryptographically random cancel secret key.
+/// Generate a cryptographically random cancel-secret key.
 ///
-/// When `fail_on_weak_rng` is `true`, the function returns an error instead of
-/// falling back to the predictable counter+time XOR derivation. Production
-/// deployments should set this flag so that a broken RNG is surfaced
-fn generate_cancel_secret(fail_on_weak_rng: bool) -> Result<u32, DbError> {
+/// V2-08 : the previous implementation kept a SHA-256(counter ‖ nanos ‖
+/// pid ‖ tid) fallback when `getrandom` failed and the operator had set
+/// `fail_on_weak_rng=false`. Every input to that derivation is observable
+/// by a co-resident attacker, so the fallback let an attacker forge
+/// `CancelRequest` packets against other sessions. The fallback is now
+/// removed entirely: any RNG failure surfaces as an error and the
+/// session is dropped before we hand out a predictable secret. The
+/// `fail_on_weak_rng` config flag is retained for source compatibility
+/// but its value no longer changes behaviour.
+fn generate_cancel_secret(_fail_on_weak_rng: bool) -> Result<u32, DbError> {
     let mut buf = [0u8; 4];
     match fill_cancel_secret_bytes(&mut buf) {
         Ok(()) => Ok(u32::from_ne_bytes(buf)),
-        Err(error) => {
-            if fail_on_weak_rng {
-                return Err(DbError::internal(format!(
-                    "getrandom failed and fail_on_weak_rng is enabled — \
-                     refusing to generate a predictable cancel secret: {error}"
-                )));
-            }
-            warn!(%error, "failed to generate cancel secret securely; using degraded fallback secret");
-            // Mix multiple entropy sources through SHA-256 to make the
-            // fallback secret harder to predict than a plain counter XOR.
-            use sha2::{Digest, Sha256};
-            let counter = FALLBACK_CANCEL_SECRET_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0u128, |duration| duration.as_nanos());
-            let mut hasher = Sha256::new();
-            hasher.update(counter.to_le_bytes());
-            hasher.update(nanos.to_le_bytes());
-            hasher.update(std::process::id().to_le_bytes());
-            // ThreadId has no stable numeric accessor; use its Debug repr
-            // as an additional entropy source.
-            let tid = format!("{:?}", std::thread::current().id());
-            hasher.update(tid.as_bytes());
-            let hash = hasher.finalize();
-            Ok(u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]))
-        }
+        Err(error) => Err(DbError::internal(format!(
+            "getrandom failed — refusing to generate a predictable cancel secret: {error}"
+        ))),
     }
 }
 

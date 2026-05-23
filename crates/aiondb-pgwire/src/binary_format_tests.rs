@@ -625,6 +625,21 @@ fn decode_timetz_wrong_length() {
     assert!(err.to_string().contains("expected 12 bytes for TIMETZ"));
 }
 
+#[test]
+fn v2_10_decode_timetz_zone_west_i32_min_does_not_panic() {
+    // V2-10 : before the fix, `-i32::MIN` panicked in debug builds and
+    // silently wrapped in release. Both branches now return a clean
+    // protocol error.
+    let mut payload = [0u8; 12];
+    payload[8..12].copy_from_slice(&i32::MIN.to_be_bytes());
+    let err = decode_binary_param(1, &payload, &DataType::TimeTz).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid TIMETZ") && msg.contains("out of range"),
+        "expected a clean out-of-range error, got: {msg}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // New types: NUMERIC
 // -----------------------------------------------------------------------
