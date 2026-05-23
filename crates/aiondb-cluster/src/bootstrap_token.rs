@@ -11,6 +11,23 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use subtle::ConstantTimeEq;
+
+/// V2-03 : compare two byte slices without short-circuiting. The
+/// length is folded into the accumulator so neither the matching
+/// prefix length nor the stored secret length leaks through timing.
+fn ct_eq_bytes(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let len_eq = (left.len() as u64).ct_eq(&(right.len() as u64));
+    let mut byte_diff: u8 = 0;
+    for i in 0..max_len {
+        let l = *left.get(i).unwrap_or(&0);
+        let r = *right.get(i).unwrap_or(&0);
+        byte_diff |= l ^ r;
+    }
+    bool::from(byte_diff.ct_eq(&0) & len_eq)
+}
+
 #[derive(Clone, Debug)]
 pub struct BootstrapToken {
     pub value: String,
@@ -72,9 +89,21 @@ impl BootstrapTokenStore {
         from_ip: Option<IpAddr>,
     ) -> Result<BootstrapToken, RedemptionError> {
         let mut g = self.inner.lock().unwrap();
-        let Some(t) = g.get_mut(value) else {
+        // V2-03 : the previous `BTreeMap::get_mut(value)` lookup did
+        // byte-by-byte ordering compare and short-circuited at the
+        // first byte mismatch — leaking each stored token octet by
+        // octet through RPC timing. Scan every entry linearly with a
+        // constant-time byte compare so misses and partial matches
+        // are indistinguishable from a clean miss.
+        let candidate = value.as_bytes();
+        let matched_key = g
+            .keys()
+            .find(|stored| ct_eq_bytes(stored.as_bytes(), candidate))
+            .cloned();
+        let Some(key) = matched_key else {
             return Err(RedemptionError::Unknown);
         };
+        let t = g.get_mut(&key).expect("matched key must exist");
         if t.is_consumed() {
             return Err(RedemptionError::AlreadyConsumed);
         }
@@ -184,5 +213,40 @@ mod tests {
             s.redeem("kill", "n", None).unwrap_err(),
             RedemptionError::Unknown
         );
+    }
+
+    #[test]
+    fn v2_03_ct_eq_bytes_handles_length_diff() {
+        // Length mismatch must NOT short-circuit ; both directions
+        // return false without leaking which side is longer.
+        assert!(!ct_eq_bytes(b"AAA", b"AAAAA"));
+        assert!(!ct_eq_bytes(b"AAAAA", b"AAA"));
+        assert!(ct_eq_bytes(b"AAAAA", b"AAAAA"));
+        assert!(ct_eq_bytes(b"", b""));
+        assert!(!ct_eq_bytes(b"", b"A"));
+    }
+
+    #[test]
+    fn v2_03_partial_prefix_match_does_not_redeem() {
+        // Pre-fix the BTreeMap::get_mut comparison could not be
+        // exploited to redeem a partial match — only to time-leak
+        // bytes. Confirm that the linear scan still rejects partial
+        // matches with the Unknown error, not e.g. a delayed answer.
+        let s = BootstrapTokenStore::new();
+        s.issue(
+            "AAAAA-BBBBB-CCCCC-DDDDD",
+            Duration::from_secs(60),
+            vec![],
+        );
+        for candidate in ["A", "AAAAA", "AAAAA-BBBBB-CCCCC-DDDD"] {
+            assert_eq!(
+                s.redeem(candidate, "n", None).unwrap_err(),
+                RedemptionError::Unknown,
+                "candidate {candidate:?} must NOT be accepted"
+            );
+        }
+        // Exact match still works.
+        let r = s.redeem("AAAAA-BBBBB-CCCCC-DDDDD", "n", None);
+        assert!(r.is_ok());
     }
 }

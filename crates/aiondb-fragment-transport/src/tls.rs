@@ -167,6 +167,30 @@ pub fn build_tls_acceptor(config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
+/// V2-09 : production-grade variant of [`build_tls_acceptor`] that
+/// refuses to start without a configured `client_ca_path`. The default
+/// builder above keeps the lenient behaviour for dev / single-node
+/// embedded setups, but production fragment-transport listeners should
+/// route through this helper so a forgotten CA path can never silently
+/// disable peer authentication.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when `client_ca_path` is
+/// `None`. Propagates the same errors as [`build_tls_acceptor`]
+/// otherwise.
+pub fn build_tls_acceptor_strict(config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
+    if config.client_ca_path.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "V2-09 : fragment-transport TLS listener refuses to start without \
+             client_ca_path ; an unpinned listener accepts any peer certificate \
+             and turns a single leaked AuthToken into RCE-equivalent",
+        ));
+    }
+    build_tls_acceptor(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +345,21 @@ mod tests {
     fn build_root_store_reports_path_in_error() {
         let err = build_root_store("/does/not/exist/ca.pem").unwrap_err();
         assert!(err.to_string().contains("/does/not/exist/ca.pem"));
+    }
+
+    #[test]
+    fn v2_09_strict_acceptor_rejects_missing_client_ca() {
+        let config = TlsServerConfig {
+            cert_path: "/whatever/server.pem".to_owned(),
+            key_path: "/whatever/server-key.pem".to_owned(),
+            client_ca_path: None,
+        };
+        let err = match build_tls_acceptor_strict(&config) {
+            Ok(_) => panic!("strict acceptor must refuse missing client_ca_path"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("V2-09"));
     }
 
     #[test]

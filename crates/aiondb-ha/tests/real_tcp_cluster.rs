@@ -16,6 +16,7 @@ use std::time::Duration;
 use aiondb_ha::kv_engine::KvEngine;
 use aiondb_ha::multi_raft::{MultiRaftGroupId, MultiRaftRegistry};
 use aiondb_ha::protocol::NodeId;
+use aiondb_ha::raft_auth::{RaftSharedSecret, MIN_RAFT_SHARED_SECRET_BYTES};
 use aiondb_ha::raft_tcp::RaftTcpServer;
 use tokio::time;
 
@@ -27,13 +28,17 @@ struct RealNode {
     tempdir: tempfile::TempDir,
 }
 
+fn test_secret() -> RaftSharedSecret {
+    RaftSharedSecret::new(vec![0x42; MIN_RAFT_SHARED_SECRET_BYTES])
+}
+
 async fn boot_node(id: u64) -> RealNode {
     let tmp = tempfile::tempdir().unwrap();
     let raft_id = NodeId::new(id);
     let registry = Arc::new(MultiRaftRegistry::new(raft_id, tmp.path()).unwrap());
     let engine = KvEngine::new(Arc::clone(&registry));
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = RaftTcpServer::start(Arc::clone(&registry), bind)
+    let server = RaftTcpServer::start(Arc::clone(&registry), bind, test_secret())
         .await
         .unwrap();
     RealNode {
@@ -153,9 +158,13 @@ async fn cluster_recovers_after_follower_restart() {
     let n2_registry = Arc::new(MultiRaftRegistry::new(NodeId::new(2), &n2_path).unwrap());
     n2_registry.open_group(g, 2).unwrap();
     let n2_engine = KvEngine::new(Arc::clone(&n2_registry));
-    let n2_server = RaftTcpServer::start(Arc::clone(&n2_registry), "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
+    let n2_server = RaftTcpServer::start(
+        Arc::clone(&n2_registry),
+        "127.0.0.1:0".parse().unwrap(),
+        test_secret(),
+    )
+    .await
+    .unwrap();
     // Re-register both directions with the new follower address.
     n1.server.unregister_peer(2).await;
     n1.server.register_peer(2, n2_server.local_addr()).await;

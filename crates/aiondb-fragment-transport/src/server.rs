@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use crate::auth::AuthToken;
 use crate::protocol::{
     self, FragmentRequest, FragmentResponse, TransportEnvelope, TransportPayload,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    MAX_PAYLOAD_BYTES, MAX_PRE_AUTH_PAYLOAD_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use crate::tls::TlsServerConfig;
 
@@ -32,6 +32,11 @@ const MAX_CONCURRENT_REAPERS: usize = 256;
 /// Hard cap on how long `run` will wait for active connections to drain
 /// before returning after a shutdown signal.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_FRAGMENT_ISOLATION_BYTES: usize = 64;
+const MAX_FRAGMENT_RESULT_ROWS: u64 = 2_000_000;
+const MAX_FRAGMENT_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FRAGMENT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FRAGMENT_TEMP_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 struct CancelRegistry {
@@ -161,6 +166,13 @@ pub struct FragmentServerConfig {
     /// permits are in use, new requests block until a slot frees up. Defaults
     /// to `max_connections` when `None`.
     pub max_concurrent_executions: Option<u32>,
+    /// V2-06 : when `false` (production), the server refuses to start
+    /// if (a) `auth_token` is shorter than [`crate::auth::MIN_AUTH_TOKEN_BYTES`],
+    /// or (b) TLS is configured without `client_ca_path` even when
+    /// `AIONDB_FRAGMENT_ALLOW_NO_MTLS=1` is set. When `true`, the
+    /// server tolerates the lenient embedded / single-process setup
+    /// so unit tests do not need a 32-byte token. Default = `false`.
+    pub allow_dev_mode_relaxations: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +226,21 @@ impl FragmentServer {
 
         info!(addr = %self.config.listen_addr, "fragment transport server listening");
 
+        // V2-06 : production-mode auth-token strength check. In dev mode
+        // we leave the legacy `is_empty` check ; in prod, refuse any
+        // token shorter than MIN_AUTH_TOKEN_BYTES so a one-byte token
+        // never reaches the wire.
+        if !self.config.allow_dev_mode_relaxations {
+            self.config
+                .auth_token
+                .require_production_strength()
+                .map_err(|e| {
+                    DbError::internal(format!(
+                        "fragment transport: V2-06 auth token strength check failed: {e}"
+                    ))
+                })?;
+        }
+
         if !self.config.auth_token.is_empty() && self.config.tls.is_none() {
             warn!(
                 addr = %self.config.listen_addr,
@@ -222,18 +249,30 @@ impl FragmentServer {
             );
         }
 
-        // Defence-in-depth: when TLS is enabled, require mTLS (`client_ca_path`)
-        // unless the operator explicitly opts into peer-cert-less mode. The
-        // shared `auth_token` alone is not enough — any TCP/TLS-reachable
-        // client can forge the token if it leaks (audit fragment-transport F2).
+        // V2-06 / V2-09 : when TLS is enabled, require mTLS
+        // (`client_ca_path`). The `AIONDB_FRAGMENT_ALLOW_NO_MTLS=1`
+        // escape hatch is honoured ONLY when the server is started
+        // with `allow_dev_mode_relaxations=true` ; in production the
+        // env var is ignored and the listener refuses to bind. This
+        // closes the V2-06 footgun where a single leaked AuthToken
+        // would become RCE-equivalent against an unpinned listener.
         if let Some(tls_cfg) = self.config.tls.as_ref() {
-            if tls_cfg.client_ca_path.is_none()
-                && std::env::var_os("AIONDB_FRAGMENT_ALLOW_NO_MTLS").is_none()
-            {
-                return Err(DbError::internal(
-                    "fragment transport: TLS configured without client_ca_path. \
-                     Enable mTLS or set AIONDB_FRAGMENT_ALLOW_NO_MTLS=1 to opt out.",
-                ));
+            if tls_cfg.client_ca_path.is_none() {
+                let dev_opt_out = self.config.allow_dev_mode_relaxations
+                    && std::env::var_os("AIONDB_FRAGMENT_ALLOW_NO_MTLS").is_some();
+                if !dev_opt_out {
+                    return Err(DbError::internal(
+                        "fragment transport: TLS configured without client_ca_path. \
+                         Enable mTLS by setting client_ca_path ; \
+                         AIONDB_FRAGMENT_ALLOW_NO_MTLS=1 is honoured only when \
+                         allow_dev_mode_relaxations=true.",
+                    ));
+                }
+                warn!(
+                    addr = %self.config.listen_addr,
+                    "V2-06 : fragment transport bound without client_ca_path under \
+                     AIONDB_FRAGMENT_ALLOW_NO_MTLS=1 + dev-mode ; do NOT use in production"
+                );
             }
         }
 
@@ -398,8 +437,19 @@ impl FragmentServer {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        // V2-05 : every envelope before the first successful auth on
+        // this connection is bounded by `MAX_PRE_AUTH_PAYLOAD_BYTES`
+        // (64 KiB) so an unauthenticated peer cannot force the
+        // server to stream and JSON-parse the full 64 MiB. Once the
+        // auth handshake passes we widen the cap to `MAX_PAYLOAD_BYTES`.
+        let mut authenticated_on_this_connection = false;
         loop {
-            let envelope = match protocol::read_envelope(&mut stream).await {
+            let frame_cap = if authenticated_on_this_connection {
+                MAX_PAYLOAD_BYTES
+            } else {
+                MAX_PRE_AUTH_PAYLOAD_BYTES
+            };
+            let envelope = match protocol::read_envelope_with_limit(&mut stream, frame_cap).await {
                 Ok(env) => env,
                 Err(e) => {
                     debug!(error = %e, "framed: read failed, closing connection");
@@ -452,10 +502,27 @@ impl FragmentServer {
                 let _ = protocol::write_envelope(&mut stream, &resp).await;
                 return Err(auth_err);
             }
+            // V2-05 : auth passed for this connection. Subsequent
+            // envelopes may use the full MAX_PAYLOAD_BYTES cap.
+            authenticated_on_this_connection = true;
 
             // ---- dispatch payload ----
             let dispatch_result: DbResult<()> = match envelope.payload {
                 TransportPayload::ExecuteFragment(req) => {
+                    if let Err(error) = validate_fragment_request(&req) {
+                        let resp = TransportEnvelope {
+                            version: PROTOCOL_VERSION,
+                            auth_token: String::new(),
+                            payload: TransportPayload::FragmentResult(FragmentResponse::Error {
+                                request_id: req.request_id,
+                                message: error.to_string(),
+                                sql_state: Some(String::from("08P01")),
+                            }),
+                        };
+                        let _ = protocol::write_envelope(&mut stream, &resp).await;
+                        return Err(error);
+                    }
+
                     // Validate any wire-supplied MVCC snapshot at the trust
                     // boundary so the local engine never sees a snapshot
                     // with `xmin > xmax`, an `active` xid outside
@@ -722,6 +789,76 @@ impl FragmentServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn validate_fragment_request(req: &FragmentRequest) -> DbResult<()> {
+    if req.request_id == 0 {
+        return Err(DbError::protocol("fragment request_id must be non-zero"));
+    }
+    if req.isolation.trim().is_empty() {
+        return Err(DbError::protocol("fragment isolation must not be empty"));
+    }
+    if req.isolation.len() > MAX_FRAGMENT_ISOLATION_BYTES {
+        return Err(DbError::protocol(format!(
+            "fragment isolation is {} bytes, max {MAX_FRAGMENT_ISOLATION_BYTES}",
+            req.isolation.len()
+        )));
+    }
+    validate_nonzero_limit("max_result_rows", req.max_result_rows)?;
+    validate_nonzero_limit("max_result_bytes", req.max_result_bytes)?;
+    validate_nonzero_limit("max_memory_bytes", req.max_memory_bytes)?;
+    validate_nonzero_limit("max_temp_bytes", req.max_temp_bytes)?;
+    validate_upper_limit(
+        "max_result_rows",
+        req.max_result_rows,
+        MAX_FRAGMENT_RESULT_ROWS,
+    )?;
+    validate_upper_limit(
+        "max_result_bytes",
+        req.max_result_bytes,
+        MAX_FRAGMENT_RESULT_BYTES,
+    )?;
+    validate_upper_limit(
+        "max_memory_bytes",
+        req.max_memory_bytes,
+        MAX_FRAGMENT_MEMORY_BYTES,
+    )?;
+    validate_upper_limit(
+        "max_temp_bytes",
+        req.max_temp_bytes,
+        MAX_FRAGMENT_TEMP_BYTES,
+    )?;
+    if req.max_result_bytes > req.max_memory_bytes {
+        return Err(DbError::protocol(format!(
+            "fragment max_result_bytes ({}) exceeds max_memory_bytes ({})",
+            req.max_result_bytes, req.max_memory_bytes
+        )));
+    }
+    if req.max_temp_bytes < req.max_memory_bytes {
+        return Err(DbError::protocol(format!(
+            "fragment max_temp_bytes ({}) is below max_memory_bytes ({})",
+            req.max_temp_bytes, req.max_memory_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nonzero_limit(name: &str, value: u64) -> DbResult<()> {
+    if value == 0 {
+        return Err(DbError::protocol(format!(
+            "fragment {name} must be non-zero"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_upper_limit(name: &str, value: u64, max: u64) -> DbResult<()> {
+    if value > max {
+        return Err(DbError::protocol(format!(
+            "fragment {name} ({value}) exceeds max {max}"
+        )));
+    }
+    Ok(())
+}
+
 /// Convert an optional epoch-millisecond deadline to an `Instant`.
 ///
 /// If the deadline has already passed, returns `Instant::now()`. If the
@@ -793,6 +930,7 @@ mod tests {
             max_connections: 64,
             request_timeout: Duration::from_secs(30),
             max_concurrent_executions: None,
+            allow_dev_mode_relaxations: true,
         };
 
         assert_eq!(config.listen_addr, "127.0.0.1:9100");
@@ -800,6 +938,65 @@ mod tests {
         assert_eq!(config.max_connections, 64);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert!(config.max_concurrent_executions.is_none());
+    }
+
+    fn valid_fragment_request_for_validation() -> FragmentRequest {
+        FragmentRequest {
+            request_id: 1,
+            plan: PhysicalPlan::InternalNoOp {
+                tag: "SELECT".to_owned(),
+                notice: None,
+            },
+            txn_id: 7,
+            isolation: "ReadCommitted".to_owned(),
+            max_result_rows: 10_000,
+            max_result_bytes: 8 * 1024 * 1024,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_temp_bytes: 256 * 1024 * 1024,
+            snapshot: None,
+            deadline_epoch_ms: None,
+            shard_id: None,
+            cancel_key: 1,
+        }
+    }
+
+    #[test]
+    fn validate_fragment_request_allows_bounded_request() {
+        let req = valid_fragment_request_for_validation();
+
+        assert!(validate_fragment_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_zero_limit() {
+        let mut req = valid_fragment_request_for_validation();
+        req.max_result_bytes = 0;
+
+        let err = validate_fragment_request(&req).expect_err("zero limit must fail");
+
+        assert!(err.to_string().contains("max_result_bytes"));
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_unbounded_memory() {
+        let mut req = valid_fragment_request_for_validation();
+        req.max_memory_bytes = MAX_FRAGMENT_MEMORY_BYTES + 1;
+        req.max_temp_bytes = MAX_FRAGMENT_TEMP_BYTES;
+
+        let err = validate_fragment_request(&req).expect_err("oversized memory must fail");
+
+        assert!(err.to_string().contains("max_memory_bytes"));
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_result_bytes_above_memory() {
+        let mut req = valid_fragment_request_for_validation();
+        req.max_result_bytes = 65 * 1024 * 1024;
+        req.max_memory_bytes = 64 * 1024 * 1024;
+
+        let err = validate_fragment_request(&req).expect_err("result bytes above memory must fail");
+
+        assert!(err.to_string().contains("max_result_bytes"));
     }
 
     #[test]
@@ -1145,6 +1342,7 @@ mod tests {
             max_connections: 8,
             request_timeout: Duration::from_secs(5),
             max_concurrent_executions: Some(4),
+            allow_dev_mode_relaxations: true,
         };
 
         let server = FragmentServer::new(config, Arc::new(NoopExecutor));

@@ -6,11 +6,13 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time;
 
 use crate::health_probe::{
     evaluate_healthz, evaluate_readyz, HealthStatus, ProbeInputs, ReadinessStatus,
@@ -19,6 +21,9 @@ use crate::health_probe::{
 pub trait ProbeSource: Send + Sync {
     fn collect(&self) -> ProbeInputs;
 }
+
+const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_REQUEST_BUFFER_BYTES: usize = 4096;
 
 pub struct HealthServer {
     handle: JoinHandle<()>,
@@ -66,33 +71,41 @@ impl HealthServer {
 }
 
 async fn serve(source: Arc<dyn ProbeSource>, stream: &mut TcpStream) -> io::Result<()> {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
+    let mut buf = vec![0u8; HTTP_REQUEST_BUFFER_BYTES];
+    let n = time::timeout(HTTP_REQUEST_READ_TIMEOUT, stream.read(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "health request read timeout"))??;
     if n == 0 {
         return Ok(());
     }
     let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let mut request_parts = head.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("/").to_string();
     let inputs = source.collect();
-    let (status, body) = match path.as_str() {
-        "/healthz" => match evaluate_healthz(&inputs) {
-            HealthStatus::Healthy => ("200 OK", "ok\n".to_string()),
-            HealthStatus::Degraded { reason_code } => (
-                "503 Service Unavailable",
-                format!("degraded {reason_code}\n"),
-            ),
-            HealthStatus::Down { reason_code } => {
-                ("503 Service Unavailable", format!("down {reason_code}\n"))
-            }
-        },
-        "/readyz" => match evaluate_readyz(&inputs) {
-            ReadinessStatus::Ready => ("200 OK", "ready\n".to_string()),
-            ReadinessStatus::NotReady { reason_code } => (
-                "503 Service Unavailable",
-                format!("not-ready {reason_code}\n"),
-            ),
-        },
-        _ => ("404 Not Found", "not found\n".to_string()),
+    let (status, body) = if method != "GET" {
+        ("405 Method Not Allowed", "method not allowed\n".to_string())
+    } else {
+        match path.as_str() {
+            "/healthz" => match evaluate_healthz(&inputs) {
+                HealthStatus::Healthy => ("200 OK", "ok\n".to_string()),
+                HealthStatus::Degraded { reason_code } => (
+                    "503 Service Unavailable",
+                    format!("degraded {reason_code}\n"),
+                ),
+                HealthStatus::Down { reason_code } => {
+                    ("503 Service Unavailable", format!("down {reason_code}\n"))
+                }
+            },
+            "/readyz" => match evaluate_readyz(&inputs) {
+                ReadinessStatus::Ready => ("200 OK", "ready\n".to_string()),
+                ReadinessStatus::NotReady { reason_code } => (
+                    "503 Service Unavailable",
+                    format!("not-ready {reason_code}\n"),
+                ),
+            },
+            _ => ("404 Not Found", "not found\n".to_string()),
+        }
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -105,8 +118,6 @@ async fn serve(source: Arc<dyn ProbeSource>, stream: &mut TcpStream) -> io::Resu
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     struct FixedSource(ProbeInputs);
@@ -117,8 +128,12 @@ mod tests {
     }
 
     async fn fetch(addr: SocketAddr, path: &str) -> String {
+        fetch_method(addr, "GET", path).await
+    }
+
+    async fn fetch_method(addr: SocketAddr, method: &str, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];
@@ -180,6 +195,19 @@ mod tests {
         .unwrap();
         let body = fetch(server.local_addr(), "/foo").await;
         assert!(body.contains("HTTP/1.1 404"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_get_method_returns_405() {
+        let server = HealthServer::start(
+            Arc::new(FixedSource(healthy())),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let body = fetch_method(server.local_addr(), "POST", "/healthz").await;
+        assert!(body.contains("HTTP/1.1 405 Method Not Allowed"));
         server.shutdown().await;
     }
 }

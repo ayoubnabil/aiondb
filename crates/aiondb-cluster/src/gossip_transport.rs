@@ -11,11 +11,10 @@
 //! - Caches a peer address book so messages can be routed by
 //!   [`NodeId`].
 //!
-//! The wire format is the simplest thing that works: a 4-byte
-//! big-endian length prefix followed by a JSON-encoded
-//! [`GossipMessage`]. JSON is on the wire purely so the format is
-//! easy to debug; if profiling shows it as a hot spot, swap in
-//! `bincode` -- the framing stays identical.
+//! The wire format is a 4-byte big-endian payload length, a JSON-encoded
+//! [`GossipMessage`], and a 32-byte HMAC-SHA256 tag. JSON is on the wire
+//! purely so the format is easy to debug; if profiling shows it as a hot
+//! spot, swap in `bincode` -- the authenticated framing stays identical.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,6 +28,10 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, trace, warn};
+
+use aiondb_ha::raft_auth::{
+    decode_authenticated, encode_authenticated, RaftSharedSecret, MIN_RAFT_SHARED_SECRET_BYTES,
+};
 
 use crate::distributed::NodeId;
 use crate::gossip::{GossipMessage, GossipNode};
@@ -59,7 +62,16 @@ impl GossipServer {
         node: Arc<GossipNode>,
         bind_addr: SocketAddr,
         tick_interval: Duration,
+        secret: RaftSharedSecret,
     ) -> io::Result<Self> {
+        if !secret.is_strong_enough() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "gossip shared secret must be at least {MIN_RAFT_SHARED_SECRET_BYTES} bytes"
+                ),
+            ));
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -67,17 +79,19 @@ impl GossipServer {
 
         let listener_handle = {
             let node = Arc::clone(&node);
+            let secret = secret.clone();
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                run_listener(node, listener, &mut shutdown_rx).await;
+                run_listener(node, listener, secret, &mut shutdown_rx).await;
             })
         };
         let ticker_handle = {
             let node = Arc::clone(&node);
             let address_book = Arc::clone(&address_book);
+            let secret = secret.clone();
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                run_ticker(node, address_book, tick_interval, &mut shutdown_rx).await;
+                run_ticker(node, address_book, tick_interval, secret, &mut shutdown_rx).await;
             })
         };
 
@@ -126,6 +140,7 @@ impl GossipServer {
 async fn run_listener(
     node: Arc<GossipNode>,
     listener: TcpListener,
+    secret: RaftSharedSecret,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     loop {
@@ -139,8 +154,9 @@ async fn run_listener(
             accept = listener.accept() => match accept {
                 Ok((stream, peer)) => {
                     let node = Arc::clone(&node);
+                    let secret = secret.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_inbound(node, stream).await {
+                        if let Err(err) = handle_inbound(node, stream, secret).await {
                             warn!(peer = %peer, error = %err, "gossip inbound connection error");
                         }
                     });
@@ -154,9 +170,13 @@ async fn run_listener(
     }
 }
 
-async fn handle_inbound(node: Arc<GossipNode>, mut stream: TcpStream) -> io::Result<()> {
+async fn handle_inbound(
+    node: Arc<GossipNode>,
+    mut stream: TcpStream,
+    secret: RaftSharedSecret,
+) -> io::Result<()> {
     loop {
-        match read_frame(&mut stream).await {
+        match read_frame(&mut stream, &secret).await {
             Ok(Some(msg)) => {
                 trace!(?msg, "gossip received");
                 node.handle_message(msg);
@@ -171,6 +191,7 @@ async fn run_ticker(
     node: Arc<GossipNode>,
     address_book: Arc<Mutex<HashMap<NodeId, SocketAddr>>>,
     interval: Duration,
+    secret: RaftSharedSecret,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let mut ticker = time::interval(interval);
@@ -199,8 +220,9 @@ async fn run_ticker(
                         }
                     };
                     let msg = envelope.message.clone();
+                    let secret = secret.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = send_one(addr, &msg).await {
+                        if let Err(err) = send_one(addr, &msg, &secret).await {
                             trace!(target_addr = %addr, error = %err, "gossip send failed");
                         }
                     });
@@ -210,17 +232,24 @@ async fn run_ticker(
     }
 }
 
-async fn send_one(addr: SocketAddr, msg: &GossipMessage) -> io::Result<()> {
+async fn send_one(
+    addr: SocketAddr,
+    msg: &GossipMessage,
+    secret: &RaftSharedSecret,
+) -> io::Result<()> {
     let connect = time::timeout(Duration::from_millis(500), TcpStream::connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gossip connect timeout"))??;
     let mut stream = connect;
-    write_frame(&mut stream, msg).await?;
+    write_frame(&mut stream, msg, secret).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<GossipMessage>> {
+async fn read_frame(
+    stream: &mut TcpStream,
+    secret: &RaftSharedSecret,
+) -> io::Result<Option<GossipMessage>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -228,20 +257,33 @@ async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<GossipMessage>>
         Err(err) => return Err(err),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_MESSAGE_BYTES {
+    if len == 0 || len > MAX_MESSAGE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("gossip frame {len} bytes exceeds MAX_MESSAGE_BYTES"),
         ));
     }
-    let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload).await?;
+    let mut frame = Vec::with_capacity(4 + len as usize + 32);
+    frame.extend_from_slice(&len_buf);
+    let mut payload_and_tag = vec![0u8; len as usize + 32];
+    stream.read_exact(&mut payload_and_tag).await?;
+    frame.extend_from_slice(&payload_and_tag);
+    let payload = decode_authenticated(secret, &frame).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gossip frame authentication failed",
+        )
+    })?;
     let msg = serde_json::from_slice::<GossipMessage>(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("gossip decode: {e}")))?;
     Ok(Some(msg))
 }
 
-async fn write_frame(stream: &mut TcpStream, msg: &GossipMessage) -> io::Result<()> {
+async fn write_frame(
+    stream: &mut TcpStream,
+    msg: &GossipMessage,
+    secret: &RaftSharedSecret,
+) -> io::Result<()> {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("gossip encode: {e}")))?;
     let len = u32::try_from(payload.len())
@@ -252,8 +294,8 @@ async fn write_frame(stream: &mut TcpStream, msg: &GossipMessage) -> io::Result<
             format!("gossip frame {len} bytes exceeds MAX_MESSAGE_BYTES"),
         ));
     }
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&payload).await?;
+    let frame = encode_authenticated(secret, &payload);
+    stream.write_all(&frame).await?;
     Ok(())
 }
 
@@ -279,12 +321,36 @@ mod tests {
         }
     }
 
+    fn test_secret() -> RaftSharedSecret {
+        RaftSharedSecret::new(vec![0x24; MIN_RAFT_SHARED_SECRET_BYTES])
+    }
+
     async fn start_node(id: NodeId) -> GossipServer {
         let node = Arc::new(GossipNode::new(id, fast_config()));
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        GossipServer::start(node, addr, Duration::from_millis(15))
+        GossipServer::start(node, addr, Duration::from_millis(15), test_secret())
             .await
             .expect("start server")
+    }
+
+    #[tokio::test]
+    async fn start_rejects_short_shared_secret() {
+        let node = Arc::new(GossipNode::new(node_id(1), fast_config()));
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+
+        let result = GossipServer::start(
+            node,
+            addr,
+            Duration::from_millis(15),
+            RaftSharedSecret::new(vec![0x24; MIN_RAFT_SHARED_SECRET_BYTES - 1]),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("short secret must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
@@ -316,6 +382,79 @@ mod tests {
         assert_eq!(b_sees_a, MemberState::Alive, "B view: {b_view:?}");
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_frame_is_dropped() {
+        let server = start_node(node_id(1)).await;
+        let forged_member = node_id(999);
+        let forged = GossipMessage::Update {
+            from: node_id(666),
+            piggyback: vec![crate::gossip::MemberUpdate {
+                node_id: forged_member.clone(),
+                state: MemberState::Alive,
+                incarnation: 1,
+                metadata: BTreeMap::new(),
+            }],
+        };
+        let body = serde_json::to_vec(&forged).expect("encode forged gossip");
+
+        let mut sock = TcpStream::connect(server.local_addr())
+            .await
+            .expect("connect gossip");
+        sock.write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .expect("write legacy length");
+        sock.write_all(&body).await.expect("write legacy body");
+        sock.flush().await.expect("flush legacy body");
+        drop(sock);
+        time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !server
+                .node()
+                .members()
+                .iter()
+                .any(|member| member.node_id == forged_member),
+            "unsigned gossip frame must not update membership"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_frame_is_dropped() {
+        let server = start_node(node_id(1)).await;
+        let forged_member = node_id(999);
+        let forged = GossipMessage::Update {
+            from: node_id(666),
+            piggyback: vec![crate::gossip::MemberUpdate {
+                node_id: forged_member.clone(),
+                state: MemberState::Alive,
+                incarnation: 1,
+                metadata: BTreeMap::new(),
+            }],
+        };
+        let body = serde_json::to_vec(&forged).expect("encode forged gossip");
+        let attacker_secret = RaftSharedSecret::new(vec![0x99; MIN_RAFT_SHARED_SECRET_BYTES]);
+        let frame = encode_authenticated(&attacker_secret, &body);
+
+        let mut sock = TcpStream::connect(server.local_addr())
+            .await
+            .expect("connect gossip");
+        sock.write_all(&frame).await.expect("write signed frame");
+        sock.flush().await.expect("flush signed frame");
+        drop(sock);
+        time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !server
+                .node()
+                .members()
+                .iter()
+                .any(|member| member.node_id == forged_member),
+            "gossip frame signed with wrong secret must not update membership"
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]

@@ -42,6 +42,13 @@ const MAX_FRONTEND_MESSAGE_BYTES: usize = MAX_BACKEND_MESSAGE_BYTES;
 const MAX_BACKEND_DATA_ROW_COLUMNS: usize = 1024;
 const PG_FRAME_LEN_BYTES: usize = 4;
 const PG_FRAME_TAG_BYTES: usize = 1;
+/// Replication connection strings are operator-provided config. Keep parsing
+/// bounded before allocating per-token strings so a hostile config source cannot
+/// force excessive startup memory or CPU work.
+const MAX_CONNINFO_BYTES: usize = 16 * 1024;
+const MAX_CONNINFO_TOKENS: usize = 32;
+const MAX_CONNINFO_KEY_BYTES: usize = 64;
+const MAX_CONNINFO_VALUE_BYTES: usize = 4 * 1024;
 
 /// TLS posture requested by the operator. Mirrors libpq's `sslmode`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -121,6 +128,13 @@ impl ConnInfo {
     /// Parse a libpq-style connection string. Recognized keys: `host`,
     /// `port`, `user`, `password`, `dbname`, `application_name`.
     pub fn parse(conninfo: &str) -> DbResult<Self> {
+        if conninfo.len() > MAX_CONNINFO_BYTES {
+            return Err(DbError::invalid_input_syntax(
+                "primary_conninfo",
+                &format!("connection string exceeds {MAX_CONNINFO_BYTES} bytes"),
+            ));
+        }
+
         let mut host = None;
         let mut port = None;
         let mut user = None;
@@ -225,6 +239,12 @@ fn parse_conninfo_tokens(conninfo: &str) -> DbResult<Vec<(String, String)>> {
             if c == '=' || c.is_whitespace() {
                 break;
             }
+            if key.len() + c.len_utf8() > MAX_CONNINFO_KEY_BYTES {
+                return Err(DbError::invalid_input_syntax(
+                    "primary_conninfo",
+                    &format!("keyword exceeds {MAX_CONNINFO_KEY_BYTES} bytes"),
+                ));
+            }
             key.push(c);
             chars.next();
         }
@@ -250,7 +270,9 @@ fn parse_conninfo_tokens(conninfo: &str) -> DbResult<Vec<(String, String)>> {
                 match chars.next() {
                     Some('\'') => break value,
                     Some('\\') => match chars.next() {
-                        Some(escaped) => value.push(escaped),
+                        Some(escaped) => {
+                            push_conninfo_value_char(&mut value, escaped, &key)?;
+                        }
                         None => {
                             return Err(DbError::invalid_input_syntax(
                                 "primary_conninfo",
@@ -260,7 +282,7 @@ fn parse_conninfo_tokens(conninfo: &str) -> DbResult<Vec<(String, String)>> {
                             ));
                         }
                     },
-                    Some(c) => value.push(c),
+                    Some(c) => push_conninfo_value_char(&mut value, c, &key)?,
                     None => {
                         return Err(DbError::invalid_input_syntax(
                             "primary_conninfo",
@@ -275,13 +297,30 @@ fn parse_conninfo_tokens(conninfo: &str) -> DbResult<Vec<(String, String)>> {
                 if c.is_whitespace() {
                     break;
                 }
-                value.push(c);
+                push_conninfo_value_char(&mut value, c, &key)?;
                 chars.next();
             }
             value
         };
+        if tokens.len() >= MAX_CONNINFO_TOKENS {
+            return Err(DbError::invalid_input_syntax(
+                "primary_conninfo",
+                &format!("connection string contains more than {MAX_CONNINFO_TOKENS} keywords"),
+            ));
+        }
         tokens.push((key, value));
     }
+}
+
+fn push_conninfo_value_char(value: &mut String, ch: char, key: &str) -> DbResult<()> {
+    if value.len() + ch.len_utf8() > MAX_CONNINFO_VALUE_BYTES {
+        return Err(DbError::invalid_input_syntax(
+            "primary_conninfo",
+            &format!("value for keyword \"{key}\" exceeds {MAX_CONNINFO_VALUE_BYTES} bytes"),
+        ));
+    }
+    value.push(ch);
+    Ok(())
 }
 
 fn validate_conninfo_value(keyword: &str, value: &str) -> DbResult<()> {
@@ -1458,6 +1497,50 @@ mod tests {
         let err = ConnInfo::parse("host=primary user=alice password=hun\0ter2")
             .expect_err("NUL bytes must not reach password messages");
         assert!(err.to_string().contains("contains NUL byte"), "{err}");
+    }
+
+    #[test]
+    fn conninfo_parse_rejects_oversized_input() {
+        let oversized = format!("host={}", "a".repeat(MAX_CONNINFO_BYTES));
+        let err = ConnInfo::parse(&oversized).expect_err("oversized conninfo must fail");
+        assert!(
+            err.to_string().contains("connection string exceeds"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conninfo_parse_rejects_too_many_tokens() {
+        let mut conninfo = String::new();
+        for idx in 0..=MAX_CONNINFO_TOKENS {
+            if idx > 0 {
+                conninfo.push(' ');
+            }
+            conninfo.push_str("application_name=x");
+        }
+
+        let err = ConnInfo::parse(&conninfo).expect_err("too many conninfo tokens must fail");
+        assert!(err.to_string().contains("more than"), "{err}");
+    }
+
+    #[test]
+    fn conninfo_parse_rejects_oversized_keyword() {
+        let oversized = format!("{}=value", "k".repeat(MAX_CONNINFO_KEY_BYTES + 1));
+        let err = ConnInfo::parse(&oversized).expect_err("oversized conninfo keyword must fail");
+        assert!(err.to_string().contains("keyword exceeds"), "{err}");
+    }
+
+    #[test]
+    fn conninfo_parse_rejects_oversized_value_without_echoing_secret() {
+        let secret = "s".repeat(MAX_CONNINFO_VALUE_BYTES + 1);
+        let conninfo = format!("host=primary user=alice password={secret}");
+        let err = ConnInfo::parse(&conninfo).expect_err("oversized conninfo value must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("value for keyword \"password\" exceeds"),
+            "{err}"
+        );
+        assert!(!message.contains(&secret), "{err}");
     }
 
     #[test]

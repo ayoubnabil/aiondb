@@ -11,7 +11,12 @@ use aiondb_ha::kv_engine::KvEngine;
 use aiondb_ha::multi_raft::{MultiRaftGroupId, MultiRaftRegistry};
 use aiondb_ha::protocol::NodeId;
 use aiondb_ha::pulse_generator::PulseGenerator;
+use aiondb_ha::raft_auth::{RaftSharedSecret, MIN_RAFT_SHARED_SECRET_BYTES};
 use aiondb_ha::raft_tcp::RaftTcpServer;
+
+fn test_secret() -> RaftSharedSecret {
+    RaftSharedSecret::new(vec![0x42; MIN_RAFT_SHARED_SECRET_BYTES])
+}
 
 #[tokio::test]
 async fn pulse_generator_advances_log_over_tcp() {
@@ -28,10 +33,10 @@ async fn pulse_generator_advances_log_over_tcp() {
     let follower_engine = KvEngine::new(Arc::clone(&follower_reg));
 
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let leader_server = RaftTcpServer::start(Arc::clone(&leader_reg), bind)
+    let leader_server = RaftTcpServer::start(Arc::clone(&leader_reg), bind, test_secret())
         .await
         .unwrap();
-    let follower_server = RaftTcpServer::start(Arc::clone(&follower_reg), bind)
+    let follower_server = RaftTcpServer::start(Arc::clone(&follower_reg), bind, test_secret())
         .await
         .unwrap();
     leader_server
