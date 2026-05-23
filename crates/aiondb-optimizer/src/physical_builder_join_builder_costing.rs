@@ -93,6 +93,97 @@ fn join_builder_does_not_swap_hybrid_source_with_outer_refs() {
 }
 
 #[test]
+fn join_builder_does_not_hash_swap_outer_ref_limit_source() {
+    let builder = PhysicalBuilder;
+    let correlated_left = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(7),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "doc_id".to_owned(),
+                data_type: DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("doc_id", 0, DataType::BigInt, false),
+        }],
+        filter: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("tenant_id", 1, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::outer_column_ref(
+            "tenant_limit",
+            2,
+            DataType::Int,
+            false,
+        )),
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::SeqScan,
+    };
+    let right = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::BigInt, false),
+        }],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::SeqScan,
+    };
+    let condition = Some(TypedExpr::binary_eq(
+        TypedExpr::column_ref("doc_id", 0, DataType::BigInt, false),
+        TypedExpr::column_ref("id", 1, DataType::BigInt, false),
+    ));
+
+    let plan = builder.build_join_from_physical(
+        correlated_left,
+        right,
+        aiondb_plan::JoinType::Inner,
+        condition,
+        vec![ProjectionExpr {
+            field: ResultField {
+                name: "doc_id".to_owned(),
+                data_type: DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("doc_id", 0, DataType::BigInt, false),
+        }],
+        None,
+        Vec::new(),
+        None,
+        None,
+        false,
+        Vec::new(),
+    );
+
+    match plan {
+        PhysicalPlan::HashJoin { left, right, .. } => {
+            assert!(
+                matches!(left.as_ref(), PhysicalPlan::ProjectTable { .. }),
+                "correlated source must stay on the original left side, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), PhysicalPlan::ProjectTable { .. }),
+                "right side should remain the hash build input when left is correlated, got {right:?}"
+            );
+        }
+        other => panic!("expected HashJoin with original correlated orientation, got {other:?}"),
+    }
+}
+
+#[test]
 fn join_swap_key_extraction_does_not_accept_out_of_range_combined_ordinals() {
     let condition = Some(TypedExpr::binary_gt(
         TypedExpr::column_ref("left_id", 0, DataType::Int, false),

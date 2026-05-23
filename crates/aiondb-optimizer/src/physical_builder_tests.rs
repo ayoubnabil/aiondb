@@ -1,8 +1,10 @@
 use crate::physical_builder::*;
-use aiondb_core::{ColumnId, DataType, RelationId, Value};
+use aiondb_core::{ColumnId, DataType, IndexId, RelationId, Value};
+use aiondb_plan::logical::RowLockPlan;
 use aiondb_plan::{
-    ColumnPlan, IndexColumnPlan, LogicalPlan, PhysicalPlan, ProjectionExpr, ResultField,
-    ScalarFunction, ScanAccessPath, SortExpr, TypedExpr, TypedExprKind, UpdateAssignment,
+    AggregateExpr, ColumnPlan, IndexColumnPlan, LogicalPlan, PhysicalPlan, ProjectionExpr,
+    ResultField, ScalarFunction, ScanAccessPath, SortExpr, TypedExpr, TypedExprKind,
+    UpdateAssignment,
 };
 
 #[path = "physical_builder_join_builder.rs"]
@@ -62,6 +64,297 @@ fn assert_scalar_function_arg_ordinals(
         }
         other => panic!("expected ScalarFunction, got {other:?}"),
     }
+}
+
+#[test]
+fn plan_sorted_prefix_prefers_explicit_order_by_over_index_path() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(1),
+        outputs: vec![make_projection("value", DataType::Int)],
+        filter: None,
+        order_by: vec![SortExpr {
+            expr: TypedExpr::column_ref("value", 1, DataType::Int, false),
+            descending: false,
+            nulls_first: Some(false),
+        }],
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEq {
+            index_id: IndexId::new(10),
+            value: Value::Int(7),
+        },
+    };
+
+    assert_eq!(plan_sorted_prefix(&plan), vec![1]);
+}
+
+#[test]
+fn plan_sorted_prefix_desc_order_by_blocks_index_order_inference() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(1),
+        outputs: vec![make_projection("value", DataType::Int)],
+        filter: None,
+        order_by: vec![SortExpr {
+            expr: TypedExpr::column_ref("value", 0, DataType::Int, false),
+            descending: true,
+            nulls_first: Some(true),
+        }],
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEq {
+            index_id: IndexId::new(10),
+            value: Value::Int(7),
+        },
+    };
+
+    assert!(plan_sorted_prefix(&plan).is_empty());
+}
+
+#[test]
+fn plan_sorted_prefix_preserves_index_only_scan_order() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(1),
+        outputs: vec![make_projection("value", DataType::Int)],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexOnlyScan {
+            inner: Box::new(ScanAccessPath::IndexRange {
+                index_id: IndexId::new(10),
+                lower: std::ops::Bound::Included(Value::Int(1)),
+                upper: std::ops::Bound::Unbounded,
+            }),
+            index_column_ids: vec![ColumnId::new(1)],
+        },
+    };
+
+    assert_eq!(plan_sorted_prefix(&plan), vec![0]);
+}
+
+#[test]
+fn plan_sorted_prefix_propagates_through_transparent_project_source() {
+    let source = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(1),
+        outputs: vec![
+            ProjectionExpr {
+                field: ResultField {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+                expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+            },
+            ProjectionExpr {
+                field: ResultField {
+                    name: "score".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+                expr: TypedExpr::column_ref("score", 1, DataType::Int, false),
+            },
+        ],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexRange {
+            index_id: IndexId::new(10),
+            lower: std::ops::Bound::Included(Value::Int(1)),
+            upper: std::ops::Bound::Unbounded,
+        },
+    };
+    let plan = PhysicalPlan::ProjectSource {
+        source: Box::new(source),
+        outputs: vec![
+            ProjectionExpr {
+                field: ResultField {
+                    name: "score".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+                expr: TypedExpr::column_ref("score", 1, DataType::Int, false),
+            },
+            ProjectionExpr {
+                field: ResultField {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+                expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+            },
+        ],
+        filter: Some(TypedExpr::binary_gt(
+            TypedExpr::column_ref("score", 0, DataType::Int, false),
+            TypedExpr::literal(Value::Int(10), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(10), DataType::Int, false)),
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(plan_sorted_prefix(&plan), vec![1]);
+}
+
+#[test]
+fn plan_sorted_prefix_does_not_cross_distinct_project_source() {
+    let plan = PhysicalPlan::ProjectSource {
+        source: Box::new(PhysicalPlan::ProjectTable {
+            table_id: RelationId::new(1),
+            outputs: vec![make_projection("id", DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            access_path: ScanAccessPath::IndexEq {
+                index_id: IndexId::new(10),
+                value: Value::Int(7),
+            },
+        }),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: true,
+        distinct_on: Vec::new(),
+    };
+
+    assert!(plan_sorted_prefix(&plan).is_empty());
+}
+
+#[test]
+fn plan_sorted_prefix_preserved_by_ordered_gather() {
+    let child = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(1),
+        outputs: vec![make_projection("id", DataType::Int)],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEq {
+            index_id: IndexId::new(10),
+            value: Value::Int(7),
+        },
+    };
+    let output_fields = child.output_fields();
+    let ordered = PhysicalPlan::Gather {
+        child: Box::new(child.clone()),
+        num_workers: 2,
+        output_fields: output_fields.clone(),
+        preserve_order: true,
+    };
+    let unordered = PhysicalPlan::Gather {
+        child: Box::new(child),
+        num_workers: 2,
+        output_fields,
+        preserve_order: false,
+    };
+
+    assert_eq!(plan_sorted_prefix(&ordered), vec![0]);
+    assert!(plan_sorted_prefix(&unordered).is_empty());
+}
+
+#[test]
+fn plan_sorted_prefix_reads_explicit_order_by_from_join_nodes() {
+    let fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::HashJoin {
+        left: Box::new(values_plan(10)),
+        right: Box::new(values_plan(10)),
+        join_type: aiondb_plan::JoinType::Inner,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        condition: None,
+        outputs: Vec::new(),
+        filter: None,
+        order_by: vec![SortExpr {
+            expr: TypedExpr::column_ref("id", 2, DataType::Int, false),
+            descending: false,
+            nulls_first: Some(false),
+        }],
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(plan_sorted_prefix(&plan), vec![2]);
+}
+
+#[test]
+fn plan_sorted_on_keys_requires_matching_prefix_order() {
+    let plan = PhysicalPlan::ProjectValues {
+        output_fields: vec![
+            ResultField {
+                name: "k1".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            ResultField {
+                name: "k2".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+        ],
+        rows: Vec::new(),
+        order_by: vec![
+            SortExpr {
+                expr: TypedExpr::column_ref("k1", 0, DataType::Int, false),
+                descending: false,
+                nulls_first: Some(false),
+            },
+            SortExpr {
+                expr: TypedExpr::column_ref("k2", 1, DataType::Int, false),
+                descending: false,
+                nulls_first: Some(false),
+            },
+        ],
+        limit: None,
+        offset: None,
+    };
+
+    assert!(plan_sorted_on_keys(&plan, &[0, 1]));
+    assert!(!plan_sorted_on_keys(&plan, &[1, 0]));
 }
 
 // -------------------------------------------------------------------
@@ -124,6 +417,36 @@ fn project_once_with_none_filter() {
         }
         _ => panic!("expected ProjectOnce"),
     }
+}
+
+#[test]
+fn estimate_rows_for_project_once_applies_limit_zero() {
+    let plan = PhysicalPlan::ProjectOnce {
+        outputs: vec![make_projection("x", DataType::Int)],
+        filter: None,
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(0), DataType::Int, false)),
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_project_once_offset_can_exhaust_singleton() {
+    let plan = PhysicalPlan::ProjectOnce {
+        outputs: vec![make_projection("x", DataType::Int)],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: Some(TypedExpr::literal(Value::Int(1), DataType::Int, false)),
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
 }
 
 // -------------------------------------------------------------------
@@ -356,6 +679,72 @@ fn insert_values_empty_rows() {
         }
         _ => panic!("expected InsertValues"),
     }
+}
+
+#[test]
+fn estimate_rows_for_insert_values_uses_row_count() {
+    let plan = PhysicalPlan::InsertValues {
+        table_id: RelationId::new(3),
+        columns: Vec::new(),
+        rows: vec![
+            vec![TypedExpr::literal(Value::Int(1), DataType::Int, false)],
+            vec![TypedExpr::literal(Value::Int(2), DataType::Int, false)],
+            vec![TypedExpr::literal(Value::Int(3), DataType::Int, false)],
+        ],
+        on_conflict: None,
+        returning: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 3.0);
+}
+
+#[test]
+fn estimate_rows_for_insert_select_uses_source_cardinality() {
+    let plan = PhysicalPlan::InsertSelect {
+        table_id: RelationId::new(3),
+        columns: Vec::new(),
+        assignments: Vec::new(),
+        source: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: vec![ResultField {
+                name: "v".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: vec![Vec::new(); 8],
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+            offset: None,
+        }),
+        on_conflict: None,
+        returning: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_create_table_as_respects_with_no_data() {
+    let source = PhysicalPlan::ProjectValues {
+        output_fields: vec![ResultField {
+            name: "v".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        rows: vec![Vec::new(); 8],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::CreateTableAs {
+        relation_name: "tmp".to_owned(),
+        columns: Vec::new(),
+        with_no_data: true,
+        source: Box::new(source),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
 }
 
 // -------------------------------------------------------------------
@@ -605,9 +994,9 @@ fn vector_top_k_hits_plan(k: i32, options: Option<serde_json::Value>) -> Physica
 }
 
 #[test]
-fn estimate_rows_for_vector_top_k_hits_subtracts_options_offset() {
+fn estimate_rows_for_vector_top_k_hits_keeps_page_size_with_options_offset() {
     let plan = vector_top_k_hits_plan(20, Some(serde_json::json!({"offset": 5})));
-    assert_eq!(estimate_plan_rows(&plan), 15.0);
+    assert_eq!(estimate_plan_rows(&plan), 20.0);
 }
 
 #[test]
@@ -615,7 +1004,7 @@ fn estimate_rows_for_vector_top_k_hits_discounts_payload_filter() {
     let options = serde_json::json!({"filter": {"must": [{"key": "kind", "match": "doc"}]}});
     let plan = vector_top_k_hits_plan(20, Some(options));
     // 20 * 0.5 (filter discount) = 10.0
-    assert_eq!(estimate_plan_rows(&plan), 10.0);
+    assert!((estimate_plan_rows(&plan) - 10.0).abs() < 1e-9);
 }
 
 #[test]
@@ -623,7 +1012,7 @@ fn estimate_rows_for_vector_top_k_hits_discounts_score_threshold() {
     let options = serde_json::json!({"score_threshold": 0.8});
     let plan = vector_top_k_hits_plan(20, Some(options));
     // 20 * 0.5 (threshold discount) = 10.0
-    assert_eq!(estimate_plan_rows(&plan), 10.0);
+    assert!((estimate_plan_rows(&plan) - 10.0).abs() < 1e-9);
 }
 
 #[test]
@@ -634,15 +1023,132 @@ fn estimate_rows_for_vector_top_k_hits_combines_offset_filter_and_threshold() {
         "distance_threshold": 0.4,
     });
     let plan = vector_top_k_hits_plan(20, Some(options));
-    // (20 - 4) * 0.5 (filter) * 0.5 (threshold) = 4.0
-    assert_eq!(estimate_plan_rows(&plan), 4.0);
+    // 20 * 0.5 (filter) * 0.5 (threshold) = 5.0. The offset increases
+    // candidates fetched by the executor but does not reduce output page size.
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
 }
 
 #[test]
-fn estimate_rows_for_vector_top_k_hits_clamps_at_one() {
+fn estimate_rows_for_hnsw_scan_uses_candidate_limit() {
+    let plan = PhysicalPlan::HnswScan {
+        table_id: RelationId::new(1),
+        index_id: IndexId::new(10),
+        query_vector: vec![1.0, 0.0],
+        limit: 7,
+        ef_search: 64,
+        projected_ordinals: vec![0],
+        output_fields: vec![ResultField {
+            name: "id".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 7.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_offset_does_not_reduce_page_size() {
     let options = serde_json::json!({"offset": 100});
     let plan = vector_top_k_hits_plan(20, Some(options));
-    assert_eq!(estimate_plan_rows(&plan), 1.0);
+    assert_eq!(estimate_plan_rows(&plan), 20.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_hits_limit_option_overrides_k() {
+    let options = serde_json::json!({"limit": 6, "offset": 100});
+    let plan = vector_top_k_hits_plan(20, Some(options));
+    assert_eq!(estimate_plan_rows(&plan), 6.0);
+}
+
+#[test]
+fn estimate_rows_for_vector_top_k_ids_zero_k_is_empty() {
+    let plan = PhysicalPlan::HybridFunctionScan {
+        function_name: "vector_top_k_ids".to_owned(),
+        args: vec![
+            TypedExpr::literal(Value::Text("docs".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("embedding".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("[1.0,0.0]".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Int(0), DataType::Int, false),
+        ],
+        output_fields: vec![ResultField {
+            name: "doc_id".to_owned(),
+            data_type: DataType::BigInt,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_full_text_top_k_hits_uses_options_and_threshold() {
+    let plan = PhysicalPlan::HybridFunctionScan {
+        function_name: "full_text_top_k_hits".to_owned(),
+        args: vec![
+            TypedExpr::literal(Value::Text("docs".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("body".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("query".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Int(20), DataType::Int, false),
+            TypedExpr::literal(Value::Null, DataType::Text, true),
+            TypedExpr::literal(Value::Null, DataType::Text, true),
+            TypedExpr::literal(Value::Double(0.4), DataType::Double, false),
+            TypedExpr::literal(
+                Value::Jsonb(serde_json::json!({
+                    "offset": 4,
+                    "filter": {"must": [{"key": "kind", "match": "doc"}]}
+                })),
+                DataType::Jsonb,
+                false,
+            ),
+        ],
+        output_fields: vec![ResultField {
+            name: "hit".to_owned(),
+            data_type: DataType::Jsonb,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    // 20 * 0.5 (filter) * 0.5 (score threshold) = 5.0.
+    // The offset increases candidates fetched, not output page size.
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_hybrid_search_top_k_hits_uses_options() {
+    let plan = PhysicalPlan::HybridFunctionScan {
+        function_name: "hybrid_search_top_k_hits".to_owned(),
+        args: vec![
+            TypedExpr::literal(Value::Text("docs".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("embedding".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("body".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("[1.0,0.0]".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("query".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Int(20), DataType::Int, false),
+            TypedExpr::literal(
+                Value::Jsonb(serde_json::json!({
+                    "offset": 4,
+                    "filter": {"must": [{"key": "kind", "match": "doc"}]},
+                    "vector_distance_threshold": 0.4
+                })),
+                DataType::Jsonb,
+                false,
+            ),
+        ],
+        output_fields: vec![ResultField {
+            name: "hit".to_owned(),
+            data_type: DataType::Jsonb,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    // 20 * 0.5 (filter) * 0.5 (threshold) = 5.0.
+    // The offset increases candidates fetched, not output page size.
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
 }
 
 #[test]
@@ -683,6 +1189,32 @@ fn estimate_rows_for_graph_neighbors_uses_limit_literal() {
     };
 
     assert_eq!(estimate_plan_rows(&plan), 2.0);
+}
+
+#[test]
+fn estimate_rows_for_graph_neighbors_uses_options_limit() {
+    let plan = PhysicalPlan::HybridFunctionScan {
+        function_name: "graph_neighbors".to_owned(),
+        args: vec![
+            TypedExpr::literal(Value::Text("related_doc".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::BigInt(42), DataType::BigInt, false),
+            TypedExpr::literal(Value::Text("outgoing".to_owned()), DataType::Text, false),
+            TypedExpr::literal(Value::Text("mentions".to_owned()), DataType::Text, false),
+            TypedExpr::literal(
+                Value::Jsonb(serde_json::json!({"limit": 3})),
+                DataType::Jsonb,
+                false,
+            ),
+        ],
+        output_fields: vec![ResultField {
+            name: "doc_id".to_owned(),
+            data_type: DataType::BigInt,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 3.0);
 }
 
 #[test]
@@ -932,6 +1464,51 @@ fn project_source_over_hybrid_scan_uses_equality_filter_shape() {
 }
 
 #[test]
+fn estimate_rows_for_bitmap_or_chain_keeps_child_lookup_estimates() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_or(
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("id", 0, DataType::Int, false),
+                TypedExpr::literal(Value::Int(10), DataType::Int, false),
+            ),
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("id", 0, DataType::Int, false),
+                TypedExpr::literal(Value::Int(20), DataType::Int, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::BitmapOr {
+            paths: vec![
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(77),
+                    value: Value::Int(10),
+                },
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(77),
+                    value: Value::Int(20),
+                },
+            ],
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 2.0);
+}
+
+#[test]
 fn project_table_seq_scan_uses_filter_shape_selectivity() {
     let plan = PhysicalPlan::ProjectTable {
         table_id: RelationId::new(42),
@@ -962,6 +1539,924 @@ fn project_table_seq_scan_uses_filter_shape_selectivity() {
     // eq_selectivity, so the planner stops favouring SeqScan over
     // index probes for tight equality predicates on large tables.
     assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn project_table_false_filter_estimates_empty() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_and(
+            TypedExpr::literal(Value::Boolean(false), DataType::Boolean, false),
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("project_id", 1, DataType::Int, false),
+                TypedExpr::literal(Value::Int(1), DataType::Int, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::SeqScan,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_single_column_composite_prefix_is_not_point_lookup() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("tenant_id", 1, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEqComposite {
+            index_id: IndexId::new(77),
+            values: vec![Value::Int(7)],
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_full_composite_lookup_remains_point_lookup() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_and(
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("tenant_id", 1, DataType::Int, false),
+                TypedExpr::literal(Value::Int(7), DataType::Int, false),
+            ),
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("id", 0, DataType::Int, false),
+                TypedExpr::literal(Value::Int(10), DataType::Int, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEqComposite {
+            index_id: IndexId::new(77),
+            values: vec![Value::Int(7), Value::Int(10)],
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
+#[test]
+fn estimate_rows_for_composite_prefix_range_uses_prefix_filter_shape() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_and(
+            TypedExpr::binary_eq(
+                TypedExpr::column_ref("tenant_id", 1, DataType::Int, false),
+                TypedExpr::literal(Value::Int(7), DataType::Int, false),
+            ),
+            TypedExpr::binary_gt(
+                TypedExpr::column_ref("id", 0, DataType::Int, false),
+                TypedExpr::literal(Value::Int(10), DataType::Int, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEqRangeComposite {
+            index_id: IndexId::new(77),
+            eq_values: vec![Value::Int(7)],
+            lower: std::ops::Bound::Excluded(Value::Int(10)),
+            upper: std::ops::Bound::Unbounded,
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 10.0);
+}
+
+#[test]
+fn estimate_rows_for_composite_prefix_range_still_applies_extra_residual() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_and(
+            TypedExpr::logical_and(
+                TypedExpr::binary_eq(
+                    TypedExpr::column_ref("tenant_id", 1, DataType::Int, false),
+                    TypedExpr::literal(Value::Int(7), DataType::Int, false),
+                ),
+                TypedExpr::binary_gt(
+                    TypedExpr::column_ref("id", 0, DataType::Int, false),
+                    TypedExpr::literal(Value::Int(10), DataType::Int, false),
+                ),
+            ),
+            TypedExpr::binary_ne(
+                TypedExpr::column_ref("status", 2, DataType::Text, false),
+                TypedExpr::literal(Value::Text("archived".to_owned()), DataType::Text, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::IndexEqRangeComposite {
+            index_id: IndexId::new(77),
+            eq_values: vec![Value::Int(7)],
+            lower: std::ops::Bound::Excluded(Value::Int(10)),
+            upper: std::ops::Bound::Unbounded,
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
+#[test]
+fn estimate_rows_for_bitmap_or_sums_child_lookup_estimates() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr {
+            kind: TypedExprKind::InList {
+                expr: Box::new(TypedExpr::column_ref("id", 0, DataType::Int, false)),
+                list: vec![
+                    TypedExpr::literal(Value::Int(10), DataType::Int, false),
+                    TypedExpr::literal(Value::Int(20), DataType::Int, false),
+                    TypedExpr::literal(Value::Int(30), DataType::Int, false),
+                ],
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::BitmapOr {
+            paths: vec![
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(77),
+                    value: Value::Int(10),
+                },
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(77),
+                    value: Value::Int(20),
+                },
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(77),
+                    value: Value::Int(30),
+                },
+            ],
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 3.0);
+}
+
+#[test]
+fn estimate_rows_for_bitmap_and_uses_most_selective_child() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::BitmapAnd {
+            paths: vec![
+                ScanAccessPath::IndexRange {
+                    index_id: IndexId::new(77),
+                    lower: std::ops::Bound::Excluded(Value::Int(10)),
+                    upper: std::ops::Bound::Unbounded,
+                },
+                ScanAccessPath::IndexEq {
+                    index_id: IndexId::new(78),
+                    value: Value::Int(20),
+                },
+            ],
+        },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
+#[test]
+fn estimate_rows_for_bitmap_and_does_not_reapply_covered_filter() {
+    let plan = PhysicalPlan::ProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::logical_and(
+            TypedExpr::binary_gt(
+                TypedExpr::column_ref("created_at", 1, DataType::Int, false),
+                TypedExpr::literal(Value::Int(10), DataType::Int, false),
+            ),
+            TypedExpr::binary_lt(
+                TypedExpr::column_ref("score", 2, DataType::Int, false),
+                TypedExpr::literal(Value::Int(20), DataType::Int, false),
+            ),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::BitmapAnd {
+            paths: vec![
+                ScanAccessPath::IndexRange {
+                    index_id: IndexId::new(77),
+                    lower: std::ops::Bound::Excluded(Value::Int(10)),
+                    upper: std::ops::Bound::Unbounded,
+                },
+                ScanAccessPath::IndexRange {
+                    index_id: IndexId::new(78),
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Excluded(Value::Int(20)),
+                },
+            ],
+        },
+    };
+
+    assert!((estimate_plan_rows(&plan) - 10.0).abs() < 1e-9);
+}
+
+#[test]
+fn estimate_rows_for_locking_project_table_uses_scan_shape() {
+    let plan = PhysicalPlan::LockingProjectTable {
+        table_id: RelationId::new(42),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("id", 0, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(3), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(1), DataType::Int, false)),
+        distinct: false,
+        distinct_on: Vec::new(),
+        access_path: ScanAccessPath::SeqScan,
+        row_lock: RowLockPlan { skip_locked: false },
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 3.0);
+}
+
+#[test]
+fn estimate_rows_for_distributed_scan_preserves_logical_scan_cardinality() {
+    let plan = PhysicalPlan::DistributedScan {
+        table_id: RelationId::new(42),
+        outputs: Vec::new(),
+        filter: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("id", 0, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        output_fields: vec![ResultField {
+            name: "id".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        node_count: 8,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_partial_aggregate_applies_group_reduction() {
+    let plan = PhysicalPlan::PartialAggregate {
+        source: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: vec![ResultField {
+                name: "tenant_id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: vec![Vec::new(); 50],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }),
+        group_by: vec![TypedExpr::column_ref("tenant_id", 0, DataType::Int, false)],
+        aggregates: vec![AggregateExpr {
+            name: "count".to_owned(),
+        }],
+        output_fields: vec![ResultField {
+            name: "count".to_owned(),
+            data_type: DataType::BigInt,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_final_aggregate_uses_largest_partial_group_count() {
+    let output_fields = vec![ResultField {
+        name: "tenant_id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let partial = |rows: usize| PhysicalPlan::PartialAggregate {
+        source: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: output_fields.clone(),
+            rows: vec![Vec::new(); rows],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }),
+        group_by: vec![TypedExpr::column_ref("tenant_id", 0, DataType::Int, false)],
+        aggregates: vec![AggregateExpr {
+            name: "count".to_owned(),
+        }],
+        output_fields: output_fields.clone(),
+    };
+    let plan = PhysicalPlan::FinalAggregate {
+        partials: vec![partial(20), partial(80), partial(40)],
+        group_by: vec![TypedExpr::column_ref("tenant_id", 0, DataType::Int, false)],
+        aggregates: vec![AggregateExpr {
+            name: "count".to_owned(),
+        }],
+        having: None,
+        output_fields,
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(2), DataType::Int, false)),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_broadcast_hash_join_uses_children() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::BroadcastHashJoin {
+        broadcast: Box::new(values_plan(4)),
+        local: Box::new(values_plan(100)),
+        join_type: aiondb_plan::JoinType::Inner,
+        left_keys: Vec::new(),
+        right_keys: Vec::new(),
+        condition: None,
+        outputs: Vec::new(),
+        output_fields,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 2.0);
+}
+
+#[test]
+fn estimate_rows_for_broadcast_hash_join_applies_residual_condition() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::BroadcastHashJoin {
+        broadcast: Box::new(values_plan(4)),
+        local: Box::new(values_plan(100)),
+        join_type: aiondb_plan::JoinType::Inner,
+        left_keys: Vec::new(),
+        right_keys: Vec::new(),
+        condition: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("id", 0, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        outputs: Vec::new(),
+        output_fields,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
+#[test]
+fn estimate_rows_for_hash_join_applies_output_offset_and_limit() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::HashJoin {
+        left: Box::new(values_plan(100)),
+        right: Box::new(values_plan(100)),
+        join_type: aiondb_plan::JoinType::Inner,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        condition: None,
+        outputs: Vec::new(),
+        filter: None,
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(7), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 7.0);
+}
+
+#[test]
+fn estimate_rows_for_nested_loop_join_applies_output_filter_shape() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::NestedLoopJoin {
+        left: Box::new(values_plan(100)),
+        right: Box::new(values_plan(100)),
+        join_type: aiondb_plan::JoinType::Inner,
+        condition: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("left_id", 0, DataType::Int, false),
+            TypedExpr::column_ref("right_id", 1, DataType::Int, false),
+        )),
+        outputs: Vec::new(),
+        filter: Some(TypedExpr::binary_gt(
+            TypedExpr::column_ref("score", 2, DataType::Int, false),
+            TypedExpr::literal(Value::Int(10), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(7), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 7.0);
+}
+
+#[test]
+fn estimate_rows_for_set_operation_union_all_sums_inputs() {
+    let output_fields = vec![ResultField {
+        name: "v".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::SetOperation {
+        op: aiondb_plan::SetOperationType::Union,
+        all: true,
+        left: Box::new(values_plan(7)),
+        right: Box::new(values_plan(11)),
+        output_fields: output_fields.clone(),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(15), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(2), DataType::Int, false)),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 15.0);
+}
+
+#[test]
+fn estimate_rows_for_distributed_append_sums_fragments_with_offset_limit() {
+    let output_fields = vec![ResultField {
+        name: "v".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::DistributedAppend {
+        fragments: vec![values_plan(4), values_plan(6), values_plan(8)],
+        output_fields: output_fields.clone(),
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(10), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 10.0);
+}
+
+#[test]
+fn estimate_rows_for_distributed_append_allows_empty_fragments() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let empty_fragment = PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::DistributedAppend {
+        fragments: vec![empty_fragment],
+        output_fields,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_gather_uses_child_cardinality() {
+    let output_fields = vec![ResultField {
+        name: "v".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let plan = PhysicalPlan::Gather {
+        child: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: output_fields.clone(),
+            rows: vec![Vec::new(); 12],
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+            offset: Some(TypedExpr::literal(Value::Int(4), DataType::Int, false)),
+        }),
+        num_workers: 4,
+        output_fields,
+        preserve_order: false,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_inner_join_with_empty_child_is_empty() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::HashJoin {
+        left: Box::new(values_plan(0)),
+        right: Box::new(values_plan(100)),
+        join_type: aiondb_plan::JoinType::Inner,
+        left_keys: vec![0],
+        right_keys: vec![0],
+        condition: None,
+        outputs: Vec::new(),
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_left_join_with_empty_right_keeps_left_rows() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::NestedLoopJoin {
+        left: Box::new(values_plan(7)),
+        right: Box::new(values_plan(0)),
+        join_type: aiondb_plan::JoinType::Left,
+        condition: None,
+        outputs: Vec::new(),
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 7.0);
+}
+
+#[test]
+fn estimate_rows_for_project_values_applies_offset_and_limit() {
+    let plan = PhysicalPlan::ProjectValues {
+        output_fields: vec![ResultField {
+            name: "v".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        rows: vec![Vec::new(); 12],
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(4), DataType::Int, false)),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 5.0);
+}
+
+#[test]
+fn estimate_rows_for_project_values_empty_rows_is_empty() {
+    let plan = PhysicalPlan::ProjectValues {
+        output_fields: vec![ResultField {
+            name: "v".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        rows: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_aggregate_group_by_empty_source_is_empty() {
+    let plan = PhysicalPlan::AggregateSource {
+        source: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: vec![ResultField {
+                name: "tenant_id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }),
+        group_by: vec![TypedExpr::column_ref("tenant_id", 0, DataType::Int, false)],
+        grouping_sets: Vec::new(),
+        aggregates: Vec::new(),
+        having: None,
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_aggregate_without_group_by_empty_source_returns_single_row() {
+    let plan = PhysicalPlan::AggregateSource {
+        source: Box::new(PhysicalPlan::ProjectValues {
+            output_fields: Vec::new(),
+            rows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }),
+        group_by: Vec::new(),
+        grouping_sets: Vec::new(),
+        aggregates: Vec::new(),
+        having: None,
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 1.0);
+}
+
+#[test]
+fn estimate_rows_for_project_values_offset_can_exhaust_rows() {
+    let plan = PhysicalPlan::ProjectValues {
+        output_fields: vec![ResultField {
+            name: "v".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        rows: vec![Vec::new(); 3],
+        order_by: Vec::new(),
+        limit: None,
+        offset: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_project_values_limit_zero_is_empty() {
+    let plan = PhysicalPlan::ProjectValues {
+        output_fields: vec![ResultField {
+            name: "v".to_owned(),
+            data_type: DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }],
+        rows: vec![Vec::new(); 3],
+        order_by: Vec::new(),
+        limit: Some(TypedExpr::literal(Value::Int(0), DataType::Int, false)),
+        offset: None,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 0.0);
+}
+
+#[test]
+fn estimate_rows_for_recursive_cte_uses_base_and_recursive_terms() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::RecursiveCte {
+        base: Box::new(values_plan(2)),
+        recursive: Box::new(values_plan(3)),
+        union_all: true,
+        output_fields,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 32.0);
+}
+
+#[test]
+fn estimate_rows_for_recursive_cte_distinct_uses_smaller_growth() {
+    let output_fields = vec![ResultField {
+        name: "id".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let values_plan = |rows: usize| PhysicalPlan::ProjectValues {
+        output_fields: output_fields.clone(),
+        rows: vec![Vec::new(); rows],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    };
+    let plan = PhysicalPlan::RecursiveCte {
+        base: Box::new(values_plan(2)),
+        recursive: Box::new(values_plan(3)),
+        union_all: false,
+        output_fields,
+    };
+
+    assert_eq!(estimate_plan_rows(&plan), 17.0);
 }
 
 #[test]

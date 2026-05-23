@@ -28,9 +28,15 @@ use std::sync::Arc;
 
 use aiondb_catalog::CatalogReader;
 use aiondb_core::{DbError, DbResult, TxnId};
-use aiondb_plan::{JoinType, LogicalPlan, ProjectionExpr, SortExpr, TypedExpr, TypedExprKind};
+use aiondb_plan::{
+    JoinType, LogicalPlan, ProjectionExpr, SetOperationType, SortExpr, TypedExpr, TypedExprKind,
+};
 
-use crate::{i64_to_f64, predicate_pushdown};
+use crate::{
+    i64_to_f64,
+    physical_builder::{estimate_filter_selectivity, estimate_hybrid_function_rows},
+    predicate_pushdown, usize_to_f64,
+};
 
 /// Minimum number of relations required to attempt reordering.
 /// With only 2 relations there is nothing to reorder.
@@ -537,20 +543,12 @@ fn predicate_relation_info(
 }
 
 fn base_selectivity_for_predicate(predicate: &TypedExpr) -> f64 {
-    if is_column_literal_equality(predicate) {
-        0.005
-    } else {
-        0.1
-    }
+    estimate_filter_selectivity(predicate)
 }
 
 fn join_selectivity_for_predicate(predicate: &TypedExpr) -> f64 {
     if !is_column_column_equality(predicate) {
-        return if is_column_literal_equality(predicate) {
-            0.005
-        } else {
-            0.1
-        };
+        return estimate_filter_selectivity(predicate);
     }
 
     let Some((left_name, right_name)) = column_column_equality_names(predicate) else {
@@ -634,17 +632,6 @@ fn ordinal_to_relation_idx(
         .find_map(|(idx, (&start, &width))| {
             (ordinal >= start && ordinal < start + width).then_some(idx)
         })
-}
-
-fn is_column_literal_equality(expr: &TypedExpr) -> bool {
-    matches!(
-        &expr.kind,
-        TypedExprKind::BinaryEq { left, right }
-            if matches!(left.kind, TypedExprKind::ColumnRef { .. })
-                && matches!(right.kind, TypedExprKind::Literal(_))
-                || matches!(right.kind, TypedExprKind::ColumnRef { .. })
-                    && matches!(left.kind, TypedExprKind::Literal(_))
-    )
 }
 
 fn is_column_column_equality(expr: &TypedExpr) -> bool {
@@ -1155,34 +1142,255 @@ fn estimate_plan_rows(plan: &LogicalPlan) -> f64 {
     // Build a temporary physical plan to use the existing estimator.
     // For simple cases (ProjectTable, SeqScan), we can estimate directly.
     match plan {
-        LogicalPlan::ProjectTable { filter, limit, .. } => {
+        LogicalPlan::ProjectOnce {
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
+        } => {
+            let filtered = apply_logical_filter_estimate(1.0, filter.as_ref());
+            let deduped = apply_logical_distinct_reduction(filtered, *distinct, distinct_on);
+            let offset_rows = apply_logical_offset(deduped, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
+        }
+        LogicalPlan::ProjectTable {
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
+        }
+        | LogicalPlan::LockingProjectTable {
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
+        } => {
             let base = 1000.0;
-            let filtered = filter.as_ref().map_or(base, |_| base * 0.1);
-            limit
-                .as_ref()
-                .and_then(literal_int)
-                .map_or(filtered, |l| filtered.min(i64_to_f64(l)))
+            let filtered = apply_logical_filter_estimate(base, filter.as_ref());
+            let deduped = apply_logical_distinct_reduction(filtered, *distinct, distinct_on);
+            let offset_rows = apply_logical_offset(deduped, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
         }
         LogicalPlan::SeqScan { .. } => 1000.0,
         LogicalPlan::ProjectSource {
             source,
             filter,
+            distinct,
+            distinct_on,
             limit,
+            offset,
             ..
         } => {
             let base = estimate_plan_rows(source);
-            let filtered = filter.as_ref().map_or(base, |_| base * 0.1);
-            limit
-                .as_ref()
-                .and_then(literal_int)
-                .map_or(filtered, |l| filtered.min(i64_to_f64(l)))
+            let filtered = apply_logical_filter_estimate(base, filter.as_ref());
+            let deduped = apply_logical_distinct_reduction(filtered, *distinct, distinct_on);
+            let offset_rows = apply_logical_offset(deduped, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
         }
-        LogicalPlan::HybridFunctionScan { args, .. } => {
-            // Use the k parameter if available.
-            args.iter().find_map(literal_int).map_or(100.0, i64_to_f64)
+        LogicalPlan::Aggregate {
+            group_by,
+            having,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
+        } => {
+            let filtered_source = apply_logical_filter_estimate(1000.0, filter.as_ref());
+            let grouped = apply_logical_group_reduction(filtered_source, group_by);
+            let having_filtered = apply_logical_filter_estimate(grouped, having.as_ref());
+            let deduped = apply_logical_distinct_reduction(having_filtered, *distinct, distinct_on);
+            let offset_rows = apply_logical_offset(deduped, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
+        }
+        LogicalPlan::AggregateSource {
+            source,
+            group_by,
+            having,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
+        } => {
+            let filtered_source =
+                apply_logical_filter_estimate(estimate_plan_rows(source), filter.as_ref());
+            let grouped = apply_logical_group_reduction(filtered_source, group_by);
+            let having_filtered = apply_logical_filter_estimate(grouped, having.as_ref());
+            let deduped = apply_logical_distinct_reduction(having_filtered, *distinct, distinct_on);
+            let offset_rows = apply_logical_offset(deduped, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
+        }
+        LogicalPlan::HybridFunctionScan {
+            function_name,
+            args,
+            ..
+        } => estimate_hybrid_function_rows(function_name, args),
+        LogicalPlan::SetOperation {
+            op,
+            all,
+            left,
+            right,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = estimate_logical_set_operation_rows(
+                *op,
+                *all,
+                estimate_plan_rows(left),
+                estimate_plan_rows(right),
+            );
+            let offset_rows = apply_logical_offset(base, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
+        }
+        LogicalPlan::ProjectValues {
+            rows,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = usize_to_f64(rows.len());
+            let offset_rows = apply_logical_offset(base, offset.as_ref());
+            apply_logical_limit(offset_rows, limit.as_ref())
+        }
+        LogicalPlan::RecursiveCte {
+            base,
+            recursive,
+            union_all,
+            ..
+        } => estimate_logical_recursive_cte_rows(
+            estimate_plan_rows(base),
+            estimate_plan_rows(recursive),
+            *union_all,
+        ),
+        LogicalPlan::CreateTableAs {
+            with_no_data,
+            source,
+            ..
+        } => {
+            if *with_no_data {
+                0.0
+            } else {
+                estimate_plan_rows(source)
+            }
+        }
+        LogicalPlan::InsertValues { rows, .. } => usize_to_f64(rows.len()),
+        LogicalPlan::InsertSelect { source, .. } => estimate_plan_rows(source),
+        LogicalPlan::DeleteFromTable { filter, .. } | LogicalPlan::UpdateTable { filter, .. } => {
+            apply_logical_filter_estimate(1000.0, filter.as_ref())
         }
         _ => 1000.0,
     }
+}
+
+fn estimate_logical_recursive_cte_rows(
+    base_rows: f64,
+    recursive_rows: f64,
+    union_all: bool,
+) -> f64 {
+    let iterations = if union_all { 10.0 } else { 5.0 };
+    (base_rows + (recursive_rows * iterations)).max(1.0)
+}
+
+fn estimate_logical_set_operation_rows(
+    op: SetOperationType,
+    all: bool,
+    left_rows: f64,
+    right_rows: f64,
+) -> f64 {
+    match op {
+        SetOperationType::Union if all => left_rows + right_rows,
+        SetOperationType::Union => {
+            let input_rows = left_rows + right_rows;
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                (input_rows * 0.5).max(1.0)
+            }
+        }
+        SetOperationType::Intersect if all => {
+            let input_rows = left_rows.min(right_rows);
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                input_rows.max(1.0)
+            }
+        }
+        SetOperationType::Intersect => {
+            let input_rows = left_rows.min(right_rows);
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                (input_rows * 0.5).max(1.0)
+            }
+        }
+        SetOperationType::Except => {
+            if left_rows <= 0.0 {
+                0.0
+            } else {
+                (left_rows * 0.5).max(1.0)
+            }
+        }
+    }
+}
+
+fn apply_logical_filter_estimate(base: f64, filter: Option<&TypedExpr>) -> f64 {
+    if base <= 0.0 {
+        return 0.0;
+    }
+    filter
+        .map(|expr| {
+            let selectivity = estimate_filter_selectivity(expr);
+            if selectivity <= 0.0 {
+                0.0
+            } else {
+                (base * selectivity).max(1.0)
+            }
+        })
+        .unwrap_or(base)
+}
+
+fn apply_logical_group_reduction(base: f64, group_by: &[TypedExpr]) -> f64 {
+    if base <= 0.0 && !group_by.is_empty() {
+        return 0.0;
+    }
+    if group_by.is_empty() {
+        1.0
+    } else {
+        (base * 0.1).max(1.0)
+    }
+}
+
+fn apply_logical_distinct_reduction(base: f64, distinct: bool, distinct_on: &[TypedExpr]) -> f64 {
+    if base <= 0.0 {
+        return 0.0;
+    }
+    if distinct || !distinct_on.is_empty() {
+        (base * 0.5).max(1.0)
+    } else {
+        base
+    }
+}
+
+fn apply_logical_offset(base: f64, offset: Option<&TypedExpr>) -> f64 {
+    offset
+        .and_then(literal_int)
+        .map_or(base, |offset| (base - i64_to_f64(offset.max(0))).max(0.0))
+}
+
+fn apply_logical_limit(base: f64, limit: Option<&TypedExpr>) -> f64 {
+    limit
+        .and_then(literal_int)
+        .map_or(base, |limit| base.min(i64_to_f64(limit.max(0))))
 }
 
 fn literal_int(expr: &TypedExpr) -> Option<i64> {
@@ -1284,5 +1492,729 @@ mod tests {
         );
 
         assert_eq!(join_selectivity_for_predicate(&predicate), 1.0);
+    }
+
+    #[test]
+    fn join_reorder_uses_shared_selectivity_for_non_equi_filters() {
+        let predicate = TypedExpr::binary_ne(
+            TypedExpr::column_ref("status", 0, aiondb_core::DataType::Text, false),
+            TypedExpr::literal(
+                aiondb_core::Value::Text("archived".to_owned()),
+                aiondb_core::DataType::Text,
+                false,
+            ),
+        );
+
+        assert_eq!(base_selectivity_for_predicate(&predicate), 0.99);
+        assert_eq!(join_selectivity_for_predicate(&predicate), 0.99);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_scan_filters_with_shared_selectivity() {
+        let plan = LogicalPlan::ProjectTable {
+            table_id: aiondb_core::RelationId::new(1),
+            outputs: Vec::new(),
+            filter: Some(TypedExpr::logical_and(
+                TypedExpr::binary_ge(
+                    TypedExpr::column_ref("id", 0, aiondb_core::DataType::Int, false),
+                    TypedExpr::literal(
+                        aiondb_core::Value::Int(100),
+                        aiondb_core::DataType::Int,
+                        false,
+                    ),
+                ),
+                TypedExpr::binary_le(
+                    TypedExpr::column_ref("id", 0, aiondb_core::DataType::Int, false),
+                    TypedExpr::literal(
+                        aiondb_core::Value::Int(110),
+                        aiondb_core::DataType::Int,
+                        false,
+                    ),
+                ),
+            )),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 90.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_false_filter_as_empty() {
+        let plan = LogicalPlan::ProjectTable {
+            table_id: aiondb_core::RelationId::new(1),
+            outputs: Vec::new(),
+            filter: Some(TypedExpr::logical_not(TypedExpr::literal(
+                aiondb_core::Value::Boolean(true),
+                aiondb_core::DataType::Boolean,
+                false,
+            ))),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_project_once_as_single_row_source() {
+        let plan = LogicalPlan::ProjectOnce {
+            outputs: vec![aiondb_plan::ProjectionExpr {
+                field: aiondb_plan::ResultField {
+                    name: "v".to_owned(),
+                    data_type: aiondb_core::DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                },
+                expr: TypedExpr::literal(
+                    aiondb_core::Value::Int(1),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            }],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 1.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_locking_scan_like_project_table() {
+        let plan = LogicalPlan::LockingProjectTable {
+            table_id: aiondb_core::RelationId::new(1),
+            outputs: Vec::new(),
+            filter: Some(TypedExpr::binary_eq(
+                TypedExpr::column_ref("id", 0, aiondb_core::DataType::Int, false),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(7),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            )),
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(3),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(1),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            distinct: false,
+            distinct_on: Vec::new(),
+            row_lock: aiondb_plan::logical::RowLockPlan { skip_locked: false },
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 3.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_scan_distinct_offset_and_limit() {
+        let plan = LogicalPlan::ProjectTable {
+            table_id: aiondb_core::RelationId::new(1),
+            outputs: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(30),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(20),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            distinct: true,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 30.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_project_source_distinct_offset_and_limit() {
+        let source = LogicalPlan::HybridFunctionScan {
+            function_name: "vector_top_k_ids".to_owned(),
+            args: vec![
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("docs".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("embedding".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("[1.0,0.0]".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(20),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            ],
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "doc_id".to_owned(),
+                data_type: aiondb_core::DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+        };
+        let plan = LogicalPlan::ProjectSource {
+            source: Box::new(source),
+            outputs: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(5),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(4),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            distinct: true,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 5.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_aggregate_shape() {
+        let plan = LogicalPlan::Aggregate {
+            table_id: aiondb_core::RelationId::new(1),
+            group_by: vec![TypedExpr::column_ref(
+                "tenant_id",
+                0,
+                aiondb_core::DataType::Int,
+                false,
+            )],
+            grouping_sets: Vec::new(),
+            aggregates: Vec::new(),
+            having: Some(TypedExpr::binary_eq(
+                TypedExpr::column_ref("tenant_id", 0, aiondb_core::DataType::Int, false),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(7),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            )),
+            filter: Some(TypedExpr::binary_gt(
+                TypedExpr::column_ref("id", 1, aiondb_core::DataType::Int, false),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(10),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            )),
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(3),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(1),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_aggregate_source_shape() {
+        let source = LogicalPlan::HybridFunctionScan {
+            function_name: "vector_top_k_ids".to_owned(),
+            args: vec![
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("docs".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("embedding".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("[1.0,0.0]".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(20),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            ],
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "doc_id".to_owned(),
+                data_type: aiondb_core::DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+        };
+        let plan = LogicalPlan::AggregateSource {
+            source: Box::new(source),
+            group_by: vec![TypedExpr::column_ref(
+                "doc_id",
+                0,
+                aiondb_core::DataType::BigInt,
+                false,
+            )],
+            grouping_sets: Vec::new(),
+            aggregates: Vec::new(),
+            having: None,
+            filter: Some(TypedExpr::binary_eq(
+                TypedExpr::column_ref("doc_id", 0, aiondb_core::DataType::BigInt, false),
+                TypedExpr::literal(
+                    aiondb_core::Value::BigInt(7),
+                    aiondb_core::DataType::BigInt,
+                    false,
+                ),
+            )),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 1.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_project_values_with_offset_and_limit() {
+        let plan = LogicalPlan::ProjectValues {
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "v".to_owned(),
+                data_type: aiondb_core::DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: vec![Vec::new(); 12],
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(5),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(4),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 5.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_project_values_offset_exhaustion() {
+        let plan = LogicalPlan::ProjectValues {
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "v".to_owned(),
+                data_type: aiondb_core::DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: vec![Vec::new(); 3],
+            order_by: Vec::new(),
+            limit: None,
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(5),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_project_values_limit_zero() {
+        let plan = LogicalPlan::ProjectValues {
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "v".to_owned(),
+                data_type: aiondb_core::DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: vec![Vec::new(); 3],
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(0),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: None,
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_project_values_empty_rows_as_empty() {
+        let plan = LogicalPlan::ProjectValues {
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "v".to_owned(),
+                data_type: aiondb_core::DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+            rows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_aggregate_group_by_empty_source_as_empty() {
+        let plan = LogicalPlan::AggregateSource {
+            source: Box::new(LogicalPlan::ProjectValues {
+                output_fields: vec![aiondb_plan::ResultField {
+                    name: "tenant_id".to_owned(),
+                    data_type: aiondb_core::DataType::Int,
+                    text_type_modifier: None,
+                    nullable: false,
+                }],
+                rows: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }),
+            group_by: vec![TypedExpr::column_ref(
+                "tenant_id",
+                0,
+                aiondb_core::DataType::Int,
+                false,
+            )],
+            grouping_sets: Vec::new(),
+            aggregates: Vec::new(),
+            having: None,
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_set_operation_union_all_shape() {
+        let output_fields = vec![aiondb_plan::ResultField {
+            name: "v".to_owned(),
+            data_type: aiondb_core::DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }];
+        let values_plan = |rows: usize| LogicalPlan::ProjectValues {
+            output_fields: output_fields.clone(),
+            rows: vec![Vec::new(); rows],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let plan = LogicalPlan::SetOperation {
+            op: SetOperationType::Union,
+            all: true,
+            left: Box::new(values_plan(7)),
+            right: Box::new(values_plan(11)),
+            output_fields: output_fields.clone(),
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(15),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+            offset: Some(TypedExpr::literal(
+                aiondb_core::Value::Int(2),
+                aiondb_core::DataType::Int,
+                false,
+            )),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 15.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_set_operation_empty_inputs_as_empty() {
+        let output_fields = vec![aiondb_plan::ResultField {
+            name: "v".to_owned(),
+            data_type: aiondb_core::DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }];
+        let empty_values = || LogicalPlan::ProjectValues {
+            output_fields: output_fields.clone(),
+            rows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let plan = LogicalPlan::SetOperation {
+            op: SetOperationType::Union,
+            all: false,
+            left: Box::new(empty_values()),
+            right: Box::new(empty_values()),
+            output_fields,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_recursive_cte_shape() {
+        let output_fields = vec![aiondb_plan::ResultField {
+            name: "v".to_owned(),
+            data_type: aiondb_core::DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }];
+        let values_plan = |rows: usize| LogicalPlan::ProjectValues {
+            output_fields: output_fields.clone(),
+            rows: vec![Vec::new(); rows],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let plan = LogicalPlan::RecursiveCte {
+            base: Box::new(values_plan(2)),
+            recursive: Box::new(values_plan(3)),
+            union_all: true,
+            output_fields,
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 32.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_insert_values_row_count() {
+        let plan = LogicalPlan::InsertValues {
+            table_id: aiondb_core::RelationId::new(7),
+            columns: Vec::new(),
+            rows: vec![Vec::new(); 4],
+            on_conflict: None,
+            returning: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 4.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_insert_select_from_source() {
+        let output_fields = vec![aiondb_plan::ResultField {
+            name: "v".to_owned(),
+            data_type: aiondb_core::DataType::Int,
+            text_type_modifier: None,
+            nullable: false,
+        }];
+        let plan = LogicalPlan::InsertSelect {
+            table_id: aiondb_core::RelationId::new(7),
+            columns: Vec::new(),
+            assignments: Vec::new(),
+            source: Box::new(LogicalPlan::ProjectValues {
+                output_fields,
+                rows: vec![Vec::new(); 9],
+                order_by: Vec::new(),
+                limit: Some(TypedExpr::literal(
+                    aiondb_core::Value::Int(6),
+                    aiondb_core::DataType::Int,
+                    false,
+                )),
+                offset: None,
+            }),
+            on_conflict: None,
+            returning: Vec::new(),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 6.0);
+    }
+
+    #[test]
+    fn join_reorder_estimates_logical_create_table_as_with_no_data_as_empty() {
+        let plan = LogicalPlan::CreateTableAs {
+            relation_name: "tmp".to_owned(),
+            columns: Vec::new(),
+            with_no_data: true,
+            source: Box::new(LogicalPlan::ProjectValues {
+                output_fields: Vec::new(),
+                rows: vec![Vec::new(); 9],
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            }),
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 0.0);
+    }
+
+    #[test]
+    fn join_reorder_uses_shared_hybrid_top_k_estimate() {
+        let plan = LogicalPlan::HybridFunctionScan {
+            function_name: "hybrid_search_top_k_hits".to_owned(),
+            args: vec![
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("docs".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("embedding".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("body".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("[1.0,0.0]".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("query".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(20),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Jsonb(serde_json::json!({
+                        "offset": 4,
+                        "filter": {"must": [{"key": "kind", "match": "doc"}]},
+                        "text_score_threshold": 0.2
+                    })),
+                    aiondb_core::DataType::Jsonb,
+                    false,
+                ),
+            ],
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "hit".to_owned(),
+                data_type: aiondb_core::DataType::Jsonb,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 5.0);
+    }
+
+    #[test]
+    fn join_reorder_uses_graph_neighbors_limit_estimate() {
+        let plan = LogicalPlan::HybridFunctionScan {
+            function_name: "graph_neighbors".to_owned(),
+            args: vec![
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("related_doc".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::BigInt(42),
+                    aiondb_core::DataType::BigInt,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("outgoing".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Int(2),
+                    aiondb_core::DataType::Int,
+                    false,
+                ),
+            ],
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "doc_id".to_owned(),
+                data_type: aiondb_core::DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 2.0);
+    }
+
+    #[test]
+    fn join_reorder_uses_graph_neighbors_options_limit_estimate() {
+        let plan = LogicalPlan::HybridFunctionScan {
+            function_name: "graph_neighbors".to_owned(),
+            args: vec![
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("related_doc".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::BigInt(42),
+                    aiondb_core::DataType::BigInt,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("outgoing".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Text("mentions".to_owned()),
+                    aiondb_core::DataType::Text,
+                    false,
+                ),
+                TypedExpr::literal(
+                    aiondb_core::Value::Jsonb(serde_json::json!({"limit": 3})),
+                    aiondb_core::DataType::Jsonb,
+                    false,
+                ),
+            ],
+            output_fields: vec![aiondb_plan::ResultField {
+                name: "doc_id".to_owned(),
+                data_type: aiondb_core::DataType::BigInt,
+                text_type_modifier: None,
+                nullable: false,
+            }],
+        };
+
+        assert_eq!(estimate_plan_rows(&plan), 3.0);
     }
 }

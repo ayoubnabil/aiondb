@@ -39,6 +39,7 @@ const BOUNDED_RANGE_SELECTIVITY: f64 = 0.10;
 const HIGH_NDISTINCT_MIN_RANGE_SELECTIVITY: f64 = 0.01;
 const HIGH_NDISTINCT_RANGE_BUCKET_WIDTH: f64 = 100.0;
 const MIN_SELECTIVITY: f64 = 1.0e-6;
+const MAX_COSTED_BITMAP_OR_SELECTIVITY: f64 = 0.50;
 
 impl Optimizer {
     /// Like `choose_access_path` but also considers index-only scans when
@@ -107,6 +108,11 @@ impl Optimizer {
         if let Some(in_list_path) = self.try_in_list_bitmap_or(filter, &meta)? {
             return Ok(in_list_path);
         }
+        if let Some(composite_in_list_path) =
+            self.try_composite_prefix_in_list_bitmap_or(filter, &meta)?
+        {
+            return Ok(composite_in_list_path);
+        }
 
         let mut extracted_by_column: HashMap<ColumnId, Option<ColumnAccessConstraint>> =
             HashMap::new();
@@ -116,7 +122,7 @@ impl Optimizer {
         // Collect all usable single-index paths for BitmapAnd consideration.
         let mut and_candidates: Vec<(ScanAccessPath, PlanCost)> = Vec::new();
         for index in indexes {
-            if index.key_columns.is_empty() {
+            if index.kind != IndexKind::BTree || index.key_columns.is_empty() {
                 continue;
             }
 
@@ -149,7 +155,7 @@ impl Optimizer {
             let eq_prefix_len = eq_values.len();
             let has_trailing_range = trailing_range.is_some();
             let access_path = if eq_prefix_len > 0 {
-                if let Some(ColumnAccessConstraint::Range(range)) = trailing_range.clone() {
+                if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
                     ScanAccessPath::IndexEqRangeComposite {
                         index_id: index.index_id,
                         eq_values,
@@ -167,10 +173,10 @@ impl Optimizer {
                 } else {
                     ScanAccessPath::IndexEq {
                         index_id: index.index_id,
-                        value: eq_values[0].clone(),
+                        value: eq_values.into_iter().next().expect("eq_prefix_len > 0"),
                     }
                 }
-            } else if let Some(ColumnAccessConstraint::Range(range)) = trailing_range.clone() {
+            } else if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
                 ScanAccessPath::IndexRange {
                     index_id: index.index_id,
                     lower: range.lower,
@@ -224,7 +230,7 @@ impl Optimizer {
 
         // --- Try BitmapAnd when multiple indexes each cover different AND predicates ---
         if and_candidates.len() >= 2 {
-            if let Some(bitmap_and) = self.try_bitmap_and(&and_candidates, &meta)? {
+            if let Some(bitmap_and) = self.try_bitmap_and(&and_candidates, &meta, table, filter)? {
                 let bitmap_cost = bitmap_and.1;
                 if best
                     .as_ref()
@@ -280,91 +286,310 @@ impl Optimizer {
         filter: &TypedExpr,
         meta: &CachedTableMeta,
     ) -> DbResult<Option<ScanAccessPath>> {
-        let TypedExprKind::InList {
-            expr,
-            list,
-            negated,
-        } = &filter.kind
-        else {
-            return Ok(None);
-        };
-        if *negated || list.is_empty() {
-            return Ok(None);
-        }
-        let TypedExprKind::ColumnRef { ordinal, .. } = &expr.kind else {
-            return Ok(None);
-        };
         let table = &meta.table;
-        let Some(column) = table.columns.get(*ordinal) else {
-            return Ok(None);
+        let stats = &meta.stats;
+        let (row_count, total_bytes) = match stats {
+            Some(s) => (s.row_count, s.total_bytes),
+            None => (1000, 1000 * 64),
         };
-        let column_id = column.column_id;
-
-        // Find an index whose first key column is `column_id`.
-        let Some(index) = meta.indexes.iter().find(|idx| {
-            idx.key_columns
-                .first()
-                .is_some_and(|c| c.column_id == column_id)
-        }) else {
-            return Ok(None);
-        };
-
-        // Each list element must be a literal we can plug into IndexEq.
-        // SQL `x IN (..., NULL)` does not match `x IS NULL` - `x = NULL` is
-        // rather than emit `IndexEq{Null}` and rely on storage sentinels.
-        let mut child_paths = Vec::with_capacity(list.len());
-        for element in list {
-            let TypedExprKind::Literal(value) = &element.kind else {
-                return Ok(None);
-            };
-            if matches!(value, aiondb_core::Value::Null) {
+        let seq_cost = PlanCost::seq_scan(row_count, total_bytes);
+        let mut best: Option<(ScanAccessPath, PlanCost)> = None;
+        for index in &meta.indexes {
+            if index.kind != IndexKind::BTree {
                 continue;
             }
-            child_paths.push(ScanAccessPath::IndexEq {
-                index_id: index.index_id,
-                value: value.clone(),
-            });
-        }
-        if child_paths.is_empty() {
-            return Ok(None);
-        }
-
-        // For small literal IN-lists on an indexed column we always
-        // pick BitmapOr over SeqScan: the cost model's
-        // RANDOM_PAGE_COST loading penalises index lookups in a way
-        // that makes a 50-element IN-list look more expensive than a
-        // 1000-row seq scan in absolute units, even though in
-        // practice the bitmap path is much faster (each IndexEq is a
-        // btree point lookup, the merge is small, and we read the
-        // heap in physical order). When the list grows past
-        // \`MAX_IN_LIST_BITMAP_OR_LEN\` we fall back so the seq scan
-        // + in-memory hashset path can win.
-        const MAX_IN_LIST_BITMAP_OR_LEN: usize = 64;
-        if list.len() > MAX_IN_LIST_BITMAP_OR_LEN {
-            let stats = &meta.stats;
-            let (row_count, total_bytes) = match stats {
-                Some(s) => (s.row_count, s.total_bytes),
-                None => (1000, 1000 * 64),
+            let Some(first_key) = index.key_columns.first() else {
+                continue;
             };
-            let mut child_costs = Vec::with_capacity(child_paths.len());
-            for child_path in &child_paths {
-                child_costs.push(self.estimate_access_cost_with_stats(
-                    child_path,
+            let column_id = first_key.column_id;
+            let Some(values) = extract_small_in_list_values(filter, table, column_id)
+                .or_else(|| extract_small_or_chain_values(filter, table, column_id))
+            else {
+                continue;
+            };
+
+            let mut child_paths = Vec::with_capacity(values.len());
+            for value in values {
+                let path = Self::build_leading_in_list_child_path(index, table, filter, value);
+                if !child_paths.contains(&path) {
+                    child_paths.push(path);
+                }
+            }
+            if child_paths.is_empty() {
+                continue;
+            }
+            if child_paths.len() == 1 {
+                let path = child_paths.into_iter().next().expect("len checked");
+                let path_cost = self.estimate_access_cost_with_stats_and_indexes(
+                    &path,
                     stats.as_ref(),
+                    &meta.indexes,
                     table,
                     filter,
-                ));
+                );
+                if index_appears_selective_for_small_bitmap_or(index, stats.as_ref())
+                    || path_cost.cheaper_than(seq_cost)
+                {
+                    if best
+                        .as_ref()
+                        .map_or(true, |(_, best_cost)| path_cost.cheaper_than(*best_cost))
+                    {
+                        best = Some((path, path_cost));
+                    }
+                }
+                continue;
             }
-            let combined_selectivity = (usize_to_f64(list.len()) / u64_to_f64(row_count.max(1)))
+
+            // For small literal IN-lists on unique/high-distinct columns we pick
+            // BitmapOr over SeqScan: the cost model's RANDOM_PAGE_COST loading
+            // overpenalises point lookups in a way that can make a 50-element ID
+            // list look more expensive than a seq scan. When stats show a
+            // low-cardinality leading key, fall through to the cost gate so a
+            // predicate like `status IN (...)` can still choose SeqScan.
+            const MAX_IN_LIST_BITMAP_OR_LEN: usize = 64;
+            let should_force_small_bitmap_or = child_paths.len() <= MAX_IN_LIST_BITMAP_OR_LEN
+                && index_appears_selective_for_small_bitmap_or(index, meta.stats.as_ref());
+            let child_selectivities: Vec<f64> = child_paths
+                .iter()
+                .map(|path| {
+                    estimate_access_path_selectivity(
+                        path,
+                        stats.as_ref(),
+                        &meta.indexes,
+                        table,
+                        filter,
+                    )
+                })
+                .collect();
+            let combined_selectivity = child_selectivities
+                .iter()
+                .copied()
+                .sum::<f64>()
                 .clamp(MIN_SELECTIVITY, 1.0);
+            let child_costs: Vec<PlanCost> = child_selectivities
+                .iter()
+                .map(|selectivity| PlanCost::bitmap_index_probe(row_count, *selectivity))
+                .collect();
             let bitmap_cost =
                 PlanCost::bitmap_or(&child_costs, row_count, total_bytes, combined_selectivity);
-            let seq_cost = PlanCost::seq_scan(row_count, total_bytes);
-            if !bitmap_cost.cheaper_than(seq_cost) {
-                return Ok(None);
+            if !should_force_small_bitmap_or {
+                if combined_selectivity >= MAX_COSTED_BITMAP_OR_SELECTIVITY {
+                    continue;
+                }
+                if !bitmap_cost.cheaper_than(seq_cost) {
+                    continue;
+                }
+            }
+            let path = ScanAccessPath::BitmapOr { paths: child_paths };
+            if best
+                .as_ref()
+                .map_or(true, |(_, best_cost)| bitmap_cost.cheaper_than(*best_cost))
+            {
+                best = Some((path, bitmap_cost));
             }
         }
-        Ok(Some(ScanAccessPath::BitmapOr { paths: child_paths }))
+        Ok(best.map(|(path, _)| path))
+    }
+
+    /// Try to build a BitmapOr for a composite BTree prefix followed by a
+    /// small IN-list, e.g. `(tenant_id, id)` with
+    /// `tenant_id = 7 AND id IN (1, 2)`.
+    fn try_composite_prefix_in_list_bitmap_or(
+        &self,
+        filter: &TypedExpr,
+        meta: &CachedTableMeta,
+    ) -> DbResult<Option<ScanAccessPath>> {
+        const MAX_IN_LIST_BITMAP_OR_LEN: usize = 64;
+        let table = &meta.table;
+        let stats = &meta.stats;
+        let (row_count, total_bytes) = match stats {
+            Some(s) => (s.row_count, s.total_bytes),
+            None => (1000, 1000 * 64),
+        };
+        let seq_cost = PlanCost::seq_scan(row_count, total_bytes);
+        let mut best: Option<(ScanAccessPath, PlanCost)> = None;
+        for index in &meta.indexes {
+            if index.kind != aiondb_catalog::IndexKind::BTree || index.key_columns.len() < 2 {
+                continue;
+            }
+
+            let mut eq_values = Vec::new();
+            for key_col in &index.key_columns {
+                if let Some(value) = extract_index_lookup_value(filter, table, key_col.column_id) {
+                    eq_values.push(value);
+                    continue;
+                }
+
+                if eq_values.is_empty() {
+                    break;
+                }
+                let values = extract_small_in_list_values(filter, table, key_col.column_id)
+                    .or_else(|| extract_small_or_chain_values(filter, table, key_col.column_id));
+                let Some(in_values) = values else {
+                    break;
+                };
+                let mut unique_in_values = Vec::with_capacity(in_values.len());
+                for value in in_values {
+                    if !unique_in_values.contains(&value) {
+                        unique_in_values.push(value);
+                    }
+                }
+                if unique_in_values.is_empty() || unique_in_values.len() > MAX_IN_LIST_BITMAP_OR_LEN
+                {
+                    break;
+                }
+
+                let mut paths = Vec::with_capacity(unique_in_values.len());
+                for value in unique_in_values {
+                    paths.push(Self::build_prefix_in_list_child_path(
+                        index, table, filter, &eq_values, value,
+                    ));
+                }
+                if paths.is_empty() {
+                    break;
+                }
+                if paths.len() == 1 {
+                    let path = paths.into_iter().next().expect("len checked");
+                    if let Some(path) =
+                        self.single_bitmap_child_if_useful(path, meta, table, filter)
+                    {
+                        let path_cost = self.estimate_access_cost_with_stats_and_indexes(
+                            &path,
+                            stats.as_ref(),
+                            &meta.indexes,
+                            table,
+                            filter,
+                        );
+                        if best
+                            .as_ref()
+                            .map_or(true, |(_, best_cost)| path_cost.cheaper_than(*best_cost))
+                        {
+                            best = Some((path, path_cost));
+                        }
+                    }
+                    break;
+                }
+                let child_selectivities: Vec<f64> = paths
+                    .iter()
+                    .map(|path| {
+                        estimate_access_path_selectivity(
+                            path,
+                            stats.as_ref(),
+                            &meta.indexes,
+                            table,
+                            filter,
+                        )
+                    })
+                    .collect();
+                let child_costs: Vec<PlanCost> = child_selectivities
+                    .iter()
+                    .map(|selectivity| PlanCost::bitmap_index_probe(row_count, *selectivity))
+                    .collect();
+                let combined_selectivity = child_selectivities
+                    .iter()
+                    .copied()
+                    .sum::<f64>()
+                    .clamp(MIN_SELECTIVITY, 1.0);
+                if !index_appears_selective_for_small_bitmap_or(index, meta.stats.as_ref()) {
+                    if combined_selectivity >= MAX_COSTED_BITMAP_OR_SELECTIVITY {
+                        break;
+                    }
+                }
+                let bitmap_cost =
+                    PlanCost::bitmap_or(&child_costs, row_count, total_bytes, combined_selectivity);
+                if !index_appears_selective_for_small_bitmap_or(index, meta.stats.as_ref()) {
+                    if !bitmap_cost.cheaper_than(seq_cost) {
+                        break;
+                    }
+                }
+                let path = ScanAccessPath::BitmapOr { paths };
+                if best
+                    .as_ref()
+                    .map_or(true, |(_, best_cost)| bitmap_cost.cheaper_than(*best_cost))
+                {
+                    best = Some((path, bitmap_cost));
+                }
+                break;
+            }
+        }
+        Ok(best.map(|(path, _)| path))
+    }
+
+    fn build_prefix_in_list_child_path(
+        index: &IndexDescriptor,
+        table: &TableDescriptor,
+        filter: &TypedExpr,
+        eq_prefix_values: &[Value],
+        in_value: Value,
+    ) -> ScanAccessPath {
+        let mut eq_values = eq_prefix_values.to_vec();
+        eq_values.push(in_value);
+        let mut trailing_range = None;
+        for key_col in index.key_columns.iter().skip(eq_values.len()) {
+            match extract_column_access_constraint(filter, table, key_col.column_id) {
+                Some(ColumnAccessConstraint::Eq(value)) => eq_values.push(value),
+                Some(range @ ColumnAccessConstraint::Range(_)) => {
+                    trailing_range = Some(range);
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
+            ScanAccessPath::IndexEqRangeComposite {
+                index_id: index.index_id,
+                eq_values,
+                lower: range.lower,
+                upper: range.upper,
+            }
+        } else {
+            ScanAccessPath::IndexEqComposite {
+                index_id: index.index_id,
+                values: eq_values,
+            }
+        }
+    }
+
+    fn build_leading_in_list_child_path(
+        index: &IndexDescriptor,
+        table: &TableDescriptor,
+        filter: &TypedExpr,
+        leading_value: Value,
+    ) -> ScanAccessPath {
+        if index.key_columns.len() == 1 {
+            return ScanAccessPath::IndexEq {
+                index_id: index.index_id,
+                value: leading_value,
+            };
+        }
+
+        let mut eq_values = vec![leading_value];
+        let mut trailing_range = None;
+        for key_col in index.key_columns.iter().skip(1) {
+            match extract_column_access_constraint(filter, table, key_col.column_id) {
+                Some(ColumnAccessConstraint::Eq(value)) => eq_values.push(value),
+                Some(range @ ColumnAccessConstraint::Range(_)) => {
+                    trailing_range = Some(range);
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
+            ScanAccessPath::IndexEqRangeComposite {
+                index_id: index.index_id,
+                eq_values,
+                lower: range.lower,
+                upper: range.upper,
+            }
+        } else {
+            ScanAccessPath::IndexEqComposite {
+                index_id: index.index_id,
+                values: eq_values,
+            }
+        }
     }
 
     /// Try to build a BitmapOr plan for a top-level OR predicate where each
@@ -394,64 +619,81 @@ impl Optimizer {
         let mut combined_selectivity = 0.0;
 
         for disjunct in &disjuncts {
-            // Try to find an index path for this disjunct.
-            let mut found = false;
+            // Pick the cheapest usable index path for this disjunct. Multiple
+            // composite indexes can match the same predicate, and the first one
+            // in catalog order is not necessarily the most selective.
+            let mut best_disjunct_path: Option<(ScanAccessPath, PlanCost, f64)> = None;
             for index in indexes {
-                if index.key_columns.is_empty() {
+                if index.kind != IndexKind::BTree {
                     continue;
                 }
-                let col_id = index.key_columns[0].column_id;
-                if let Some(constraint) = extract_column_access_constraint(disjunct, table, col_id)
-                {
-                    let path = constraint.with_index_id(index.index_id);
-                    let cost = self.estimate_access_cost_with_stats(
+                if let Some(path) = extract_index_prefix_access_path(disjunct, table, index) {
+                    let selectivity = estimate_access_path_selectivity(
                         &path,
                         stats.as_ref(),
+                        indexes,
                         table,
                         disjunct,
                     );
-                    child_paths.push(path);
-                    child_costs.push(cost);
-                    combined_selectivity += DEFAULT_EQUALITY_SELECTIVITY;
-                    found = true;
-                    break;
+                    let cost = PlanCost::bitmap_index_probe(row_count, selectivity);
+                    if best_disjunct_path
+                        .as_ref()
+                        .map_or(true, |(_, best_cost, _)| cost.cheaper_than(*best_cost))
+                    {
+                        best_disjunct_path = Some((path, cost, selectivity));
+                    }
                 }
             }
-            if !found {
+            let Some((path, cost, selectivity)) = best_disjunct_path else {
                 // If any disjunct can't use an index, bitmap OR is not viable.
                 return Ok(None);
+            };
+            if !child_paths.contains(&path) {
+                combined_selectivity += selectivity;
+                child_paths.push(path);
+                child_costs.push(cost);
             }
         }
 
-        // Same gate as `try_in_list_bitmap_or`: short OR-chains
-        // where every disjunct is an IndexEq on the same indexed
-        // column (\`col=1 OR col=2 OR ... OR col=N\`) are
-        // semantically identical to \`col IN (1, 2, ..., N)\` and
-        // should bypass the cost gate. The cost model's
-        // RANDOM_PAGE_COST overpenalises N point lookups vs a
-        // SeqScan, even though in practice the bitmap path is
-        // much faster.
+        if child_paths.len() == 1 {
+            let path = child_paths.into_iter().next().expect("len checked");
+            return Ok(self.single_bitmap_child_if_useful(path, meta, table, filter));
+        }
+
+        // Same gate as `try_in_list_bitmap_or`: short OR-chains where every
+        // disjunct is a point lookup on the same index are semantically close
+        // to an IN-list and should bypass the cost gate. The cost model's
+        // RANDOM_PAGE_COST overpenalises N point lookups vs a SeqScan, even
+        // though in practice the bitmap path is much faster.
         const MAX_OR_CHAIN_BITMAP_OR_LEN: usize = 64;
-        if disjuncts.len() <= MAX_OR_CHAIN_BITMAP_OR_LEN
-            && child_paths
-                .iter()
-                .all(|path| matches!(path, ScanAccessPath::IndexEq { .. }))
+        if child_paths.len() <= MAX_OR_CHAIN_BITMAP_OR_LEN
+            && child_paths.iter().all(|path| {
+                matches!(
+                    path,
+                    ScanAccessPath::IndexEq { .. } | ScanAccessPath::IndexEqComposite { .. }
+                )
+            })
             && {
-                let first_index = match &child_paths[0] {
-                    ScanAccessPath::IndexEq { index_id, .. } => Some(*index_id),
-                    _ => None,
-                };
+                let first_index = scan_access_path_index_id(&child_paths[0]);
                 first_index.is_some()
-                    && child_paths.iter().all(|path| match path {
-                        ScanAccessPath::IndexEq { index_id, .. } => Some(*index_id) == first_index,
-                        _ => false,
-                    })
+                    && child_paths
+                        .iter()
+                        .all(|path| scan_access_path_index_id(path) == first_index)
+                    && indexes
+                        .iter()
+                        .find(|index| Some(index.index_id) == first_index)
+                        .is_some_and(|index| {
+                            index_appears_selective_for_small_bitmap_or(index, stats.as_ref())
+                        })
             }
         {
             return Ok(Some(ScanAccessPath::BitmapOr { paths: child_paths }));
         }
 
         combined_selectivity = combined_selectivity.clamp(MIN_SELECTIVITY, 1.0);
+        if combined_selectivity >= MAX_COSTED_BITMAP_OR_SELECTIVITY {
+            return Ok(None);
+        }
         let bitmap_cost =
             PlanCost::bitmap_or(&child_costs, row_count, total_bytes, combined_selectivity);
         let seq_cost = PlanCost::seq_scan(row_count, total_bytes);
@@ -463,12 +705,52 @@ impl Optimizer {
         }
     }
 
+    fn single_bitmap_child_if_useful(
+        &self,
+        path: ScanAccessPath,
+        meta: &CachedTableMeta,
+        table: &TableDescriptor,
+        filter: &TypedExpr,
+    ) -> Option<ScanAccessPath> {
+        let Some(index_id) = scan_access_path_index_id(&path) else {
+            return None;
+        };
+        if meta
+            .indexes
+            .iter()
+            .find(|index| index.index_id == index_id)
+            .is_some_and(|index| {
+                index_appears_selective_for_small_bitmap_or(index, meta.stats.as_ref())
+            })
+        {
+            return Some(path);
+        }
+        let (row_count, total_bytes) = match &meta.stats {
+            Some(stats) => (stats.row_count, stats.total_bytes),
+            None => (1000, 1000 * 64),
+        };
+        let path_cost = self.estimate_access_cost_with_stats_and_indexes(
+            &path,
+            meta.stats.as_ref(),
+            &meta.indexes,
+            table,
+            filter,
+        );
+        if path_cost.cheaper_than(PlanCost::seq_scan(row_count, total_bytes)) {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     /// Try to build a BitmapAnd plan when multiple different indexes each
     /// cover different parts of an AND predicate.
     fn try_bitmap_and(
         &self,
         candidates: &[(ScanAccessPath, PlanCost)],
         meta: &CachedTableMeta,
+        table: &TableDescriptor,
+        filter: &TypedExpr,
     ) -> DbResult<Option<(ScanAccessPath, PlanCost)>> {
         if candidates.len() < 2 {
             return Ok(None);
@@ -478,30 +760,118 @@ impl Optimizer {
             None => (1000, 1000 * 64),
         };
 
-        // Use only candidates that touch different indexes.
-        let mut seen_indexes = std::collections::HashSet::new();
-        let mut unique_candidates: Vec<&(ScanAccessPath, PlanCost)> = Vec::new();
-        for c in candidates {
-            let idx = scan_access_path_index_id(&c.0);
-            if let Some(id) = idx {
-                if seen_indexes.insert(id) {
-                    unique_candidates.push(c);
-                }
-            }
+        struct BitmapAndCandidate {
+            path: ScanAccessPath,
+            columns: Vec<ColumnId>,
+            index_id: IndexId,
+            selectivity: f64,
+            probe_cost: PlanCost,
         }
-        if unique_candidates.len() < 2 {
+
+        let bitmap_candidates: Vec<BitmapAndCandidate> = candidates
+            .iter()
+            .filter_map(|(path, _)| {
+                let columns = scan_access_path_constrained_columns(path, &meta.indexes)?;
+                let index_id = scan_access_path_index_id(path)?;
+                let selectivity = estimate_access_path_selectivity(
+                    path,
+                    meta.stats.as_ref(),
+                    &meta.indexes,
+                    table,
+                    filter,
+                );
+                Some(BitmapAndCandidate {
+                    path: path.clone(),
+                    columns,
+                    index_id,
+                    selectivity,
+                    probe_cost: PlanCost::bitmap_index_probe(row_count, selectivity),
+                })
+            })
+            .collect();
+        if bitmap_candidates.len() < 2 {
             return Ok(None);
         }
 
-        let paths: Vec<ScanAccessPath> = unique_candidates.iter().map(|c| c.0.clone()).collect();
-        let costs: Vec<PlanCost> = unique_candidates.iter().map(|c| c.1).collect();
-        // Intersection: multiply selectivities.
-        let combined_selectivity = (DEFAULT_EQUALITY_SELECTIVITY
-            .powi(usize_to_i32_saturating(unique_candidates.len())))
-        .clamp(MIN_SELECTIVITY, 1.0);
+        let seq_cost = PlanCost::seq_scan(row_count, total_bytes);
 
-        let bitmap_cost =
-            PlanCost::bitmap_and(&costs, row_count, total_bytes, combined_selectivity);
+        let candidates_are_disjoint = |selected: &[usize], candidate_idx: usize| {
+            let candidate = &bitmap_candidates[candidate_idx];
+            selected.iter().all(|selected_idx| {
+                let selected = &bitmap_candidates[*selected_idx];
+                selected.index_id != candidate.index_id
+                    && !selected
+                        .columns
+                        .iter()
+                        .any(|column| candidate.columns.contains(column))
+            })
+        };
+        let bitmap_cost_for = |selected: &[usize]| {
+            let child_costs: Vec<PlanCost> = selected
+                .iter()
+                .map(|idx| bitmap_candidates[*idx].probe_cost)
+                .collect();
+            let combined_selectivity = selected
+                .iter()
+                .map(|idx| bitmap_candidates[*idx].selectivity)
+                .product::<f64>()
+                .clamp(MIN_SELECTIVITY, 1.0);
+            PlanCost::bitmap_and(&child_costs, row_count, total_bytes, combined_selectivity)
+        };
+
+        let mut best_subset: Option<(Vec<usize>, PlanCost)> = None;
+        for left_idx in 0..bitmap_candidates.len() {
+            for right_idx in (left_idx + 1)..bitmap_candidates.len() {
+                if !candidates_are_disjoint(&[left_idx], right_idx) {
+                    continue;
+                }
+                let mut selected = vec![left_idx, right_idx];
+                let mut selected_cost = bitmap_cost_for(&selected);
+
+                loop {
+                    let mut best_extension: Option<(usize, PlanCost)> = None;
+                    for candidate_idx in 0..bitmap_candidates.len() {
+                        if selected.contains(&candidate_idx)
+                            || !candidates_are_disjoint(&selected, candidate_idx)
+                        {
+                            continue;
+                        }
+                        let mut extended = selected.clone();
+                        extended.push(candidate_idx);
+                        let extended_cost = bitmap_cost_for(&extended);
+                        if extended_cost.cheaper_than(selected_cost)
+                            && best_extension.as_ref().map_or(true, |(_, best_cost)| {
+                                extended_cost.cheaper_than(*best_cost)
+                            })
+                        {
+                            best_extension = Some((candidate_idx, extended_cost));
+                        }
+                    }
+                    let Some((candidate_idx, extended_cost)) = best_extension else {
+                        break;
+                    };
+                    selected.push(candidate_idx);
+                    selected_cost = extended_cost;
+                }
+
+                if best_subset.as_ref().map_or(true, |(_, best_cost)| {
+                    selected_cost.cheaper_than(*best_cost)
+                }) {
+                    best_subset = Some((selected, selected_cost));
+                }
+            }
+        }
+
+        let Some((selected, bitmap_cost)) = best_subset else {
+            return Ok(None);
+        };
+        if !bitmap_cost.cheaper_than(seq_cost) {
+            return Ok(None);
+        }
+        let paths = selected
+            .into_iter()
+            .map(|idx| bitmap_candidates[idx].path.clone())
+            .collect();
 
         Ok(Some((ScanAccessPath::BitmapAnd { paths }, bitmap_cost)))
     }
@@ -603,16 +973,6 @@ impl Optimizer {
         })
     }
 
-    fn estimate_access_cost_with_stats(
-        &self,
-        access_path: &ScanAccessPath,
-        stats: Option<&TableStatistics>,
-        table: &TableDescriptor,
-        filter: &TypedExpr,
-    ) -> PlanCost {
-        self.estimate_access_cost_with_stats_and_indexes(access_path, stats, &[], table, filter)
-    }
-
     fn estimate_access_cost_with_stats_and_indexes(
         &self,
         access_path: &ScanAccessPath,
@@ -630,8 +990,15 @@ impl Optimizer {
 
         match access_path {
             ScanAccessPath::SeqScan => PlanCost::seq_scan(row_count, total_bytes),
-            ScanAccessPath::IndexEq { index_id, .. } => {
-                let selectivity = estimate_equality_selectivity(filter, stats, table);
+            ScanAccessPath::IndexEq { index_id, value } => {
+                let selectivity = estimate_index_equality_selectivity(
+                    *index_id,
+                    std::slice::from_ref(value),
+                    stats,
+                    indexes,
+                    filter,
+                    table,
+                );
                 let correlation = leading_correlation(*index_id);
                 PlanCost::index_eq_with_correlation(
                     row_count,
@@ -641,12 +1008,9 @@ impl Optimizer {
                 )
             }
             ScanAccessPath::IndexEqComposite { index_id, values } => {
-                // Each additional prefix column tightens selectivity multiplicatively.
-                let base = estimate_equality_selectivity(filter, stats, table);
-                let selectivity = (base
-                    * DEFAULT_EQUALITY_SELECTIVITY
-                        .powi(usize_to_i32_saturating(values.len()).saturating_sub(1)))
-                .clamp(MIN_SELECTIVITY, 1.0);
+                let selectivity = estimate_index_equality_selectivity(
+                    *index_id, values, stats, indexes, filter, table,
+                );
                 let correlation = leading_correlation(*index_id);
                 PlanCost::index_eq_with_correlation(
                     row_count,
@@ -655,9 +1019,24 @@ impl Optimizer {
                     correlation,
                 )
             }
-            ScanAccessPath::IndexRange { index_id, .. }
-            | ScanAccessPath::IndexEqRangeComposite { index_id, .. } => {
+            ScanAccessPath::IndexRange { index_id, .. } => {
                 let selectivity = estimate_range_selectivity(filter, stats, table);
+                let correlation = leading_correlation(*index_id);
+                PlanCost::index_range_with_correlation(
+                    row_count,
+                    total_bytes,
+                    selectivity,
+                    correlation,
+                )
+            }
+            ScanAccessPath::IndexEqRangeComposite {
+                index_id,
+                eq_values,
+                ..
+            } => {
+                let selectivity = estimate_index_eq_range_selectivity(
+                    *index_id, eq_values, stats, indexes, filter, table,
+                );
                 let correlation = leading_correlation(*index_id);
                 PlanCost::index_range_with_correlation(
                     row_count,
@@ -912,10 +1291,152 @@ fn estimate_equality_selectivity(
         return DEFAULT_EQUALITY_SELECTIVITY;
     };
 
-    let value = extract_eq_literal_value(filter);
+    let value = extract_index_lookup_value(filter, table, column_id);
+    estimate_column_equality_selectivity(col_stats, value.as_ref())
+}
 
+fn estimate_index_equality_selectivity(
+    index_id: IndexId,
+    values: &[Value],
+    stats: Option<&TableStatistics>,
+    indexes: &[IndexDescriptor],
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+) -> f64 {
+    let Some(index) = indexes.iter().find(|index| index.index_id == index_id) else {
+        return (estimate_equality_selectivity(filter, stats, table)
+            * DEFAULT_EQUALITY_SELECTIVITY
+                .powi(usize_to_i32_saturating(values.len()).saturating_sub(1)))
+        .clamp(MIN_SELECTIVITY, 1.0);
+    };
+    let selectivity = values
+        .iter()
+        .zip(&index.key_columns)
+        .map(|(value, key_col)| {
+            stats
+                .and_then(|stats| {
+                    stats
+                        .column_stats
+                        .iter()
+                        .find(|col_stats| col_stats.column_id == key_col.column_id)
+                })
+                .map_or(DEFAULT_EQUALITY_SELECTIVITY, |col_stats| {
+                    estimate_column_equality_selectivity(col_stats, Some(value))
+                })
+        })
+        .product::<f64>();
+    selectivity.clamp(MIN_SELECTIVITY, 1.0)
+}
+
+fn estimate_index_eq_range_selectivity(
+    index_id: IndexId,
+    eq_values: &[Value],
+    stats: Option<&TableStatistics>,
+    indexes: &[IndexDescriptor],
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+) -> f64 {
+    let range_selectivity = estimate_range_selectivity(filter, stats, table);
+    let Some(index) = indexes.iter().find(|index| index.index_id == index_id) else {
+        return (estimate_equality_selectivity(filter, stats, table) * range_selectivity)
+            .clamp(MIN_SELECTIVITY, 1.0);
+    };
+
+    let prefix_selectivity = eq_values
+        .iter()
+        .zip(&index.key_columns)
+        .map(|(value, key_col)| {
+            stats
+                .and_then(|stats| {
+                    stats
+                        .column_stats
+                        .iter()
+                        .find(|col_stats| col_stats.column_id == key_col.column_id)
+                })
+                .map_or(DEFAULT_EQUALITY_SELECTIVITY, |col_stats| {
+                    estimate_column_equality_selectivity(col_stats, Some(value))
+                })
+        })
+        .product::<f64>();
+
+    (prefix_selectivity * range_selectivity).clamp(MIN_SELECTIVITY, 1.0)
+}
+
+fn estimate_access_path_selectivity(
+    access_path: &ScanAccessPath,
+    stats: Option<&TableStatistics>,
+    indexes: &[IndexDescriptor],
+    table: &TableDescriptor,
+    filter: &TypedExpr,
+) -> f64 {
+    match access_path {
+        ScanAccessPath::IndexEq { index_id, value } => estimate_index_equality_selectivity(
+            *index_id,
+            std::slice::from_ref(value),
+            stats,
+            indexes,
+            filter,
+            table,
+        ),
+        ScanAccessPath::IndexEqComposite { index_id, values } => {
+            estimate_index_equality_selectivity(*index_id, values, stats, indexes, filter, table)
+        }
+        ScanAccessPath::IndexRange { .. } => estimate_range_selectivity(filter, stats, table),
+        ScanAccessPath::IndexEqRangeComposite {
+            index_id,
+            eq_values,
+            ..
+        } => {
+            estimate_index_eq_range_selectivity(*index_id, eq_values, stats, indexes, filter, table)
+        }
+        ScanAccessPath::GinContainment { .. } => DEFAULT_EQUALITY_SELECTIVITY,
+        ScanAccessPath::SeqScan => 1.0,
+        ScanAccessPath::BitmapOr { paths } => paths
+            .iter()
+            .map(|path| estimate_access_path_selectivity(path, stats, indexes, table, filter))
+            .sum::<f64>()
+            .clamp(MIN_SELECTIVITY, 1.0),
+        ScanAccessPath::BitmapAnd { paths } => paths
+            .iter()
+            .map(|path| estimate_access_path_selectivity(path, stats, indexes, table, filter))
+            .product::<f64>()
+            .clamp(MIN_SELECTIVITY, 1.0),
+        ScanAccessPath::IndexOnlyScan { inner, .. } => {
+            estimate_access_path_selectivity(inner, stats, indexes, table, filter)
+        }
+    }
+}
+
+fn index_appears_selective_for_small_bitmap_or(
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if index.unique {
+        return true;
+    }
+    let Some(stats) = stats else {
+        return true;
+    };
+    let Some(leading) = index.key_columns.first() else {
+        return false;
+    };
+    let Some(col_stats) = stats
+        .column_stats
+        .iter()
+        .find(|col_stats| col_stats.column_id == leading.column_id)
+    else {
+        return true;
+    };
+    let min_distinct = (u64_to_f64(stats.row_count) * 0.5).max(1.0);
+    col_stats.ndistinct >= min_distinct
+}
+
+fn estimate_column_equality_selectivity(
+    col_stats: &aiondb_catalog::ColumnStatistics,
+    value: Option<&Value>,
+) -> f64 {
     // --- MCV lookup (exact frequency if value is among most-common) ---
-    let (mcv_sel, sum_common) = match (&col_stats.mcv, &value) {
+    let (mcv_sel, sum_common) = match (&col_stats.mcv, value) {
         (Some(mcv), Some(val)) => {
             if let Some(freq) = mcv.frequency_of(val) {
                 // Exact MCV hit - return immediately.
@@ -931,7 +1452,7 @@ fn estimate_equality_selectivity(
     let other_frac = (1.0 - col_stats.null_fraction - sum_common).max(0.0);
 
     // --- Histogram-based estimate on the non-MCV population ---
-    if let (Some(histogram), Some(val)) = (&col_stats.histogram, &value) {
+    if let (Some(histogram), Some(val)) = (&col_stats.histogram, value) {
         if let Some(hist_sel) = histogram.estimate_equality_selectivity(val) {
             let sel = mcv_sel + other_frac * hist_sel;
             return sel.clamp(MIN_SELECTIVITY, 1.0);
@@ -950,19 +1471,6 @@ fn estimate_equality_selectivity(
         col_stats.equality_selectivity()
     };
     apply_null_fraction(sel, col_stats.null_fraction)
-}
-
-/// Extract the literal value from an equality predicate for histogram lookup.
-fn extract_eq_literal_value(filter: &TypedExpr) -> Option<Value> {
-    match &filter.kind {
-        TypedExprKind::BinaryEq { left, right } => {
-            extract_constant_value(left).or_else(|| extract_constant_value(right))
-        }
-        TypedExprKind::LogicalAnd { left, right } => {
-            extract_eq_literal_value(left).or_else(|| extract_eq_literal_value(right))
-        }
-        _ => None,
-    }
 }
 
 fn extract_text_search_match(
@@ -1300,6 +1808,62 @@ pub(crate) fn extract_index_access_path(
         .map(|extracted| extracted.with_index_id(index_id))
 }
 
+pub(crate) fn extract_index_prefix_access_path(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> Option<ScanAccessPath> {
+    if index.key_columns.is_empty() {
+        return None;
+    }
+
+    let mut eq_values = Vec::new();
+    let mut trailing_range = None;
+
+    for key_col in &index.key_columns {
+        match extract_column_access_constraint(filter, table, key_col.column_id) {
+            Some(ColumnAccessConstraint::Eq(value)) => eq_values.push(value),
+            Some(range @ ColumnAccessConstraint::Range(_)) => {
+                trailing_range = Some(range);
+                break;
+            }
+            None => break,
+        }
+    }
+
+    if !eq_values.is_empty() {
+        if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
+            Some(ScanAccessPath::IndexEqRangeComposite {
+                index_id: index.index_id,
+                eq_values,
+                lower: range.lower,
+                upper: range.upper,
+            })
+        } else if index.key_columns.len() > 1 {
+            Some(ScanAccessPath::IndexEqComposite {
+                index_id: index.index_id,
+                values: eq_values,
+            })
+        } else {
+            Some(ScanAccessPath::IndexEq {
+                index_id: index.index_id,
+                value: eq_values
+                    .into_iter()
+                    .next()
+                    .expect("eq_values is not empty"),
+            })
+        }
+    } else if let Some(ColumnAccessConstraint::Range(range)) = trailing_range {
+        Some(ScanAccessPath::IndexRange {
+            index_id: index.index_id,
+            lower: range.lower,
+            upper: range.upper,
+        })
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ColumnAccessConstraint {
     Eq(Value),
@@ -1347,6 +1911,84 @@ pub(crate) fn extract_index_lookup_value(
     column_id: ColumnId,
 ) -> Option<Value> {
     extract_index_lookup_value_direct(filter, table, column_id)
+}
+
+pub(crate) fn extract_small_in_list_values(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    column_id: ColumnId,
+) -> Option<Vec<Value>> {
+    match &filter.kind {
+        TypedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if *negated || list.is_empty() {
+                return None;
+            }
+            let TypedExprKind::ColumnRef { ordinal, .. } = &expr.kind else {
+                return None;
+            };
+            if !table
+                .columns
+                .get(*ordinal)
+                .is_some_and(|column| column.column_id == column_id)
+            {
+                return None;
+            }
+            let mut values = Vec::with_capacity(list.len());
+            for element in list {
+                let TypedExprKind::Literal(value) = &element.kind else {
+                    return None;
+                };
+                if !matches!(value, Value::Null) && !values.contains(value) {
+                    values.push(value.clone());
+                }
+            }
+            Some(values)
+        }
+        TypedExprKind::LogicalAnd { left, right } => {
+            extract_small_in_list_values(left, table, column_id)
+                .or_else(|| extract_small_in_list_values(right, table, column_id))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_small_or_chain_values(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    column_id: ColumnId,
+) -> Option<Vec<Value>> {
+    const MAX_OR_CHAIN_BITMAP_OR_LEN: usize = 64;
+    match &filter.kind {
+        TypedExprKind::LogicalOr { .. } => {
+            let disjuncts = collect_or_disjuncts(filter);
+            if disjuncts.len() < 2 {
+                return None;
+            }
+            let mut values = Vec::with_capacity(disjuncts.len());
+            for disjunct in disjuncts {
+                let value = extract_index_lookup_value(disjunct, table, column_id)?;
+                if matches!(value, Value::Null) {
+                    return None;
+                }
+                if !values.contains(&value) {
+                    if values.len() >= MAX_OR_CHAIN_BITMAP_OR_LEN {
+                        return None;
+                    }
+                    values.push(value);
+                }
+            }
+            Some(values)
+        }
+        TypedExprKind::LogicalAnd { left, right } => {
+            extract_small_or_chain_values(left, table, column_id)
+                .or_else(|| extract_small_or_chain_values(right, table, column_id))
+        }
+        _ => None,
+    }
 }
 
 fn extract_index_lookup_value_direct(
@@ -1825,6 +2467,37 @@ fn scan_access_path_index_id(path: &ScanAccessPath) -> Option<IndexId> {
             | ScanAccessPath::BitmapAnd { .. } => return None,
         }
     }
+}
+
+fn scan_access_path_constrained_columns(
+    path: &ScanAccessPath,
+    indexes: &[IndexDescriptor],
+) -> Option<Vec<ColumnId>> {
+    let index_id = scan_access_path_index_id(path)?;
+    let index = indexes.iter().find(|index| index.index_id == index_id)?;
+    let constrained_len = match path {
+        ScanAccessPath::IndexEq { .. } | ScanAccessPath::IndexRange { .. } => 1,
+        ScanAccessPath::IndexEqComposite { values, .. } => values.len(),
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } => eq_values.len() + 1,
+        ScanAccessPath::IndexOnlyScan { inner, .. } => {
+            return scan_access_path_constrained_columns(inner, indexes);
+        }
+        ScanAccessPath::SeqScan
+        | ScanAccessPath::GinContainment { .. }
+        | ScanAccessPath::BitmapOr { .. }
+        | ScanAccessPath::BitmapAnd { .. } => return None,
+    };
+    if constrained_len == 0 || constrained_len > index.key_columns.len() {
+        return None;
+    }
+    Some(
+        index
+            .key_columns
+            .iter()
+            .take(constrained_len)
+            .map(|column| column.column_id)
+            .collect(),
+    )
 }
 
 fn index_keys_appear_high_distinct(

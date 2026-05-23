@@ -7,8 +7,9 @@
 //!
 //! A predicate is pushed only when we are **certain** it references only
 //! one side of the join (based on `ColumnRef` ordinals vs `left_width`).
-//! For hybrid joins, predicates are never pushed into a child subtree that
-//! contains `HybridFunctionScan`; only pure relational branches remain eligible.
+//! Mixed SQL/hybrid subtrees remain eligible: predicates can pass through
+//! transparent relational wrappers and nested joins, but they are not pushed
+//! directly into `HybridFunctionScan` leaves.
 
 use std::{cell::Cell, sync::Arc};
 
@@ -164,11 +165,9 @@ pub(crate) fn push_predicates_into_join(
     //   INNER/SEMI: neither side nullable  -> push both
     //   ANTI  JOIN: only outputs left rows; right-side WHERE filtering
     //               changes match semantics -> push left only
-    let can_push_left = (is_inner
-        || matches!(join_type, JoinType::Left | JoinType::Anti | JoinType::Semi))
-        && !logical_plan_contains_hybrid_sources(&left);
-    let can_push_right = (is_inner || matches!(join_type, JoinType::Right))
-        && !logical_plan_contains_hybrid_sources(&right);
+    let can_push_left =
+        is_inner || matches!(join_type, JoinType::Left | JoinType::Anti | JoinType::Semi);
+    let can_push_right = is_inner || matches!(join_type, JoinType::Right);
 
     // --- Phase 1: Decompose WHERE filter predicates ---
     if let Some(filter_expr) = filter {
@@ -1025,7 +1024,7 @@ fn remap_outer_ordinals_in_plan(
     }
 }
 
-fn rewrite_project_source_refs(
+pub(crate) fn rewrite_project_source_refs(
     expr: TypedExpr,
     outputs: &[aiondb_plan::ProjectionExpr],
 ) -> TypedExpr {
@@ -1329,10 +1328,26 @@ fn rewrite_project_source_refs(
 ///   should have happened earlier).
 ///
 /// Returns true when the child plan can accept a pushed-down predicate.
-fn can_push_into_child(child: &LogicalPlan) -> bool {
+pub(crate) fn can_push_into_child(child: &LogicalPlan) -> bool {
     match child {
-        LogicalPlan::ProjectTable { .. } | LogicalPlan::SeqScan { .. } => true,
+        LogicalPlan::ProjectTable { .. }
+        | LogicalPlan::LockingProjectTable { .. }
+        | LogicalPlan::SeqScan { .. } => true,
         LogicalPlan::NestedLoopJoin { outputs, .. } => outputs.is_empty(),
+        LogicalPlan::SetOperation {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            order_by.is_empty()
+                && limit.is_none()
+                && offset.is_none()
+                && can_push_into_child(left)
+                && can_push_into_child(right)
+        }
         _ => project_source_allows_predicate_passthrough(child),
     }
 }
@@ -1362,6 +1377,33 @@ pub(crate) fn push_into_child(child: LogicalPlan, predicate: TypedExpr) -> Logic
                 offset,
                 distinct,
                 distinct_on,
+            }
+        }
+        LogicalPlan::LockingProjectTable {
+            table_id,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct,
+            distinct_on,
+            row_lock,
+        } => {
+            let new_filter = match filter {
+                Some(existing) => Some(TypedExpr::logical_and(existing, predicate)),
+                None => Some(predicate),
+            };
+            LogicalPlan::LockingProjectTable {
+                table_id,
+                outputs,
+                filter: new_filter,
+                order_by,
+                limit,
+                offset,
+                distinct,
+                distinct_on,
+                row_lock,
             }
         }
         LogicalPlan::SeqScan { table_id } => LogicalPlan::ProjectTable {
@@ -1405,6 +1447,32 @@ pub(crate) fn push_into_child(child: LogicalPlan, predicate: TypedExpr) -> Logic
                 distinct_on,
             }
         }
+        LogicalPlan::SetOperation {
+            op,
+            all,
+            left,
+            right,
+            output_fields,
+            order_by,
+            limit,
+            offset,
+        } if order_by.is_empty()
+            && limit.is_none()
+            && offset.is_none()
+            && can_push_into_child(&left)
+            && can_push_into_child(&right) =>
+        {
+            LogicalPlan::SetOperation {
+                op,
+                all,
+                left: Box::new(push_into_child(*left, predicate.clone())),
+                right: Box::new(push_into_child(*right, predicate)),
+                output_fields,
+                order_by,
+                limit,
+                offset,
+            }
+        }
         LogicalPlan::ProjectSource {
             source,
             outputs,
@@ -1420,7 +1488,6 @@ pub(crate) fn push_into_child(child: LogicalPlan, predicate: TypedExpr) -> Logic
                 .filter(|_| offset.is_none())
                 .filter(|_| !distinct)
                 .filter(|_| distinct_on.is_empty())
-                .filter(|_| !logical_plan_contains_hybrid_sources(&source))
                 .filter(|_| can_push_into_child(&source))
                 .is_some()
             {
@@ -1473,7 +1540,6 @@ fn project_source_allows_predicate_passthrough(child: &LogicalPlan) -> bool {
                 && offset.is_none()
                 && !*distinct
                 && distinct_on.is_empty()
-                && !logical_plan_contains_hybrid_sources(source)
                 && can_push_into_child(source)
         }
         _ => false,
@@ -1484,7 +1550,9 @@ fn project_source_passthrough_ordinals(
     outputs: &[aiondb_plan::ProjectionExpr],
 ) -> Option<Vec<usize>> {
     if outputs.is_empty() {
-        return None;
+        // Empty outputs mean "project every child column" for ProjectSource,
+        // so the parent and child ordinal spaces are identical.
+        return Some(Vec::new());
     }
     outputs
         .iter()
@@ -1529,6 +1597,9 @@ fn logical_plan_child_width_at_depth(
         LogicalPlan::SeqScan { table_id } => table_column_count(catalog_reader, txn_id, *table_id),
         LogicalPlan::ProjectTable {
             table_id, outputs, ..
+        }
+        | LogicalPlan::LockingProjectTable {
+            table_id, outputs, ..
         } => {
             if outputs.is_empty() {
                 // No explicit projection: width = number of table columns.
@@ -1554,6 +1625,15 @@ fn logical_plan_child_width_at_depth(
                 _ => Ok(None),
             }
         }
+        LogicalPlan::ProjectSource {
+            source, outputs, ..
+        } => {
+            if outputs.is_empty() {
+                logical_plan_child_width_at_depth(source, catalog_reader, txn_id, depth + 1)
+            } else {
+                Ok(Some(outputs.len()))
+            }
+        }
         _ => {
             let fields = plan.output_fields();
             if fields.is_empty() {
@@ -1563,32 +1643,6 @@ fn logical_plan_child_width_at_depth(
             }
         }
     }
-}
-
-fn logical_plan_contains_hybrid_sources(plan: &LogicalPlan) -> bool {
-    let mut stack = vec![plan];
-    while let Some(plan) = stack.pop() {
-        match plan {
-            LogicalPlan::HybridFunctionScan { .. } => return true,
-            LogicalPlan::ProjectSource { source, .. }
-            | LogicalPlan::AggregateSource { source, .. }
-            | LogicalPlan::InsertSelect { source, .. } => stack.push(source),
-            LogicalPlan::NestedLoopJoin { left, right, .. }
-            | LogicalPlan::SetOperation { left, right, .. } => {
-                stack.push(right);
-                stack.push(left);
-            }
-            LogicalPlan::RecursiveCte {
-                base, recursive, ..
-            } => {
-                stack.push(recursive);
-                stack.push(base);
-            }
-            LogicalPlan::CypherQuery(_) => {}
-            _ => {}
-        }
-    }
-    false
 }
 
 /// System column names appended by the type-checker
@@ -1826,4 +1880,326 @@ pub(crate) fn predicate_contains_subquery_or_outer_ref(expr: &TypedExpr) -> bool
         for_each_child_expr(expr, &mut |child| stack.push(child));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiondb_catalog::{
+        ColumnDescriptor, IndexDescriptor, QualifiedName, SchemaDescriptor, SequenceDescriptor,
+        TableDescriptor, TableStatistics, ViewDescriptor,
+    };
+    use aiondb_core::{ColumnId, DbResult, IndexId, SchemaId, TxnId};
+    use aiondb_core::{DataType, RelationId, Value};
+    use aiondb_plan::logical::RowLockPlan;
+    use aiondb_plan::{ProjectionExpr, ResultField, SetOperationType};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct WidthCatalog {
+        table: TableDescriptor,
+    }
+
+    impl WidthCatalog {
+        fn new(table_id: RelationId, column_count: usize) -> Self {
+            let columns = (0..column_count)
+                .map(|idx| ColumnDescriptor {
+                    column_id: ColumnId::new(u64::try_from(idx + 1).unwrap_or(u64::MAX)),
+                    name: format!("col_{idx}"),
+                    data_type: DataType::Int,
+                    raw_type_name: None,
+                    text_type_modifier: None,
+                    nullable: false,
+                    ordinal_position: u32::try_from(idx).unwrap_or(u32::MAX),
+                    default_value: None,
+                })
+                .collect();
+            Self {
+                table: TableDescriptor {
+                    table_id,
+                    schema_id: SchemaId::new(1),
+                    name: QualifiedName::qualified("public", "t"),
+                    columns,
+                    identity_columns: Vec::new(),
+                    primary_key: None,
+                    foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
+                    shard_config: None,
+                    owner: None,
+                },
+            }
+        }
+    }
+
+    impl CatalogReader for WidthCatalog {
+        fn get_schema(
+            &self,
+            _txn: TxnId,
+            _name: &QualifiedName,
+        ) -> DbResult<Option<SchemaDescriptor>> {
+            Ok(None)
+        }
+
+        fn get_table(
+            &self,
+            _txn: TxnId,
+            _name: &QualifiedName,
+        ) -> DbResult<Option<TableDescriptor>> {
+            Ok(Some(self.table.clone()))
+        }
+
+        fn get_table_by_id(
+            &self,
+            _txn: TxnId,
+            table_id: RelationId,
+        ) -> DbResult<Option<TableDescriptor>> {
+            Ok((self.table.table_id == table_id).then(|| self.table.clone()))
+        }
+
+        fn list_tables(&self, _txn: TxnId, _schema_id: SchemaId) -> DbResult<Vec<TableDescriptor>> {
+            Ok(vec![self.table.clone()])
+        }
+
+        fn list_indexes(
+            &self,
+            _txn: TxnId,
+            _table_id: RelationId,
+        ) -> DbResult<Vec<IndexDescriptor>> {
+            Ok(Vec::new())
+        }
+
+        fn get_index(&self, _txn: TxnId, _index_id: IndexId) -> DbResult<Option<IndexDescriptor>> {
+            Ok(None)
+        }
+
+        fn get_sequence(
+            &self,
+            _txn: TxnId,
+            _name: &QualifiedName,
+        ) -> DbResult<Option<SequenceDescriptor>> {
+            Ok(None)
+        }
+
+        fn get_statistics(
+            &self,
+            _txn: TxnId,
+            _table_id: RelationId,
+        ) -> DbResult<Option<TableStatistics>> {
+            Ok(None)
+        }
+
+        fn get_view(&self, _txn: TxnId, _name: &QualifiedName) -> DbResult<Option<ViewDescriptor>> {
+            Ok(None)
+        }
+
+        fn list_views(&self, _txn: TxnId, _schema_id: SchemaId) -> DbResult<Vec<ViewDescriptor>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn result_field(name: &str, data_type: DataType) -> ResultField {
+        ResultField {
+            name: name.to_owned(),
+            data_type,
+            text_type_modifier: None,
+            nullable: false,
+        }
+    }
+
+    fn projection(name: &str, ordinal: usize, data_type: DataType) -> ProjectionExpr {
+        ProjectionExpr {
+            field: result_field(name, data_type.clone()),
+            expr: TypedExpr::column_ref(name, ordinal, data_type, false),
+        }
+    }
+
+    fn project_table(table_id: u64) -> LogicalPlan {
+        LogicalPlan::ProjectTable {
+            table_id: RelationId::new(table_id),
+            outputs: vec![projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        }
+    }
+
+    fn locking_project_table(table_id: u64) -> LogicalPlan {
+        LogicalPlan::LockingProjectTable {
+            table_id: RelationId::new(table_id),
+            outputs: vec![projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            row_lock: RowLockPlan { skip_locked: false },
+        }
+    }
+
+    fn id_eq(value: i32) -> TypedExpr {
+        TypedExpr::binary_eq(
+            TypedExpr::column_ref("id", 0, DataType::Int, false),
+            TypedExpr::literal(Value::Int(value), DataType::Int, false),
+        )
+    }
+
+    #[test]
+    fn push_into_child_pushes_filter_into_union_all_branches() {
+        let plan = LogicalPlan::SetOperation {
+            op: SetOperationType::Union,
+            all: true,
+            left: Box::new(project_table(1)),
+            right: Box::new(project_table(2)),
+            output_fields: vec![result_field("id", DataType::Int)],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        assert!(can_push_into_child(&plan));
+
+        let pushed = push_into_child(plan, id_eq(7));
+        let LogicalPlan::SetOperation { left, right, .. } = pushed else {
+            panic!("expected SetOperation after pushdown");
+        };
+        match (left.as_ref(), right.as_ref()) {
+            (
+                LogicalPlan::ProjectTable {
+                    filter: Some(left_filter),
+                    ..
+                },
+                LogicalPlan::ProjectTable {
+                    filter: Some(right_filter),
+                    ..
+                },
+            ) => {
+                assert!(matches!(left_filter.kind, TypedExprKind::BinaryEq { .. }));
+                assert!(matches!(right_filter.kind, TypedExprKind::BinaryEq { .. }));
+            }
+            other => panic!("expected both union branches to receive filters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_operation_with_limit_blocks_predicate_pushdown() {
+        let plan = LogicalPlan::SetOperation {
+            op: SetOperationType::Union,
+            all: true,
+            left: Box::new(project_table(1)),
+            right: Box::new(project_table(2)),
+            output_fields: vec![result_field("id", DataType::Int)],
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(Value::Int(10), DataType::Int, false)),
+            offset: None,
+        };
+
+        assert!(!can_push_into_child(&plan));
+    }
+
+    #[test]
+    fn push_into_child_pushes_filter_into_locking_project_table() {
+        let plan = locking_project_table(1);
+
+        assert!(can_push_into_child(&plan));
+
+        let pushed = push_into_child(plan, id_eq(7));
+        match pushed {
+            LogicalPlan::LockingProjectTable {
+                filter: Some(filter),
+                row_lock,
+                ..
+            } => {
+                assert!(matches!(filter.kind, TypedExprKind::BinaryEq { .. }));
+                assert!(!row_lock.skip_locked);
+            }
+            other => panic!("expected filtered LockingProjectTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_into_child_pushes_through_implicit_project_source() {
+        let plan = LogicalPlan::ProjectSource {
+            source: Box::new(project_table(1)),
+            outputs: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert!(can_push_into_child(&plan));
+
+        let pushed = push_into_child(plan, id_eq(7));
+        match pushed {
+            LogicalPlan::ProjectSource { source, filter, .. } => {
+                assert!(filter.is_none());
+                match source.as_ref() {
+                    LogicalPlan::ProjectTable {
+                        filter: Some(filter),
+                        ..
+                    } => assert!(matches!(filter.kind, TypedExprKind::BinaryEq { .. })),
+                    other => panic!("expected filtered ProjectTable child, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProjectSource wrapper, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_child_width_uses_source_for_implicit_project_source() {
+        let table_id = RelationId::new(1);
+        let catalog: Arc<dyn CatalogReader> = Arc::new(WidthCatalog::new(table_id, 3));
+        let plan = LogicalPlan::ProjectSource {
+            source: Box::new(LogicalPlan::ProjectTable {
+                table_id,
+                outputs: Vec::new(),
+                filter: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                distinct: false,
+                distinct_on: Vec::new(),
+            }),
+            outputs: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert_eq!(
+            logical_plan_child_width(&plan, &catalog, TxnId::new(1)).unwrap(),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn logical_child_width_uses_catalog_for_implicit_locking_project_table() {
+        let table_id = RelationId::new(1);
+        let catalog: Arc<dyn CatalogReader> = Arc::new(WidthCatalog::new(table_id, 3));
+        let plan = LogicalPlan::LockingProjectTable {
+            table_id,
+            outputs: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            row_lock: RowLockPlan { skip_locked: false },
+        };
+
+        assert_eq!(
+            logical_plan_child_width(&plan, &catalog, TxnId::new(1)).unwrap(),
+            Some(10)
+        );
+    }
 }

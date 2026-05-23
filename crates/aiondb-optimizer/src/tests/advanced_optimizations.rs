@@ -396,6 +396,91 @@ fn limit_with_offset_pushes_sum() {
     }
 }
 
+#[test]
+fn limit_pushdown_crosses_transparent_project_source() {
+    let catalog = MultiTableCatalog::new(1, 2, 10_000);
+    let optimizer = Optimizer::new(Arc::new(catalog));
+
+    let inner = make_scan_leaf(RelationId::new(1), &["c0", "c1"]);
+    let middle = LogicalPlan::ProjectSource {
+        source: Box::new(inner),
+        outputs: vec![
+            ProjectionExpr {
+                field: ResultField {
+                    name: "c0".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: true,
+                },
+                expr: TypedExpr::column_ref("c0", 0, DataType::Int, true),
+            },
+            ProjectionExpr {
+                field: ResultField {
+                    name: "c1".to_owned(),
+                    data_type: DataType::Int,
+                    text_type_modifier: None,
+                    nullable: true,
+                },
+                expr: TypedExpr::column_ref("c1", 1, DataType::Int, true),
+            },
+        ],
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+    let plan = LogicalPlan::ProjectSource {
+        source: Box::new(middle),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "c0".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: true,
+            },
+            expr: TypedExpr::column_ref("c0", 0, DataType::Int, true),
+        }],
+        filter: None,
+        order_by: vec![SortExpr {
+            expr: TypedExpr::column_ref("c0", 0, DataType::Int, true),
+            descending: false,
+            nulls_first: None,
+        }],
+        limit: Some(TypedExpr::literal(Value::Int(10), DataType::Int, false)),
+        offset: Some(TypedExpr::literal(Value::Int(5), DataType::Int, false)),
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    let physical = optimizer
+        .optimize(OptimizeRequest {
+            logical_plan: plan,
+            txn_id: TxnId::new(1),
+        })
+        .unwrap();
+
+    match &physical {
+        PhysicalPlan::ProjectSource { source, .. } => match source.as_ref() {
+            PhysicalPlan::ProjectSource { source, .. } => match source.as_ref() {
+                PhysicalPlan::ProjectTable {
+                    limit, order_by, ..
+                } => {
+                    assert!(!order_by.is_empty(), "ORDER BY should reach the table");
+                    match limit.as_ref().map(|expr| &expr.kind) {
+                        Some(TypedExprKind::Literal(Value::BigInt(15))) => {}
+                        other => panic!("expected pushed effective limit 15, got {other:?}"),
+                    }
+                }
+                other => panic!("expected ProjectTable grandchild, got: {other:?}"),
+            },
+            other => panic!("expected ProjectSource child, got: {other:?}"),
+        },
+        other => panic!("expected ProjectSource, got: {other:?}"),
+    }
+}
+
 // ==================================================================
 // Redundant sort elimination tests
 // ==================================================================
@@ -466,6 +551,74 @@ fn redundant_sort_eliminated_when_child_sorted_by_order_by() {
             assert!(
                 order_by.is_empty(),
                 "parent ORDER BY should be eliminated when child is already sorted"
+            );
+        }
+        other => panic!("expected ProjectSource, got: {other:?}"),
+    }
+}
+
+#[test]
+fn redundant_sort_eliminated_when_project_values_child_has_order_by() {
+    let catalog = MultiTableCatalog::new(1, 1, 1_000);
+    let optimizer = Optimizer::new(Arc::new(catalog));
+    let order_by = vec![SortExpr {
+        expr: TypedExpr::column_ref("v", 0, DataType::Int, false),
+        descending: false,
+        nulls_first: Some(false),
+    }];
+    let fields = vec![ResultField {
+        name: "v".to_owned(),
+        data_type: DataType::Int,
+        text_type_modifier: None,
+        nullable: false,
+    }];
+    let inner = LogicalPlan::ProjectValues {
+        output_fields: fields,
+        rows: vec![
+            vec![TypedExpr::literal(Value::Int(1), DataType::Int, false)],
+            vec![TypedExpr::literal(Value::Int(2), DataType::Int, false)],
+        ],
+        order_by: order_by.clone(),
+        limit: None,
+        offset: None,
+    };
+    let plan = LogicalPlan::ProjectSource {
+        source: Box::new(inner),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "v".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("v", 0, DataType::Int, false),
+        }],
+        filter: None,
+        order_by,
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    let physical = optimizer
+        .optimize(OptimizeRequest {
+            logical_plan: plan,
+            txn_id: TxnId::new(1),
+        })
+        .unwrap();
+
+    match &physical {
+        PhysicalPlan::ProjectSource {
+            order_by, source, ..
+        } => {
+            assert!(
+                order_by.is_empty(),
+                "parent ORDER BY should be eliminated when ProjectValues is already sorted"
+            );
+            assert!(
+                matches!(source.as_ref(), PhysicalPlan::ProjectValues { order_by, .. } if !order_by.is_empty()),
+                "expected sorted ProjectValues child, got {source:?}"
             );
         }
         other => panic!("expected ProjectSource, got: {other:?}"),

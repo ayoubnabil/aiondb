@@ -381,3 +381,89 @@ fn assert_scalar_function_arg_ordinals(
         other => panic!("expected ScalarFunction, got {other:?}"),
     }
 }
+
+fn find_project_table_filter<'a>(
+    plan: &'a PhysicalPlan,
+    table_id: RelationId,
+) -> Option<&'a Option<TypedExpr>> {
+    match plan {
+        PhysicalPlan::ProjectTable {
+            table_id: candidate,
+            filter,
+            ..
+        } if *candidate == table_id => Some(filter),
+        PhysicalPlan::ProjectSource { source, .. }
+        | PhysicalPlan::AggregateSource { source, .. } => {
+            find_project_table_filter(source, table_id)
+        }
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. } => find_project_table_filter(left, table_id)
+            .or_else(|| find_project_table_filter(right, table_id)),
+        _ => None,
+    }
+}
+
+#[test]
+fn optimizer_pushes_sql_filter_inside_mixed_sql_hybrid_branch() {
+    let catalog = MultiTableCatalog::new(2, 2, 1_000);
+    let optimizer = Optimizer::new(Arc::new(catalog));
+
+    let mixed_sql_hybrid_branch = LogicalPlan::NestedLoopJoin {
+        left: Box::new(make_hybrid_leaf("graph_neighbors", 32, "doc_id")),
+        right: Box::new(make_scan_leaf(RelationId::new(1), &["col_0", "col_1"])),
+        join_type: JoinType::Inner,
+        condition: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("doc_id", 0, DataType::Int, false),
+            TypedExpr::column_ref("col_0", 1, DataType::Int, false),
+        )),
+        outputs: Vec::new(),
+        filter: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    let plan = LogicalPlan::NestedLoopJoin {
+        left: Box::new(mixed_sql_hybrid_branch),
+        right: Box::new(make_scan_leaf(RelationId::new(2), &["col_0", "col_1"])),
+        join_type: JoinType::Inner,
+        condition: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("col_0", 1, DataType::Int, false),
+            TypedExpr::column_ref("col_0", 3, DataType::Int, false),
+        )),
+        outputs: vec![ProjectionExpr {
+            field: ResultField {
+                name: "doc_id".to_owned(),
+                data_type: DataType::Int,
+                text_type_modifier: None,
+                nullable: false,
+            },
+            expr: TypedExpr::column_ref("doc_id", 0, DataType::Int, false),
+        }],
+        filter: Some(TypedExpr::binary_eq(
+            TypedExpr::column_ref("col_1", 2, DataType::Int, false),
+            TypedExpr::literal(Value::Int(7), DataType::Int, false),
+        )),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        distinct_on: Vec::new(),
+    };
+
+    let physical = optimizer
+        .optimize(OptimizeRequest {
+            logical_plan: plan,
+            txn_id: TxnId::new(1),
+        })
+        .unwrap();
+
+    let pushed_filter = find_project_table_filter(&physical, RelationId::new(1))
+        .expect("expected mixed branch SQL table to remain in the physical plan")
+        .as_ref()
+        .expect("expected SQL predicate to be pushed to the table scan before hybrid join work");
+    assert_binary_eq_left_column_ordinal(pushed_filter, 1);
+}

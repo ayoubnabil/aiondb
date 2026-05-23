@@ -6,19 +6,125 @@
 //! - Aggregates -> partial/final aggregates (map-reduce)
 //! - Hash joins -> broadcast hash joins (small side broadcast)
 
-use aiondb_plan::{AggregateExpr, PhysicalPlan, ResultField, ScanAccessPath, TypedExpr};
+use aiondb_core::Value;
+use aiondb_plan::{
+    AggregateExpr, PhysicalPlan, ProjectionExpr, ResultField, ScanAccessPath, TypedExpr,
+    TypedExprKind,
+};
+
+use crate::{physical_builder::estimate_plan_rows, predicate_pushdown::map_ordinals};
+
+const BROADCAST_ROW_THRESHOLD: usize = 10_000;
+
+fn literal_limit_rows(expr: &TypedExpr) -> Option<usize> {
+    match &expr.kind {
+        TypedExprKind::Literal(Value::Int(value)) => usize::try_from((*value).max(0)).ok(),
+        TypedExprKind::Literal(Value::BigInt(value)) => usize::try_from((*value).max(0)).ok(),
+        _ => None,
+    }
+}
+
+fn limit_is_broadcast_small(limit: &Option<TypedExpr>) -> bool {
+    limit
+        .as_ref()
+        .and_then(literal_limit_rows)
+        .is_some_and(|rows| rows <= BROADCAST_ROW_THRESHOLD)
+}
+
+fn estimated_rows_are_broadcast_small(plan: &PhysicalPlan) -> bool {
+    estimate_plan_rows(plan) <= BROADCAST_ROW_THRESHOLD as f64
+}
+
+fn is_hybrid_rooted_plan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::HybridFunctionScan { .. } => true,
+        PhysicalPlan::ProjectSource { source, .. }
+        | PhysicalPlan::AggregateSource { source, .. }
+        | PhysicalPlan::CreateTableAs { source, .. }
+        | PhysicalPlan::InsertSelect { source, .. } => is_hybrid_rooted_plan(source),
+        _ => false,
+    }
+}
+
+fn access_path_can_produce_small_broadcast_side(access_path: &ScanAccessPath) -> bool {
+    match access_path {
+        ScanAccessPath::SeqScan => false,
+        ScanAccessPath::IndexOnlyScan { inner, .. } => {
+            access_path_can_produce_small_broadcast_side(inner)
+        }
+        _ => true,
+    }
+}
 
 /// Return `true` when the plan is a simple small-side node that is
 /// suitable for broadcasting (e.g. `ProjectOnce`, `ProjectValues`,
-/// or a `ProjectSource` over a small plan / with a LIMIT).
+/// or a `ProjectSource` over a small plan / with a small constant LIMIT).
 fn is_small_plan(plan: &PhysicalPlan) -> bool {
     match plan {
-        PhysicalPlan::ProjectOnce { .. } | PhysicalPlan::ProjectValues { .. } => true,
-        PhysicalPlan::ProjectSource { source, limit, .. } => {
-            // A ProjectSource over a small plan, or with a small LIMIT
-            is_small_plan(source) || limit.is_some()
+        PhysicalPlan::ProjectOnce { .. } => true,
+        PhysicalPlan::ProjectValues { rows, limit, .. } => {
+            rows.len() <= BROADCAST_ROW_THRESHOLD || limit_is_broadcast_small(limit)
         }
+        PhysicalPlan::ProjectSource { source, limit, .. } => {
+            // A ProjectSource over a small plan, or with a small LIMIT.
+            is_small_plan(source)
+                || limit_is_broadcast_small(limit)
+                || (is_hybrid_rooted_plan(source) && estimated_rows_are_broadcast_small(plan))
+        }
+        PhysicalPlan::AggregateSource { source, limit, .. } => {
+            (is_hybrid_rooted_plan(source) && estimated_rows_are_broadcast_small(plan))
+                || limit_is_broadcast_small(limit)
+        }
+        PhysicalPlan::ProjectTable { access_path, .. }
+        | PhysicalPlan::LockingProjectTable { access_path, .. }
+        | PhysicalPlan::Aggregate { access_path, .. } => {
+            access_path_can_produce_small_broadcast_side(access_path)
+                && estimated_rows_are_broadcast_small(plan)
+        }
+        PhysicalPlan::HybridFunctionScan { .. } => estimated_rows_are_broadcast_small(plan),
         _ => false,
+    }
+}
+
+fn typed_key_exprs(keys: &[usize], fields: &[ResultField]) -> Vec<TypedExpr> {
+    keys.iter()
+        .map(|&ordinal| {
+            let (data_type, nullable) = fields
+                .get(ordinal)
+                .map_or((aiondb_core::DataType::Int, false), |field| {
+                    (field.data_type.clone(), field.nullable)
+                });
+            TypedExpr::column_ref(format!("key_{ordinal}"), ordinal, data_type, nullable)
+        })
+        .collect()
+}
+
+fn swap_join_ordinal(ordinal: usize, left_width: usize, right_width: usize) -> usize {
+    if ordinal < left_width {
+        ordinal.saturating_add(right_width)
+    } else {
+        ordinal.saturating_sub(left_width)
+    }
+}
+
+fn remap_expr_for_swapped_join(
+    expr: TypedExpr,
+    left_width: usize,
+    right_width: usize,
+) -> TypedExpr {
+    map_ordinals(expr, |ordinal| {
+        swap_join_ordinal(ordinal, left_width, right_width)
+    })
+}
+
+fn remap_projection_for_swapped_join(
+    projection: ProjectionExpr,
+    left_width: usize,
+    right_width: usize,
+) -> ProjectionExpr {
+    ProjectionExpr {
+        field: projection.field,
+        expr: remap_expr_for_swapped_join(projection.expr, left_width, right_width),
     }
 }
 
@@ -96,6 +202,7 @@ pub fn try_distribute_aggregate(plan: &PhysicalPlan, node_count: usize) -> Optio
         order_by,
         limit,
         offset,
+        access_path,
         ..
     } = plan
     {
@@ -120,7 +227,7 @@ pub fn try_distribute_aggregate(plan: &PhysicalPlan, node_count: usize) -> Optio
                     offset: None,
                     distinct: false,
                     distinct_on: Vec::new(),
-                    access_path: ScanAccessPath::SeqScan,
+                    access_path: access_path.clone(),
                 }),
                 group_by: group_by.clone(),
                 aggregates: aggregate_exprs.clone(),
@@ -164,11 +271,26 @@ pub fn try_distribute_hash_join(plan: &PhysicalPlan, node_count: usize) -> Optio
         ..
     } = plan
     {
+        if *join_type != aiondb_plan::JoinType::Inner {
+            return None;
+        }
+
         let left_small = is_small_plan(left);
         let right_small = is_small_plan(right);
+        let left_rows = left_small.then(|| estimate_plan_rows(left));
+        let right_rows = right_small.then(|| estimate_plan_rows(right));
 
+        let broadcast_right = match (left_rows, right_rows) {
+            (Some(left_rows), Some(right_rows)) => right_rows < left_rows,
+            (None, Some(_)) => true,
+            _ => false,
+        };
         let (broadcast, local) = if left_small {
-            (left, right)
+            if broadcast_right {
+                (right, left)
+            } else {
+                (left, right)
+            }
         } else if right_small {
             (right, left)
         } else {
@@ -181,29 +303,35 @@ pub fn try_distribute_hash_join(plan: &PhysicalPlan, node_count: usize) -> Optio
         let left_fields = plan_output_fields(left);
         let right_fields = plan_output_fields(right);
 
-        let typed_left_keys: Vec<TypedExpr> = left_keys
-            .iter()
-            .map(|&ordinal| {
-                let (data_type, nullable) = left_fields
-                    .get(ordinal)
-                    .map_or((aiondb_core::DataType::Int, false), |f| {
-                        (f.data_type.clone(), f.nullable)
-                    });
-                TypedExpr::column_ref(format!("key_{ordinal}"), ordinal, data_type, nullable)
-            })
-            .collect();
-
-        let typed_right_keys: Vec<TypedExpr> = right_keys
-            .iter()
-            .map(|&ordinal| {
-                let (data_type, nullable) = right_fields
-                    .get(ordinal)
-                    .map_or((aiondb_core::DataType::Int, false), |f| {
-                        (f.data_type.clone(), f.nullable)
-                    });
-                TypedExpr::column_ref(format!("key_{ordinal}"), ordinal, data_type, nullable)
-            })
-            .collect();
+        let (typed_left_keys, typed_right_keys, condition, outputs) = if broadcast_right {
+            let remap_left_width = left_fields.len();
+            let remap_right_width = right_fields.len();
+            (
+                typed_key_exprs(right_keys, &right_fields),
+                typed_key_exprs(left_keys, &left_fields),
+                condition.clone().map(|expr| {
+                    remap_expr_for_swapped_join(expr, remap_left_width, remap_right_width)
+                }),
+                outputs
+                    .iter()
+                    .cloned()
+                    .map(|projection| {
+                        remap_projection_for_swapped_join(
+                            projection,
+                            remap_left_width,
+                            remap_right_width,
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            (
+                typed_key_exprs(left_keys, &left_fields),
+                typed_key_exprs(right_keys, &right_fields),
+                condition.clone(),
+                outputs.clone(),
+            )
+        };
 
         return Some(PhysicalPlan::BroadcastHashJoin {
             broadcast: broadcast.clone(),
@@ -211,8 +339,8 @@ pub fn try_distribute_hash_join(plan: &PhysicalPlan, node_count: usize) -> Optio
             join_type: *join_type,
             left_keys: typed_left_keys,
             right_keys: typed_right_keys,
-            condition: condition.clone(),
-            outputs: outputs.clone(),
+            condition,
+            outputs,
             output_fields,
         });
     }
@@ -608,6 +736,50 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_distribution_preserves_chosen_access_path() {
+        let plan = PhysicalPlan::Aggregate {
+            table_id: RelationId::new(2),
+            group_by: vec![TypedExpr::column_ref(
+                "department",
+                0,
+                DataType::Text,
+                false,
+            )],
+            grouping_sets: Vec::new(),
+            aggregates: vec![make_projection("count", 0, DataType::BigInt)],
+            having: None,
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            access_path: ScanAccessPath::IndexEq {
+                index_id: aiondb_core::IndexId::new(77),
+                value: Value::Text("engineering".to_owned()),
+            },
+        };
+
+        let result = try_distribute_aggregate(&plan, 3).expect("expected aggregate distribution");
+        let PhysicalPlan::FinalAggregate { partials, .. } = result else {
+            panic!("expected FinalAggregate");
+        };
+
+        for partial in partials {
+            let PhysicalPlan::PartialAggregate { source, .. } = partial else {
+                panic!("expected PartialAggregate");
+            };
+            assert!(matches!(
+                *source,
+                PhysicalPlan::ProjectTable {
+                    access_path: ScanAccessPath::IndexEq { .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn aggregate_not_distributed_when_single_node() {
         let plan = make_aggregate_plan(RelationId::new(2));
         let result = try_distribute_aggregate(&plan, 1);
@@ -688,6 +860,261 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_distributed_with_small_right_remaps_keys_and_outputs() {
+        let big_left = PhysicalPlan::ProjectTable {
+            table_id: RelationId::new(10),
+            outputs: vec![
+                make_projection("left_id", 0, DataType::Int),
+                make_projection("left_name", 1, DataType::Text),
+            ],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            access_path: ScanAccessPath::SeqScan,
+        };
+        let small_right = PhysicalPlan::ProjectOnce {
+            outputs: vec![make_projection("right_id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+        let condition = TypedExpr::binary_eq(
+            TypedExpr::column_ref("left_id", 0, DataType::Int, false),
+            TypedExpr::column_ref("right_id", 2, DataType::Int, false),
+        );
+
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(big_left),
+            right: Box::new(small_right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: Some(condition),
+            outputs: vec![
+                make_projection("left_id", 0, DataType::Int),
+                make_projection("right_id", 2, DataType::Int),
+            ],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 3).expect("expected broadcast hash join");
+
+        let PhysicalPlan::BroadcastHashJoin {
+            broadcast,
+            local,
+            left_keys,
+            right_keys,
+            condition,
+            outputs,
+            ..
+        } = result
+        else {
+            panic!("expected BroadcastHashJoin");
+        };
+        assert!(matches!(*broadcast, PhysicalPlan::ProjectOnce { .. }));
+        assert!(matches!(*local, PhysicalPlan::ProjectTable { .. }));
+        assert_eq!(left_keys.len(), 1);
+        assert_eq!(right_keys.len(), 1);
+        assert!(matches!(
+            left_keys[0].kind,
+            TypedExprKind::ColumnRef { ordinal: 0, .. }
+        ));
+        assert!(matches!(
+            right_keys[0].kind,
+            TypedExprKind::ColumnRef { ordinal: 0, .. }
+        ));
+
+        let condition = condition.expect("expected remapped join condition");
+        match condition.kind {
+            TypedExprKind::BinaryEq { left, right } => {
+                assert!(matches!(
+                    left.kind,
+                    TypedExprKind::ColumnRef { ordinal: 1, .. }
+                ));
+                assert!(matches!(
+                    right.kind,
+                    TypedExprKind::ColumnRef { ordinal: 0, .. }
+                ));
+            }
+            other => panic!("expected BinaryEq condition, got {other:?}"),
+        }
+        assert!(matches!(
+            outputs[0].expr.kind,
+            TypedExprKind::ColumnRef { ordinal: 1, .. }
+        ));
+        assert!(matches!(
+            outputs[1].expr.kind,
+            TypedExprKind::ColumnRef { ordinal: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn hash_join_broadcasts_smaller_side_when_both_sides_are_small() {
+        let left_values = PhysicalPlan::ProjectValues {
+            output_fields: vec![make_result_field("left_id", DataType::Int, false)],
+            rows: vec![vec![TypedExpr::literal(Value::Int(1), DataType::Int, false)]; 100],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let right_once = PhysicalPlan::ProjectOnce {
+            outputs: vec![make_projection("right_id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(left_values),
+            right: Box::new(right_once),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("left_id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 3).expect("expected broadcast hash join");
+        let PhysicalPlan::BroadcastHashJoin {
+            broadcast, local, ..
+        } = result
+        else {
+            panic!("expected BroadcastHashJoin");
+        };
+        assert!(
+            matches!(*broadcast, PhysicalPlan::ProjectOnce { .. }),
+            "expected smaller right side to be broadcast, got {broadcast:?}"
+        );
+        assert!(
+            matches!(*local, PhysicalPlan::ProjectValues { .. }),
+            "expected larger left side to stay local, got {local:?}"
+        );
+    }
+
+    #[test]
+    fn hash_join_distribution_skips_non_inner_joins() {
+        let small_left = PhysicalPlan::ProjectOnce {
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+        let right = make_seq_scan_plan(RelationId::new(2));
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(small_left),
+            right: Box::new(right),
+            join_type: JoinType::Left,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert!(try_distribute_hash_join(&plan, 3).is_none());
+    }
+
+    #[test]
+    fn hash_join_broadcasts_index_lookup_project_table_side() {
+        let left = make_seq_scan_plan(RelationId::new(1));
+        let indexed_right = PhysicalPlan::ProjectTable {
+            table_id: RelationId::new(2),
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            access_path: ScanAccessPath::IndexEq {
+                index_id: aiondb_core::IndexId::new(99),
+                value: Value::Int(42),
+            },
+        };
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(left),
+            right: Box::new(indexed_right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 4).expect("expected indexed side broadcast");
+        let PhysicalPlan::BroadcastHashJoin {
+            broadcast, local, ..
+        } = result
+        else {
+            panic!("expected BroadcastHashJoin");
+        };
+        assert!(matches!(
+            *broadcast,
+            PhysicalPlan::ProjectTable {
+                access_path: ScanAccessPath::IndexEq { .. },
+                ..
+            }
+        ));
+        assert!(matches!(*local, PhysicalPlan::ProjectTable { .. }));
+    }
+
+    #[test]
+    fn hash_join_does_not_broadcast_default_seq_scan_estimate() {
+        let left = make_seq_scan_plan(RelationId::new(1));
+        let right = make_seq_scan_plan(RelationId::new(2));
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        assert!(try_distribute_hash_join(&plan, 4).is_none());
+    }
+
+    #[test]
     fn hash_join_not_distributed_when_neither_side_small() {
         let left = make_seq_scan_plan(RelationId::new(1));
         let right = make_seq_scan_plan(RelationId::new(2));
@@ -712,6 +1139,118 @@ mod tests {
         assert!(
             result.is_none(),
             "expected no distribution when neither side is small"
+        );
+    }
+
+    #[test]
+    fn hash_join_distributes_small_limited_project_source() {
+        let small_left = PhysicalPlan::ProjectSource {
+            source: Box::new(make_seq_scan_plan(RelationId::new(1))),
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(Value::Int(100), DataType::Int, false)),
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+        let right = make_seq_scan_plan(RelationId::new(2));
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(small_left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 3);
+
+        assert!(
+            matches!(result, Some(PhysicalPlan::BroadcastHashJoin { .. })),
+            "expected small limited ProjectSource to be broadcast"
+        );
+    }
+
+    #[test]
+    fn hash_join_does_not_broadcast_large_limited_project_source() {
+        let large_left = PhysicalPlan::ProjectSource {
+            source: Box::new(make_seq_scan_plan(RelationId::new(1))),
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: Some(TypedExpr::literal(
+                Value::Int(1_000_000),
+                DataType::Int,
+                false,
+            )),
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+        let right = make_seq_scan_plan(RelationId::new(2));
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(large_left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 3);
+
+        assert!(
+            result.is_none(),
+            "large limited ProjectSource should not be broadcast"
+        );
+    }
+
+    #[test]
+    fn hash_join_does_not_broadcast_large_project_values() {
+        let large_left = PhysicalPlan::ProjectValues {
+            output_fields: vec![make_result_field("id", DataType::Int, false)],
+            rows: vec![Vec::new(); BROADCAST_ROW_THRESHOLD + 1],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let right = make_seq_scan_plan(RelationId::new(2));
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(large_left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            condition: None,
+            outputs: vec![make_projection("id", 0, DataType::Int)],
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+        };
+
+        let result = try_distribute_hash_join(&plan, 3);
+
+        assert!(
+            result.is_none(),
+            "large ProjectValues should not be broadcast without a small output limit"
         );
     }
 
