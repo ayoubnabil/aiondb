@@ -238,7 +238,13 @@ impl Engine {
         session: &SessionHandle,
         stmt: &aiondb_parser::CommentStatement,
     ) -> DbResult<crate::prepared::StatementResult> {
-        if self.authorizer_is_noop {
+        // V2-02 : the previous gate ran only when `authorizer_is_noop`,
+        // so on production deployments (real authorizer, no
+        // COMMENT-specific hook) any authenticated user could COMMENT
+        // on any catalogue object. The check now runs whenever the
+        // role catalogue is bootstrapped, independent of the
+        // authorizer kind.
+        {
             let session_info = self.session_info(session)?;
             if crate::catalog_authorizer::catalog_has_any_roles(self.catalog_reader.as_ref())?
                 && !crate::catalog_authorizer::is_superuser_checked(
@@ -704,7 +710,10 @@ impl Engine {
         session: &SessionHandle,
         stmt: &aiondb_parser::SecurityLabelStatement,
     ) -> DbResult<crate::prepared::StatementResult> {
-        if self.authorizer_is_noop {
+        // V2-02 : SECURITY LABEL had the same inverted gate as
+        // COMMENT ON. Always enforce the superuser check when RBAC is
+        // bootstrapped.
+        {
             let session_info = self.session_info(session)?;
             if crate::catalog_authorizer::catalog_has_any_roles(self.catalog_reader.as_ref())?
                 && !crate::catalog_authorizer::is_superuser_checked(

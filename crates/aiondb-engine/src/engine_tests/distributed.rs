@@ -141,6 +141,7 @@ fn start_fragment_server(remote_engine: Arc<Engine>) -> RunningFragmentServer {
         max_connections: 8,
         request_timeout: Duration::from_secs(10),
         max_concurrent_executions: Some(4),
+        allow_dev_mode_relaxations: true,
     };
     let remote_executor: Arc<dyn FragmentExecutor> = remote_engine;
     let server = FragmentServer::new(server_config, remote_executor);
@@ -238,6 +239,7 @@ fn distributed_plan_shard_leader_executes_against_real_fragment_transport_node()
         max_connections: 8,
         request_timeout: Duration::from_secs(10),
         max_concurrent_executions: Some(4),
+        allow_dev_mode_relaxations: true,
     };
     let remote_executor: Arc<dyn FragmentExecutor> = remote_engine.clone();
     let server = FragmentServer::new(server_config, remote_executor);

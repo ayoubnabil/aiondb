@@ -466,6 +466,14 @@ pub struct ViewDescriptor {
     pub columns: Vec<ColumnDescriptor>,
     #[serde(default)]
     pub check_option: Option<ViewCheckOption>,
+    /// V2-04 : role that created the view. `CREATE OR REPLACE VIEW`
+    /// must match the current identity against this value (or be
+    /// superuser) before replacing the descriptor. `#[serde(default)]`
+    /// is wired so on-disk catalogs from earlier versions deserialize
+    /// as `owner=""`, which the replace path treats as
+    /// "owner unknown — require superuser".
+    #[serde(default)]
+    pub owner: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -602,7 +610,7 @@ impl IndexDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoleDescriptor {
     pub name: String,
     pub login: bool,
@@ -622,6 +630,27 @@ pub struct RoleDescriptor {
     pub connection_limit: i64,
     #[serde(default)]
     pub valid_until: Option<String>,
+}
+
+impl std::fmt::Debug for RoleDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoleDescriptor")
+            .field("name", &self.name)
+            .field("login", &self.login)
+            .field("superuser", &self.superuser)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "<redacted>"),
+            )
+            .field("inherit", &self.inherit)
+            .field("createdb", &self.createdb)
+            .field("createrole", &self.createrole)
+            .field("replication", &self.replication)
+            .field("bypassrls", &self.bypassrls)
+            .field("connection_limit", &self.connection_limit)
+            .field("valid_until", &self.valid_until)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {

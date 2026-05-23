@@ -1155,6 +1155,10 @@ impl Engine {
                     default_value: None,
                 })
                 .collect(),
+            // V2-04 : matview sidecar inherits the source matview's
+            // owner. The sidecar mirror is not directly user-facing
+            // but record the owner anyway for consistency.
+            owner: table.owner.clone().unwrap_or_default(),
         };
         self.catalog_writer.create_view(txn_id, descriptor)?;
         Ok(())

@@ -4,9 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aiondb_engine::{
-    Credential, DataType, Engine, PortalBatch, QueryEngine, QueryExtendedProtocol,
-    IsolationLevel, SecretString, SessionHandle, StartupParams, StatementResult, TransportInfo,
-    TransportKind,
+    Credential, DataType, Engine, IsolationLevel, PortalBatch, QueryEngine, QueryExtendedProtocol,
+    SecretString, SessionHandle, StartupParams, StatementResult, TransportInfo, TransportKind,
 };
 use aiondb_parser::{parse_sql, Statement};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -31,6 +30,14 @@ const BOLT_SUPPORTED_VERSIONS: [u32; 8] = [
 const BOLT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const BOLT_CHUNK_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const BOLT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const BOLT_MAX_STRING_BYTES: usize = 1024 * 1024;
+const BOLT_MAX_METADATA_ENTRIES: usize = 128;
+const BOLT_MAX_COLLECTION_ITEMS: usize = 4096;
+const BOLT_MAX_PARAMETER_ENTRIES: usize = 1024;
+const BOLT_MAX_AUTH_PRINCIPAL_BYTES: usize = 128;
+const BOLT_MAX_AUTH_CREDENTIALS_BYTES: usize = 8 * 1024;
+const BOLT_MAX_AUTH_USER_AGENT_BYTES: usize = 1024;
+const BOLT_MAX_AUTH_SCHEME_BYTES: usize = 64;
 const BOLT_SUCCESS_SIGNATURE: u8 = 0x70;
 const BOLT_FAILURE_SIGNATURE: u8 = 0x7F;
 const BOLT_IGNORED_SIGNATURE: u8 = 0x7E;
@@ -231,24 +238,22 @@ pub(crate) async fn handle_bolt_connection(
         ..Default::default()
     };
     loop {
-        let message = match tokio::time::timeout(
-            BOLT_CHUNK_READ_TIMEOUT,
-            read_chunked_message(&mut stream),
-        )
-        .await
-        {
-            Ok(Ok(message)) => message,
-            Ok(Err(err))
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) =>
+        let message =
+            match tokio::time::timeout(BOLT_CHUNK_READ_TIMEOUT, read_chunked_message(&mut stream))
+                .await
             {
-                break;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(_) => break,
-        };
+                Ok(Ok(message)) => message,
+                Ok(Err(err))
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break;
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => break,
+            };
         if message.is_empty() {
             break;
         }
@@ -264,7 +269,9 @@ pub(crate) async fn handle_bolt_connection(
     Ok(())
 }
 
-fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) -> impl std::future::Future<Output = ()> {
+fn wait_for_shutdown(
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> impl std::future::Future<Output = ()> {
     async move {
         let _ = shutdown_rx.changed().await;
     }
@@ -372,11 +379,8 @@ async fn handle_bolt_message(
                 }
                 Err(err) => return Err(err),
             };
-            write_chunked_message(
-                stream,
-                &encode_hello_success_message(&state.connection_id),
-            )
-            .await?;
+            write_chunked_message(stream, &encode_hello_success_message(&state.connection_id))
+                .await?;
             if let Some(session) = maybe_session {
                 if let Some(existing) = state.session.replace(session) {
                     let _ = engine.terminate(existing);
@@ -513,8 +517,9 @@ async fn handle_bolt_message(
                         .map(|(_, value)| value.clone())
                         .unwrap_or_else(|| BOLT_DEFAULT_DATABASE.to_owned());
                     let in_explicit_txn =
-                        QueryEngine::has_active_transaction(engine.as_ref(), session)
-                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+                        QueryEngine::has_active_transaction(engine.as_ref(), session).map_err(
+                            |err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
+                        )?;
                     let mut pending = pending;
                     if !in_explicit_txn {
                         state.next_bookmark_id = state.next_bookmark_id.saturating_add(1);
@@ -546,10 +551,7 @@ async fn handle_bolt_message(
                     state.failed = true;
                     write_chunked_message(
                         stream,
-                        &encode_failure_message(
-                            BOLT_FORBIDDEN_FAILURE_CODE,
-                            &err.to_string(),
-                        ),
+                        &encode_failure_message(BOLT_FORBIDDEN_FAILURE_CODE, &err.to_string()),
                     )
                     .await?;
                     Ok(false)
@@ -682,7 +684,9 @@ async fn handle_bolt_message(
                 stream,
                 &encode_route_success_message(
                     &address,
-                    requested_database.as_deref().unwrap_or(BOLT_DEFAULT_DATABASE),
+                    requested_database
+                        .as_deref()
+                        .unwrap_or(BOLT_DEFAULT_DATABASE),
                 ),
             )
             .await?;
@@ -772,7 +776,11 @@ async fn handle_bolt_message(
             }
             ensure_supported_database(begin_metadata.get("db").and_then(JsonValue::as_str))?;
             let session = state.session.as_ref().expect("checked session");
-            match QueryEngine::begin_transaction(engine.as_ref(), session, IsolationLevel::ReadCommitted) {
+            match QueryEngine::begin_transaction(
+                engine.as_ref(),
+                session,
+                IsolationLevel::ReadCommitted,
+            ) {
                 Ok(()) => {
                     state.pending = None;
                     state.failed = false;
@@ -1029,10 +1037,8 @@ async fn handle_bolt_message(
                 return Ok(false);
             }
             if let Some(session) = state.session.as_ref() {
-                let has_active_txn =
-                    QueryEngine::has_active_transaction(engine.as_ref(), session).map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidData, err.to_string())
-                    })?;
+                let has_active_txn = QueryEngine::has_active_transaction(engine.as_ref(), session)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
                 if has_active_txn {
                     QueryEngine::rollback_transaction(engine.as_ref(), session).map_err(|err| {
                         io::Error::new(io::ErrorKind::InvalidData, err.to_string())
@@ -1061,10 +1067,7 @@ async fn handle_bolt_message(
         _ => {
             write_chunked_message(
                 stream,
-                &encode_failure_message(
-                    BOLT_REQUEST_FAILURE_CODE,
-                    "unsupported Bolt message",
-                ),
+                &encode_failure_message(BOLT_REQUEST_FAILURE_CODE, "unsupported Bolt message"),
             )
             .await?;
             Ok(false)
@@ -1128,6 +1131,7 @@ fn decode_string_keyed_string_map<'a>(
     input: &mut &'a [u8],
 ) -> Result<std::collections::HashMap<String, String>, io::Error> {
     let map_len = decode_map_len(input)?;
+    ensure_bolt_collection_len(map_len, BOLT_MAX_METADATA_ENTRIES, "bolt string map")?;
     let mut map = std::collections::HashMap::with_capacity(map_len);
     for _ in 0..map_len {
         let key = decode_string(input)?;
@@ -1139,6 +1143,7 @@ fn decode_string_keyed_string_map<'a>(
 
 fn decode_string_list<'a>(input: &mut &'a [u8]) -> Result<Vec<String>, io::Error> {
     let len = decode_list_len(input)?;
+    ensure_bolt_collection_len(len, BOLT_MAX_COLLECTION_ITEMS, "bolt string list")?;
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
         values.push(decode_string(input)?);
@@ -1190,6 +1195,7 @@ fn decode_auth_metadata(payload: &[u8], signature: u8) -> Result<BoltHelloMetada
     }
     let mut remaining = &payload[2..];
     let map_len = decode_map_len(&mut remaining)?;
+    ensure_bolt_collection_len(map_len, BOLT_MAX_METADATA_ENTRIES, "bolt auth metadata")?;
 
     let mut principal = None;
     let mut credentials = None;
@@ -1199,10 +1205,34 @@ fn decode_auth_metadata(payload: &[u8], signature: u8) -> Result<BoltHelloMetada
     for _ in 0..map_len {
         let key = decode_string(&mut remaining)?;
         match key.as_str() {
-            "principal" => principal = Some(decode_string(&mut remaining)?),
-            "credentials" => credentials = Some(decode_string(&mut remaining)?),
-            "user_agent" => user_agent = Some(decode_string(&mut remaining)?),
-            "scheme" => scheme = Some(decode_string(&mut remaining)?),
+            "principal" => {
+                principal = Some(decode_limited_string(
+                    &mut remaining,
+                    BOLT_MAX_AUTH_PRINCIPAL_BYTES,
+                    "bolt auth principal",
+                )?)
+            }
+            "credentials" => {
+                credentials = Some(decode_limited_string(
+                    &mut remaining,
+                    BOLT_MAX_AUTH_CREDENTIALS_BYTES,
+                    "bolt auth credentials",
+                )?)
+            }
+            "user_agent" => {
+                user_agent = Some(decode_limited_string(
+                    &mut remaining,
+                    BOLT_MAX_AUTH_USER_AGENT_BYTES,
+                    "bolt user agent",
+                )?)
+            }
+            "scheme" => {
+                scheme = Some(decode_limited_string(
+                    &mut remaining,
+                    BOLT_MAX_AUTH_SCHEME_BYTES,
+                    "bolt auth scheme",
+                )?)
+            }
             _ => {
                 let value = decode_json_value(&mut remaining, 0)?;
                 extra_metadata.insert(key, value);
@@ -1289,6 +1319,14 @@ fn decode_list_len<'a>(input: &mut &'a [u8]) -> Result<usize, io::Error> {
 }
 
 fn decode_string<'a>(input: &mut &'a [u8]) -> Result<String, io::Error> {
+    decode_limited_string(input, BOLT_MAX_STRING_BYTES, "bolt string")
+}
+
+fn decode_limited_string<'a>(
+    input: &mut &'a [u8],
+    max_bytes: usize,
+    context: &str,
+) -> Result<String, io::Error> {
     let Some((&marker, rest)) = input.split_first() else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1308,6 +1346,7 @@ fn decode_string<'a>(input: &mut &'a [u8]) -> Result<String, io::Error> {
             ))
         }
     };
+    ensure_bolt_string_len(len, max_bytes, context)?;
     if tail.len() < len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1320,7 +1359,30 @@ fn decode_string<'a>(input: &mut &'a [u8]) -> Result<String, io::Error> {
     Ok(value.to_owned())
 }
 
-fn decode_pull_metadata(payload: &[u8], expected_signature: u8) -> Result<BoltStreamControl, io::Error> {
+fn ensure_bolt_collection_len(len: usize, max_len: usize, context: &str) -> Result<(), io::Error> {
+    if len > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} has {len} items, max {max_len}"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_bolt_string_len(len: usize, max_len: usize, context: &str) -> Result<(), io::Error> {
+    if len > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} is {len} bytes, max {max_len}"),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_pull_metadata(
+    payload: &[u8],
+    expected_signature: u8,
+) -> Result<BoltStreamControl, io::Error> {
     if payload.len() < 3 || payload[0] != 0xB1 || payload[1] != expected_signature {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1385,10 +1447,7 @@ fn decode_optional_usize<'a>(input: &mut &'a [u8]) -> Result<Option<usize>, io::
         None => Ok(None),
         Some(value) if value < 0 => Ok(None),
         Some(value) => usize::try_from(value).map(Some).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bolt integer must fit in usize",
-            )
+            io::Error::new(io::ErrorKind::InvalidData, "bolt integer must fit in usize")
         }),
     }
 }
@@ -1649,7 +1708,12 @@ fn encode_hello_success_message(connection_id: &str) -> Vec<u8> {
     payload
 }
 
-fn encode_run_success_message(fields: &[String], qid: i64, database: &str, t_first: u64) -> Vec<u8> {
+fn encode_run_success_message(
+    fields: &[String],
+    qid: i64,
+    database: &str,
+    t_first: u64,
+) -> Vec<u8> {
     let mut payload = vec![0xB1, BOLT_SUCCESS_SIGNATURE];
     encode_map_header_into(&mut payload, 5);
     encode_string_into(&mut payload, "fields");
@@ -1716,12 +1780,7 @@ fn encode_statuses_into(buf: &mut Vec<u8>, status: BoltStatusKind) {
             "Successful completion - omitted result",
             "note: successful completion - omitted result",
         ),
-        BoltStatusKind::NoData => (
-            "02000",
-            "note: no data",
-            "No data",
-            "note: no data",
-        ),
+        BoltStatusKind::NoData => ("02000", "note: no data", "No data", "note: no data"),
     };
     encode_string_into(buf, "gql_status");
     encode_string_into(buf, gql_status);
@@ -1766,7 +1825,11 @@ fn encode_stats_into(buf: &mut Vec<u8>, stats: &BoltQueryStats) {
     encode_string_into(buf, "contains-updates");
     buf.push(if stats.contains_updates { 0xC3 } else { 0xC2 });
     encode_string_into(buf, "contains-system-updates");
-    buf.push(if stats.contains_system_updates { 0xC3 } else { 0xC2 });
+    buf.push(if stats.contains_system_updates {
+        0xC3
+    } else {
+        0xC2
+    });
 }
 
 fn encode_route_success_message(address: &str, database: &str) -> Vec<u8> {
@@ -1894,7 +1957,7 @@ fn execute_run_message(
             statement,
             param_hints,
         )
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         let (batch, notices) = QueryExtendedProtocol::execute_prepared_statement_with_notices(
             engine.as_ref(),
             session,
@@ -1902,15 +1965,16 @@ fn execute_run_message(
             params,
             0,
         )
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         portal_batch_to_statement_results(batch, notices)
     };
     let mut pending = build_pending_query(results)?;
     pending.result_available_after_ms =
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    pending
-        .summary
-        .push(("db", database.unwrap_or_else(|| BOLT_DEFAULT_DATABASE.to_owned())));
+    pending.summary.push((
+        "db",
+        database.unwrap_or_else(|| BOLT_DEFAULT_DATABASE.to_owned()),
+    ));
     Ok(pending)
 }
 
@@ -2278,7 +2342,10 @@ fn compat_procedure_pending_query(
         CompatProcedure::DbPing => Ok(compat_ping_pending_query()),
         procedure => {
             let graph_metadata = compat_graph_metadata(engine, session)?;
-            build_projected_compat_query(&query.projection, compat_procedure_rows(procedure, &graph_metadata))
+            build_projected_compat_query(
+                &query.projection,
+                compat_procedure_rows(procedure, &graph_metadata),
+            )
         }
     }
 }
@@ -2350,7 +2417,10 @@ fn compat_procedure_rows(
     match procedure {
         CompatProcedure::DbPing => Vec::new(),
         CompatProcedure::DbmsComponents => vec![vec![
-            ("name".to_owned(), aiondb_engine::Value::Text("Neo4j Kernel".to_owned())),
+            (
+                "name".to_owned(),
+                aiondb_engine::Value::Text("Neo4j Kernel".to_owned()),
+            ),
             (
                 "versions".to_owned(),
                 aiondb_engine::Value::Array(vec![aiondb_engine::Value::Text("5.26.0".to_owned())]),
@@ -2364,7 +2434,10 @@ fn compat_procedure_rows(
             .node_labels
             .iter()
             .map(|label| {
-                vec![("label".to_owned(), aiondb_engine::Value::Text(label.clone()))]
+                vec![(
+                    "label".to_owned(),
+                    aiondb_engine::Value::Text(label.clone()),
+                )]
             })
             .collect(),
         CompatProcedure::DbRelationshipTypes => graph_metadata
@@ -2529,7 +2602,10 @@ fn build_pending_query(results: Vec<StatementResult>) -> Result<BoltPendingQuery
                         "Bolt compatibility only supports one query result",
                     ));
                 }
-                let fields = columns.into_iter().map(|column| column.name).collect::<Vec<_>>();
+                let fields = columns
+                    .into_iter()
+                    .map(|column| column.name)
+                    .collect::<Vec<_>>();
                 let records = rows
                     .into_iter()
                     .map(|row| encode_record_message(&row.values))
@@ -2662,6 +2738,7 @@ fn decode_string_keyed_json_map<'a>(
     input: &mut &'a [u8],
 ) -> Result<JsonMap<String, JsonValue>, io::Error> {
     let map_len = decode_map_len(input)?;
+    ensure_bolt_collection_len(map_len, BOLT_MAX_PARAMETER_ENTRIES, "bolt json map")?;
     let mut map = JsonMap::with_capacity(map_len);
     for _ in 0..map_len {
         let key = decode_string(input)?;
@@ -2697,7 +2774,9 @@ fn decode_json_value<'a>(input: &mut &'a [u8], depth: usize) -> Result<JsonValue
         }
         0xC9 => {
             let bytes = take_exact(input, 2)?;
-            Ok(JsonValue::from(i64::from(i16::from_be_bytes([bytes[0], bytes[1]]))))
+            Ok(JsonValue::from(i64::from(i16::from_be_bytes([
+                bytes[0], bytes[1],
+            ]))))
         }
         0xCA => {
             let bytes = take_exact(input, 4)?;
@@ -2723,6 +2802,7 @@ fn decode_json_value<'a>(input: &mut &'a [u8], depth: usize) -> Result<JsonValue
         }
         0x80..=0x8F | 0xD0 | 0xD1 | 0xD2 => {
             let len = decode_string_len_from_marker(marker, input)?;
+            ensure_bolt_string_len(len, BOLT_MAX_STRING_BYTES, "bolt parameter string")?;
             let bytes = take_exact(input, len)?;
             let value = std::str::from_utf8(bytes).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "bolt string is not utf-8")
@@ -2731,6 +2811,7 @@ fn decode_json_value<'a>(input: &mut &'a [u8], depth: usize) -> Result<JsonValue
         }
         0x90..=0x9F | 0xD4 | 0xD5 | 0xD6 => {
             let len = decode_list_len_from_marker(marker, input)?;
+            ensure_bolt_collection_len(len, BOLT_MAX_COLLECTION_ITEMS, "bolt parameter list")?;
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
                 items.push(decode_json_value(input, depth + 1)?);
@@ -2739,6 +2820,7 @@ fn decode_json_value<'a>(input: &mut &'a [u8], depth: usize) -> Result<JsonValue
         }
         0xA0..=0xAF | 0xD8 | 0xD9 | 0xDA => {
             let len = decode_map_len_from_marker(marker, input)?;
+            ensure_bolt_collection_len(len, BOLT_MAX_PARAMETER_ENTRIES, "bolt parameter map")?;
             let mut map = JsonMap::with_capacity(len);
             for _ in 0..len {
                 let key = decode_string(input)?;
@@ -3065,9 +3147,7 @@ where
     let mut offset = 0usize;
     while offset < payload.len() {
         let chunk_len = (payload.len() - offset).min(u16::MAX as usize);
-        writer
-            .write_all(&(chunk_len as u16).to_be_bytes())
-            .await?;
+        writer.write_all(&(chunk_len as u16).to_be_bytes()).await?;
         writer
             .write_all(&payload[offset..offset + chunk_len])
             .await?;
@@ -3076,7 +3156,6 @@ where
     writer.write_all(&0u16.to_be_bytes()).await?;
     writer.flush().await
 }
-
 
 #[cfg(test)]
 mod tests;
