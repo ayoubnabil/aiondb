@@ -137,11 +137,14 @@ fn build_in_subquery_cache_entry(
                     first_value_type = Some(value_type.clone());
                 }
             }
+            // Build the hash key from a borrow first, then move `value` into
+            // `values` — skips a per-row clone of the IN-subquery value.
+            let hash_key = build_hash_key(&value);
             let value_index = values.len();
-            values.push(value.clone());
-            match build_hash_key(&value) {
-                Ok(hash_key) => {
-                    hash_index.entry(hash_key).or_default().push(value_index);
+            values.push(value);
+            match hash_key {
+                Ok(key) => {
+                    hash_index.entry(key).or_default().push(value_index);
                 }
                 Err(_) => {
                     all_hashable = false;

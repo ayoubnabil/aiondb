@@ -247,14 +247,14 @@ pub(super) fn extract_multi_range_literal_filter(
         if let TypedExprKind::BinaryEq { left, right } = &filter.kind {
             let l = strip_cast_wrappers(left);
             let r = strip_cast_wrappers(right);
-            let (ord, lit) = match (&l.kind, &r.kind) {
+            let (ord, lit_ref) = match (&l.kind, &r.kind) {
                 (TypedExprKind::ColumnRef { ordinal, .. }, TypedExprKind::Literal(v))
                 | (TypedExprKind::Literal(v), TypedExprKind::ColumnRef { ordinal, .. }) => {
-                    (*ordinal, v.clone())
+                    (*ordinal, v)
                 }
                 _ => return None,
             };
-            if matches!(lit, Value::Null) {
+            if matches!(lit_ref, Value::Null) {
                 return None;
             }
             let entry = by_col
@@ -265,8 +265,11 @@ pub(super) fn extract_multi_range_literal_filter(
             {
                 return None;
             }
-            entry.0 = std::ops::Bound::Included(lit.clone());
-            entry.1 = std::ops::Bound::Included(lit);
+            // Defer the literal clones until after the early-return checks so
+            // rejected predicates (NULL literal or already-bounded entry) skip
+            // them entirely.
+            entry.0 = std::ops::Bound::Included(lit_ref.clone());
+            entry.1 = std::ops::Bound::Included(lit_ref.clone());
             return Some(());
         }
         // Detect a single col-vs-literal comparison. Reuse the
@@ -453,28 +456,33 @@ pub(super) fn add_column_literal_range(
         *column_ordinal = Some(*ordinal);
     }
 
-    let literal = match &strip_cast_wrappers(literal_expr).kind {
-        TypedExprKind::Literal(value) => value.clone(),
+    let literal_ref = match &strip_cast_wrappers(literal_expr).kind {
+        TypedExprKind::Literal(value) => value,
         _ => return None,
     };
-    if matches!(literal, Value::Null) {
+    if matches!(literal_ref, Value::Null) {
         return None;
     }
-    let bound = if inclusive {
-        std::ops::Bound::Included(literal)
-    } else {
-        std::ops::Bound::Excluded(literal)
-    };
     if is_lower {
         if lower.is_some() {
             return None;
         }
-        *lower = Some(bound);
+        // Defer the literal clone until after the early-return so a NULL
+        // literal or an already-set bound skips it.
+        *lower = Some(if inclusive {
+            std::ops::Bound::Included(literal_ref.clone())
+        } else {
+            std::ops::Bound::Excluded(literal_ref.clone())
+        });
     } else {
         if upper.is_some() {
             return None;
         }
-        *upper = Some(bound);
+        *upper = Some(if inclusive {
+            std::ops::Bound::Included(literal_ref.clone())
+        } else {
+            std::ops::Bound::Excluded(literal_ref.clone())
+        });
     }
     Some(())
 }

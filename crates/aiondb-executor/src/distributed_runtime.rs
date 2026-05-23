@@ -69,10 +69,9 @@ fn execute_single_root(
         };
         ensure_gather_schema_matches_root(root, &columns)?;
 
-        return Ok(ExecutionResult::Query {
-            columns: root.output_fields.clone(),
-            rows,
-        });
+        // `columns` already matches `root.output_fields` (the gather schema
+        // check above asserts this), so reuse it instead of cloning.
+        return Ok(ExecutionResult::Query { columns, rows });
     }
 
     let fragment = DistributedFragment {
@@ -88,10 +87,9 @@ fn execute_single_root(
     };
     ensure_gather_schema_matches_root(root, &columns)?;
 
-    Ok(ExecutionResult::Query {
-        columns: root.output_fields.clone(),
-        rows,
-    })
+    // Reuse the schema we just got rather than re-cloning `root.output_fields`;
+    // the gather-schema check above guarantees they are equivalent.
+    Ok(ExecutionResult::Query { columns, rows })
 }
 
 #[cfg(test)]
@@ -174,10 +172,8 @@ fn execute_gather_dag(
     }
     rows = apply_root_project_values_bounds(root, rows, context)?;
 
-    Ok(ExecutionResult::Query {
-        columns: root.output_fields.clone(),
-        rows,
-    })
+    // Reuse the gather schema rather than re-cloning `root.output_fields`.
+    Ok(ExecutionResult::Query { columns, rows })
 }
 
 fn is_root_merge_exchange(exchange: &ExchangeKind) -> bool {

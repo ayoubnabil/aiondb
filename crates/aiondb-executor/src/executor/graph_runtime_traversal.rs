@@ -405,24 +405,28 @@ impl Executor {
                     projection.map_or(src_col_idx, |value| value.src_col_idx);
                 let projected_tgt_col_idx =
                     projection.map_or(tgt_col_idx, |value| value.tgt_col_idx);
-                let source_id = compat_row
-                    .values
-                    .get(projected_src_col_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let target_id = compat_row
-                    .values
-                    .get(projected_tgt_col_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                // Defer the source/target Value clones until we know the edge
+                // is adjacent; index over-fetch otherwise paid two `Value`
+                // clones per skipped record.
+                let source_ref = compat_row.values.get(projected_src_col_idx);
+                let target_ref = compat_row.values.get(projected_tgt_col_idx);
                 let adjacent = match direction {
-                    CypherRelDirection::Outgoing => source_id == *node_id,
-                    CypherRelDirection::Incoming => target_id == *node_id,
-                    CypherRelDirection::Both => source_id == *node_id || target_id == *node_id,
+                    CypherRelDirection::Outgoing => {
+                        source_ref.is_some_and(|v| *v == *node_id)
+                    }
+                    CypherRelDirection::Incoming => {
+                        target_ref.is_some_and(|v| *v == *node_id)
+                    }
+                    CypherRelDirection::Both => {
+                        source_ref.is_some_and(|v| *v == *node_id)
+                            || target_ref.is_some_and(|v| *v == *node_id)
+                    }
                 };
                 if !adjacent {
                     continue;
                 }
+                let source_id = source_ref.cloned().unwrap_or(Value::Null);
+                let target_id = target_ref.cloned().unwrap_or(Value::Null);
                 ensure_graph_workset_capacity(context, results.len(), "adjacent edge candidates")?;
                 context.track_memory(estimate_adjacent_edge_record_bytes(
                     &compat_row,
@@ -635,22 +639,25 @@ impl Executor {
                     projection.map_or(src_col_idx, |value| value.src_col_idx);
                 let projected_tgt_col_idx =
                     projection.map_or(tgt_col_idx, |value| value.tgt_col_idx);
-                let source_id = compat_row
-                    .values
-                    .get(projected_src_col_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let target_id = compat_row
-                    .values
-                    .get(projected_tgt_col_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                // Defer the source/target Value clones until adjacency holds,
+                // the same way the index-scan branch above does.
+                let source_ref = compat_row.values.get(projected_src_col_idx);
+                let target_ref = compat_row.values.get(projected_tgt_col_idx);
                 let adjacent = match direction {
-                    CypherRelDirection::Outgoing => source_id == *node_id,
-                    CypherRelDirection::Incoming => target_id == *node_id,
-                    CypherRelDirection::Both => source_id == *node_id || target_id == *node_id,
+                    CypherRelDirection::Outgoing => {
+                        source_ref.is_some_and(|v| *v == *node_id)
+                    }
+                    CypherRelDirection::Incoming => {
+                        target_ref.is_some_and(|v| *v == *node_id)
+                    }
+                    CypherRelDirection::Both => {
+                        source_ref.is_some_and(|v| *v == *node_id)
+                            || target_ref.is_some_and(|v| *v == *node_id)
+                    }
                 };
                 if adjacent {
+                    let source_id = source_ref.cloned().unwrap_or(Value::Null);
+                    let target_id = target_ref.cloned().unwrap_or(Value::Null);
                     ensure_graph_workset_capacity(
                         context,
                         results.len(),

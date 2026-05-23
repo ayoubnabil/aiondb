@@ -93,25 +93,36 @@ impl Executor {
         input_bindings: Vec<BindingRow>,
     ) -> DbResult<Vec<BindingRow>> {
         let mut result = Vec::new();
-        for binding in &input_bindings {
+        // Consume the input bindings so the last element of each UNWIND list
+        // (and the scalar fallback) moves `binding` into the output instead
+        // of cloning it.
+        for binding in input_bindings {
             context.check_deadline()?;
             let list_value =
-                self.evaluate_cypher_expr_with_binding(&unwind.expr, binding, context)?;
+                self.evaluate_cypher_expr_with_binding(&unwind.expr, &binding, context)?;
             match list_value {
                 Value::Array(elements) => {
-                    for elem in elements {
+                    let mut elements_iter = elements.into_iter();
+                    let Some(last_elem) = elements_iter.next_back() else {
+                        continue;
+                    };
+                    for elem in elements_iter {
                         let mut new_binding = binding.clone();
                         new_binding
                             .insert_binding(unwind.variable.clone(), BoundValue::Scalar(elem));
                         push_graph_binding(context, &mut result, new_binding)?;
                     }
+                    let mut new_binding = binding;
+                    new_binding
+                        .insert_binding(unwind.variable.clone(), BoundValue::Scalar(last_elem));
+                    push_graph_binding(context, &mut result, new_binding)?;
                 }
                 Value::Null => {
                     // UNWIND null produces no rows
                 }
                 other => {
                     // UNWIND on a single value treats it as a one-element list
-                    let mut new_binding = binding.clone();
+                    let mut new_binding = binding;
                     new_binding.insert_binding(unwind.variable.clone(), BoundValue::Scalar(other));
                     push_graph_binding(context, &mut result, new_binding)?;
                 }
@@ -308,7 +319,7 @@ impl Executor {
         input_bindings: Vec<BindingRow>,
     ) -> DbResult<Vec<BindingRow>> {
         let mut output = Vec::new();
-        for outer in input_bindings {
+        for mut outer in input_bindings {
             context.check_deadline()?;
             let mut returned = self.execute_cypher_call_subquery_branch(
                 context,
@@ -348,7 +359,14 @@ impl Executor {
                 continue;
             }
 
-            for row in returned {
+            // Move `outer` into the final merged row instead of cloning it on
+            // every iteration: each subquery result row needs an owned copy of
+            // the outer binding, but the last one can reuse `outer` directly.
+            let mut returned_iter = returned.into_iter();
+            let Some(last_row) = returned_iter.next_back() else {
+                continue;
+            };
+            for row in returned_iter {
                 let mut merged = outer.clone();
                 for (name, value) in row.entries {
                     merged.insert_shared_binding(name, value);
@@ -356,6 +374,11 @@ impl Executor {
                 ensure_graph_result_row_capacity(context, output.len())?;
                 output.push(merged);
             }
+            for (name, value) in last_row.entries {
+                outer.insert_shared_binding(name, value);
+            }
+            ensure_graph_result_row_capacity(context, output.len())?;
+            output.push(outer);
         }
 
         Ok(output)

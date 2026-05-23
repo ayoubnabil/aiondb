@@ -66,12 +66,12 @@ impl VectorSearchBackendRegistry {
     /// Returns an error if no backend is registered for the algorithm.
     pub fn backend_for(
         &self,
-        algorithm: VectorSearchAlgorithm,
+        algorithm: &VectorSearchAlgorithm,
     ) -> DbResult<&'static dyn VectorSearchBackend> {
         self.backends
             .iter()
             .copied()
-            .find(|backend| backend.algorithm() == algorithm)
+            .find(|backend| backend.algorithm() == *algorithm)
             .ok_or_else(|| {
                 DbError::internal(format!(
                     "no vector backend registered for algorithm \"{}\"",
@@ -87,7 +87,7 @@ impl VectorSearchBackendRegistry {
     /// Returns an error when the algorithm is not registered or the backend
     /// rejects the spec.
     pub fn validate(&self, spec: &VectorSearchSpec) -> DbResult<()> {
-        self.backend_for(spec.algorithm.clone())?.validate(spec)
+        self.backend_for(&spec.algorithm)?.validate(spec)
     }
 
     /// Return a snapshot of currently registered algorithm identifiers.
@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn all_builtins_have_registered_backend() {
         for algorithm in VectorSearchAlgorithm::all() {
-            let backend = default_registry().backend_for(algorithm.clone()).unwrap();
-            assert_eq!(backend.algorithm(), algorithm.clone());
+            let backend = default_registry().backend_for(algorithm).unwrap();
+            assert_eq!(&backend.algorithm(), algorithm);
         }
     }
 
@@ -146,7 +146,7 @@ mod tests {
     fn unknown_algorithm_returns_clear_error() {
         let mut registry = VectorSearchBackendRegistry::new();
         registry.register(&hnsw::HNSW_BACKEND).unwrap();
-        match registry.backend_for(VectorSearchAlgorithm::other("diskann")) {
+        match registry.backend_for(&VectorSearchAlgorithm::other("diskann")) {
             Err(err) => assert!(
                 err.to_string().contains("diskann"),
                 "unexpected error: {err}"

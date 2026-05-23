@@ -214,22 +214,35 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let source_id = record.row.values.first().unwrap_or(&Value::Null);
-            let target_id = record.row.values.get(1).unwrap_or(&Value::Null);
-            let weight = record.row.values.get(2).unwrap_or(&Value::Null);
-            if weight.is_null() {
-                continue;
+            {
+                let weight = record.row.values.get(2).unwrap_or(&Value::Null);
+                if weight.is_null() {
+                    continue;
+                }
+                let Some(ordering) = compare_runtime_values(weight, &filter_value)? else {
+                    continue;
+                };
+                if ordering != Ordering::Greater {
+                    continue;
+                }
             }
-            let Some(ordering) = compare_runtime_values(weight, &filter_value)? else {
-                continue;
+            // Filters have passed: consume the row's values so we move
+            // the endpoint ids into the result array instead of cloning.
+            let mut values = record.row.values;
+            let source_id_v = if !values.is_empty() {
+                std::mem::replace(&mut values[0], Value::Null)
+            } else {
+                Value::Null
             };
-            if ordering != Ordering::Greater {
-                continue;
-            }
+            let target_id_v = if values.len() > 1 {
+                std::mem::replace(&mut values[1], Value::Null)
+            } else {
+                Value::Null
+            };
             let endpoint_ids: [Value; 2] = match rel.direction {
-                CypherRelDirection::Outgoing => [target_id.clone(), Value::Null],
-                CypherRelDirection::Incoming => [source_id.clone(), Value::Null],
-                CypherRelDirection::Both => [source_id.clone(), target_id.clone()],
+                CypherRelDirection::Outgoing => [target_id_v, Value::Null],
+                CypherRelDirection::Incoming => [source_id_v, Value::Null],
+                CypherRelDirection::Both => [source_id_v, target_id_v],
             };
             if Self::append_fast_unanchored_endpoint_rows(
                 context,
@@ -389,19 +402,32 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let source_id = record.row.values.first().unwrap_or(&Value::Null);
-            let target_id = record.row.values.get(1).unwrap_or(&Value::Null);
-            let prop_value = record.row.values.get(2).unwrap_or(&Value::Null);
-            let Some(ordering) = compare_runtime_values(prop_value, &filter_value)? else {
-                continue;
-            };
-            if ordering != Ordering::Equal {
-                continue;
+            {
+                let prop_value = record.row.values.get(2).unwrap_or(&Value::Null);
+                let Some(ordering) = compare_runtime_values(prop_value, &filter_value)? else {
+                    continue;
+                };
+                if ordering != Ordering::Equal {
+                    continue;
+                }
             }
+            // After the equality filter, consume the row's values so we
+            // move the endpoint ids into the array instead of cloning.
+            let mut values = record.row.values;
+            let source_id_v = if !values.is_empty() {
+                std::mem::replace(&mut values[0], Value::Null)
+            } else {
+                Value::Null
+            };
+            let target_id_v = if values.len() > 1 {
+                std::mem::replace(&mut values[1], Value::Null)
+            } else {
+                Value::Null
+            };
             let endpoint_ids: [Value; 2] = match rel.direction {
-                CypherRelDirection::Outgoing => [target_id.clone(), Value::Null],
-                CypherRelDirection::Incoming => [source_id.clone(), Value::Null],
-                CypherRelDirection::Both => [source_id.clone(), target_id.clone()],
+                CypherRelDirection::Outgoing => [target_id_v, Value::Null],
+                CypherRelDirection::Incoming => [source_id_v, Value::Null],
+                CypherRelDirection::Both => [source_id_v, target_id_v],
             };
             if Self::append_fast_unanchored_endpoint_rows(
                 context,
@@ -642,11 +668,16 @@ impl Executor {
         )?;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let mut source_id = record.row.values.first().cloned().unwrap_or(Value::Null);
-            let mut target_id = record.row.values.get(1).cloned().unwrap_or(Value::Null);
-            if source_id.is_null() || target_id.is_null() {
+            // Check both endpoints by reference first; rejected edges (either
+            // endpoint NULL) no longer pay two Value clones.
+            let source_null = record.row.values.first().map_or(true, Value::is_null);
+            let target_null = record.row.values.get(1).map_or(true, Value::is_null);
+            if source_null || target_null {
                 continue;
             }
+            let mut row_values = record.row.values;
+            let mut source_id = std::mem::replace(&mut row_values[0], Value::Null);
+            let mut target_id = std::mem::replace(&mut row_values[1], Value::Null);
             normalize_int_key(&mut source_id);
             normalize_int_key(&mut target_id);
             let target_key = build_hash_key(&target_id)?;
@@ -667,10 +698,17 @@ impl Executor {
                         }
                     };
                     entry.outdegree = entry.outdegree.saturating_add(1);
-                    *entry.target_counts.entry(neighbor_key.clone()).or_insert(0) += 1;
+                    // Insert the filtered count first when the key matches the
+                    // allow-list; the second insert can then *move* neighbor_key
+                    // into target_counts. Filter rejects (the common case) skip
+                    // the clone entirely.
                     if allowed_left_target_ids.contains(&neighbor_key) {
-                        *entry.filtered_target_counts.entry(neighbor_key).or_insert(0) += 1;
+                        *entry
+                            .filtered_target_counts
+                            .entry(neighbor_key.clone())
+                            .or_insert(0) += 1;
                     }
+                    *entry.target_counts.entry(neighbor_key).or_insert(0) += 1;
                     Ok(())
                 };
 
@@ -934,10 +972,13 @@ impl Executor {
 
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let mut source_id = record.row.values.first().cloned().unwrap_or(Value::Null);
-            if source_id.is_null() {
+            // Check the source endpoint by reference first; NULL rows skip the
+            // Value clone.
+            if record.row.values.first().map_or(true, Value::is_null) {
                 continue;
             }
+            let mut row_values = record.row.values;
+            let mut source_id = std::mem::replace(&mut row_values[0], Value::Null);
             normalize_int_key(&mut source_id);
             let source_key = build_hash_key(&source_id)?;
             if !seen_sources.insert(source_key) {
@@ -2088,10 +2129,12 @@ impl Executor {
         let mut result_bytes = 0u64;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let mut middle_id = record.row.values.first().cloned().unwrap_or(Value::Null);
-            if middle_id.is_null() {
+            // Skip the Value clone when the middle endpoint is NULL.
+            if record.row.values.first().map_or(true, Value::is_null) {
                 continue;
             }
+            let mut row_values = record.row.values;
+            let mut middle_id = std::mem::replace(&mut row_values[0], Value::Null);
             normalize_int_key(&mut middle_id);
             let mut next_ids = Vec::with_capacity(limit.saturating_sub(rows.len()).min(1024));
             if self

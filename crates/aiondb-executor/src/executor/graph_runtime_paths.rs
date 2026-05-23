@@ -169,12 +169,16 @@ pub(super) fn record_variable_traversal_step(
         );
     }
 
+    // `row` and `raw_row` carry the same edge-marker payload (the far-end id);
+    // share a single Arc<Row> rather than allocating two identical Rows and
+    // cloning `far_end` an extra time per edge.
+    let edge_marker_row = Arc::new(aiondb_core::Row::new(vec![far_end.clone()]));
     new_binding.push_fresh_shared_binding(
         "__edge_next_node_id__".to_owned(),
         Arc::new(BoundValue::Node {
             table_id: RelationId::new(0),
-            row: Arc::new(aiondb_core::Row::new(vec![far_end.clone()])),
-            raw_row: Arc::new(aiondb_core::Row::new(vec![far_end.clone()])),
+            row: Arc::clone(&edge_marker_row),
+            raw_row: edge_marker_row,
             id_value: Value::Null,
             tuple_id: TupleId::new(0),
             labels: Arc::new(Vec::new()),
@@ -182,13 +186,25 @@ pub(super) fn record_variable_traversal_step(
         }),
     );
 
-    if depth >= min_hops {
+    let push_to_output = depth >= min_hops;
+    let push_to_frontier = depth < max_hops;
+
+    if push_to_output && !push_to_frontier {
+        // Last hop of the variable-length traversal: no frontier push, so
+        // hand `new_binding` to the output by move instead of clone.
+        ensure_graph_result_row_capacity(context, output.len())?;
+        context.track_memory(estimate_binding_row_bytes(&new_binding))?;
+        output.push(new_binding);
+        return Ok(());
+    }
+
+    if push_to_output {
         ensure_graph_result_row_capacity(context, output.len())?;
         context.track_memory(estimate_binding_row_bytes(&new_binding))?;
         output.push(new_binding.clone());
     }
 
-    if depth < max_hops {
+    if push_to_frontier {
         let mut new_path_edges = entry.path_edges.clone();
         new_path_edges.insert(edge_key);
         context.track_memory(estimate_variable_frontier_entry_bytes(
@@ -278,12 +294,16 @@ pub(super) fn build_traversed_edge_binding(
         }
     }
 
+    // `row` and `raw_row` carry the same edge-marker payload; share a single
+    // Arc<Row> rather than allocating two identical Rows and cloning
+    // `next_node_id` an extra time per edge.
+    let edge_marker_row = Arc::new(aiondb_core::Row::new(vec![next_node_id]));
     new_binding.push_fresh_shared_binding(
         "__edge_next_node_id__".to_owned(),
         Arc::new(BoundValue::Node {
             table_id: RelationId::new(0),
-            row: Arc::new(aiondb_core::Row::new(vec![next_node_id.clone()])),
-            raw_row: Arc::new(aiondb_core::Row::new(vec![next_node_id])),
+            row: Arc::clone(&edge_marker_row),
+            raw_row: edge_marker_row,
             id_value: Value::Null,
             tuple_id: TupleId::new(0),
             labels: Arc::new(Vec::new()),
@@ -329,13 +349,31 @@ impl Executor {
 
         if rel_variants.len() > 1 {
             let mut output = Vec::new();
-            for variant in &rel_variants {
+            // Move `input_bindings` into the last variant instead of cloning
+            // it for every iteration.
+            let mut iter = rel_variants.iter();
+            let last_variant = iter.next_back();
+            for variant in iter {
                 let bindings = self.adjacency_match_relationship(
                     context,
                     current_node,
                     variant,
                     next_node,
                     input_bindings.clone(),
+                    excluded_next_node_id_vars,
+                    path_variable,
+                    filter_conjuncts,
+                    runtime_cache,
+                )?;
+                output.extend(bindings);
+            }
+            if let Some(variant) = last_variant {
+                let bindings = self.adjacency_match_relationship(
+                    context,
+                    current_node,
+                    variant,
+                    next_node,
+                    input_bindings,
                     excluded_next_node_id_vars,
                     path_variable,
                     filter_conjuncts,
@@ -467,17 +505,19 @@ impl Executor {
                 } else {
                     (Vec::new(), Vec::new(), Vec::new())
                 };
+            // Track memory first while `start_id` is still borrowable, then
+            // move it into the frontier entry instead of cloning.
+            context.track_memory(estimate_variable_frontier_entry_bytes(
+                &start_id, binding, 0,
+            ))?;
             let mut frontier = vec![VariableTraversalFrontierEntry {
-                node_id: start_id.clone(),
+                node_id: start_id,
                 binding: binding.clone(),
                 path_edges: HashSet::new(),
                 path_nodes: initial_path_nodes,
                 path_relationships: initial_path_relationships,
                 path_directions: initial_path_directions,
             }];
-            context.track_memory(estimate_variable_frontier_entry_bytes(
-                &start_id, binding, 0,
-            ))?;
 
             for depth in 1..=max_hops {
                 if frontier.is_empty() {
@@ -703,7 +743,10 @@ impl Executor {
                             });
                         if let Some(neighbor_ids) = cached_neighbors {
                             used_adjacency = true;
-                            for neighbor_id in neighbor_ids.iter().cloned() {
+                            // Defer the per-neighbor Value clone past the
+                            // allow / exclude filters so rejected neighbors
+                            // don't pay it.
+                            for neighbor_id in neighbor_ids.iter() {
                                 if has_interrupts {
                                     tid_counter = tid_counter.wrapping_add(1);
                                     if tid_counter.trailing_zeros() >= 10 {
@@ -711,19 +754,21 @@ impl Executor {
                                     }
                                 }
                                 if !adjacency_neighbor_allowed(
-                                    &neighbor_id,
+                                    neighbor_id,
                                     next_node_candidate_ids.as_ref(),
                                 ) {
                                     continue;
                                 }
                                 if excluded_next_node_id_match(
                                     &excluded_next_node_id_keys,
-                                    &neighbor_id,
+                                    neighbor_id,
                                 ) {
                                     continue;
                                 }
-                                let new_binding =
-                                    Self::build_neighbor_marker_binding(binding, neighbor_id);
+                                let new_binding = Self::build_neighbor_marker_binding(
+                                    binding,
+                                    neighbor_id.clone(),
+                                );
                                 push_graph_binding(context, &mut output, new_binding)?;
                             }
                         } else if let Some(node_key) =
@@ -741,7 +786,7 @@ impl Executor {
                                 Arc::clone(&neighbor_ids),
                             );
                             used_adjacency = true;
-                            for neighbor_id in neighbor_ids.iter().cloned() {
+                            for neighbor_id in neighbor_ids.iter() {
                                 if has_interrupts {
                                     tid_counter = tid_counter.wrapping_add(1);
                                     if tid_counter.trailing_zeros() >= 10 {
@@ -749,19 +794,21 @@ impl Executor {
                                     }
                                 }
                                 if !adjacency_neighbor_allowed(
-                                    &neighbor_id,
+                                    neighbor_id,
                                     next_node_candidate_ids.as_ref(),
                                 ) {
                                     continue;
                                 }
                                 if excluded_next_node_id_match(
                                     &excluded_next_node_id_keys,
-                                    &neighbor_id,
+                                    neighbor_id,
                                 ) {
                                     continue;
                                 }
-                                let new_binding =
-                                    Self::build_neighbor_marker_binding(binding, neighbor_id);
+                                let new_binding = Self::build_neighbor_marker_binding(
+                                    binding,
+                                    neighbor_id.clone(),
+                                );
                                 push_graph_binding(context, &mut output, new_binding)?;
                             }
                         } else {

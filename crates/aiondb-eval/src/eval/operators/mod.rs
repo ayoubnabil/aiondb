@@ -959,59 +959,35 @@ pub(super) fn eval_arith_add(left: &Value, right: &Value) -> DbResult<Value> {
         // now()`, `interval '1 day' + '1 hour'`, etc. all bail with
         // "cannot perform arithmetic on … and TEXT".
         (Value::Text(s), Value::Interval(_)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(&coerced, right)
         }
         (Value::Interval(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(left, &coerced)
         }
         (Value::Text(s), Value::Timestamp(_)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(&coerced, right)
         }
         (Value::Timestamp(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(left, &coerced)
         }
         (Value::Text(s), Value::TimestampTz(_)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(&coerced, right)
         }
         (Value::TimestampTz(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(left, &coerced)
         }
         (Value::Text(s), Value::Date(_)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(&coerced, right)
         }
         (Value::Date(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_add(left, &coerced)
         }
         // inet/cidr (stored as text) + integer/numeric offset

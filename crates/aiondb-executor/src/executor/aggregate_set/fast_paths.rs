@@ -325,10 +325,12 @@ impl Executor {
             };
             filter_column_ids.push(col);
         }
+        // Consume `filters` so the per-entry `lo` / `hi` move into the
+        // storage filter tuples instead of being cloned.
         let storage_filters: Vec<_> = filters
-            .iter()
+            .into_iter()
             .zip(filter_column_ids.into_iter())
-            .map(|((_, lo, hi), col)| (col, lo.clone(), hi.clone()))
+            .map(|((_, lo, hi), col)| (col, lo, hi))
             .collect();
 
         let mode = if context.isolation == aiondb_tx::IsolationLevel::Serializable {
@@ -992,7 +994,12 @@ impl Executor {
                 };
                 for (group_value, count) in per_key_groups {
                     let hash_key = build_hash_key(group_value)?;
-                    let entry = groups.entry(hash_key).or_insert((group_value.clone(), 0));
+                    // `or_insert_with` only invokes the closure (and therefore
+                    // clones `group_value`) on Vacant entries; hits skip the
+                    // clone entirely.
+                    let entry = groups
+                        .entry(hash_key)
+                        .or_insert_with(|| (group_value.clone(), 0));
                     entry.1 = entry.1.saturating_add(*count);
                 }
                 Ok(true)
@@ -1200,9 +1207,6 @@ impl Executor {
             let Some(join_value) = record.row.values.first() else {
                 continue;
             };
-            let Some(group_value) = record.row.values.get(1).cloned() else {
-                continue;
-            };
             let join_hash = build_hash_key(join_value)?;
             let Some(count) = right_counts.get(&join_hash).copied() else {
                 continue;
@@ -1210,6 +1214,11 @@ impl Executor {
             if count == 0 {
                 continue;
             }
+            // Defer the `group_value` clone past the join + count rejection
+            // checks — rejected rows no longer pay it.
+            let Some(group_value) = record.row.values.get(1).cloned() else {
+                continue;
+            };
             let hash_key = build_hash_key(&group_value)?;
             let entry = groups.entry(hash_key).or_insert((group_value, 0));
             entry.1 = entry.1.saturating_add(count);
@@ -1555,7 +1564,14 @@ impl Executor {
                     );
                 }
                 ordered_groups.push(SimpleGroupState::new(group_values, output_count));
-                groups.insert(group_key_scratch.clone(), group_idx);
+                // Move the freshly built key into the HashMap rather than cloning
+                // it; the next iteration starts by `clear()`ing scratch, so an
+                // empty Vec (with a same-sized fresh capacity) preserves the
+                // previous reuse pattern without paying the per-new-group clone.
+                let key_capacity = group_key_scratch.capacity();
+                let key =
+                    std::mem::replace(&mut group_key_scratch, Vec::with_capacity(key_capacity));
+                groups.insert(key, group_idx);
                 group_idx
             };
             let group = ordered_groups.get_mut(group_idx).ok_or_else(|| {
@@ -1631,7 +1647,10 @@ impl Executor {
             .map(|projection| classify_agg_expr(&projection.expr))
             .collect();
         let mut rows = Vec::with_capacity(ordered_groups.len());
-        for group in &ordered_groups {
+        // Consume `ordered_groups` so each per-group sum / extremum slot can be
+        // moved into the output instead of cloned. Each `output_idx` reads its
+        // slot exactly once, so a take is safe.
+        for mut group in ordered_groups {
             context.check_deadline()?;
             if usize_to_u64(rows.len()) >= context.max_result_rows {
                 return Err(DbError::program_limit(
@@ -1652,7 +1671,7 @@ impl Executor {
                     SimpleGroupOutput::Sum { .. } | SimpleGroupOutput::Avg { .. } => {
                         let mut acc = AggAccumulator::new(false);
                         acc.count = group.counts[output_idx];
-                        acc.sum = group.sums[output_idx].clone();
+                        acc.sum = std::mem::take(&mut group.sums[output_idx]);
                         finalize_accumulator(
                             &acc,
                             &agg_templates[output_idx],
@@ -1664,7 +1683,7 @@ impl Executor {
                         // The running extremum is stored verbatim in
                         // `group.sums`; an empty group leaves it as
                         // `None`, which projects as SQL NULL.
-                        group.sums[output_idx].clone().unwrap_or(Value::Null)
+                        std::mem::take(&mut group.sums[output_idx]).unwrap_or(Value::Null)
                     }
                 };
                 values.push(value);

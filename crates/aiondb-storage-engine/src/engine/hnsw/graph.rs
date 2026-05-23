@@ -64,11 +64,14 @@ pub(crate) enum DistanceContext<'a> {
     },
     Binary {
         query_code: BinaryCode,
-        quantizer: BinaryQuantizer,
+        /// `Cow` so search-time probes can borrow the index's quantizer (no
+        /// deep clone of the codebook), while parallel build still owns its
+        /// copy when it cannot keep an index borrow alive.
+        quantizer: Cow<'a, BinaryQuantizer>,
     },
     Scalar {
         query_code: ScalarCode,
-        quantizer: ScalarQuantizer,
+        quantizer: Cow<'a, ScalarQuantizer>,
     },
     Product {
         /// Precomputed query-to-centroid LUT. The LUT carries enough
@@ -2410,24 +2413,16 @@ impl HnswIndex {
     }
 
     fn build_probe_for_graph_insert<'a>(&self, query: &'a [f32]) -> DbResult<DistanceContext<'a>> {
+        // Insert path mutates `self.nodes` while the probe is alive (neighbour
+        // pruning), so the probe cannot keep a `&self` borrow. Build an owned
+        // quantizer copy on this branch only — the search-time hot path uses
+        // `build_probe_for_query`'s borrowed variant.
         if matches!(
             self.graph_build_quantization(),
             StoredQuantizationKind::None
         ) {
-            Ok(self.build_raw_probe(query))
-        } else {
-            self.build_probe_for_query(query)
+            return Ok(self.build_raw_probe(query));
         }
-    }
-
-    /// Build a [`DistanceContext`] for the given raw query vector, honoring
-    /// the index's storage mode (raw f32 or binary). Binary mode requires
-    /// the quantizer to already be initialized (first insert does that).
-    ///
-    /// The probe owns its binary data so it may outlive an index borrow,
-    /// which matters during construction (we mutate `self.nodes` while the
-    /// probe is alive).
-    fn build_probe_for_query<'a>(&self, query: &'a [f32]) -> DbResult<DistanceContext<'a>> {
         match self.quantization {
             StoredQuantizationKind::Binary => {
                 let Some(quantizer) = self.binary_quantizer.as_ref() else {
@@ -2438,7 +2433,7 @@ impl HnswIndex {
                 let query_code = quantizer.encode(query)?;
                 Ok(DistanceContext::Binary {
                     query_code,
-                    quantizer: quantizer.clone(),
+                    quantizer: Cow::Owned(quantizer.clone()),
                 })
             }
             StoredQuantizationKind::Scalar => {
@@ -2446,7 +2441,51 @@ impl HnswIndex {
                     let query_code = quantizer.encode(query)?;
                     Ok(DistanceContext::Scalar {
                         query_code,
-                        quantizer: quantizer.clone(),
+                        quantizer: Cow::Owned(quantizer.clone()),
+                    })
+                } else {
+                    Ok(self.build_raw_probe(query))
+                }
+            }
+            StoredQuantizationKind::Product => {
+                if let Some(quantizer) = self.product_quantizer.as_ref() {
+                    let query_lut = quantizer.compute_query_lut(query)?;
+                    Ok(DistanceContext::Product { query_lut })
+                } else {
+                    Ok(self.build_raw_probe(query))
+                }
+            }
+            StoredQuantizationKind::None => Ok(self.build_raw_probe(query)),
+        }
+    }
+
+    /// Build a [`DistanceContext`] for the given raw query vector, honoring
+    /// the index's storage mode (raw f32 or binary). Binary mode requires
+    /// the quantizer to already be initialized (first insert does that).
+    ///
+    /// The probe owns its binary data so it may outlive an index borrow,
+    /// which matters during construction (we mutate `self.nodes` while the
+    /// probe is alive).
+    fn build_probe_for_query<'a>(&'a self, query: &'a [f32]) -> DbResult<DistanceContext<'a>> {
+        match self.quantization {
+            StoredQuantizationKind::Binary => {
+                let Some(quantizer) = self.binary_quantizer.as_ref() else {
+                    return Err(DbError::internal(
+                        "HNSW binary-quantized search on empty index",
+                    ));
+                };
+                let query_code = quantizer.encode(query)?;
+                Ok(DistanceContext::Binary {
+                    query_code,
+                    quantizer: Cow::Borrowed(quantizer),
+                })
+            }
+            StoredQuantizationKind::Scalar => {
+                if let Some(quantizer) = self.scalar_quantizer.as_ref() {
+                    let query_code = quantizer.encode(query)?;
+                    Ok(DistanceContext::Scalar {
+                        query_code,
+                        quantizer: Cow::Borrowed(quantizer),
                     })
                 } else {
                     Ok(self.build_raw_probe(query))
@@ -2484,14 +2523,14 @@ impl HnswIndex {
     /// Build a probe whose query is one of the stored nodes. Used for
     /// intra-graph distance (e.g. neighbor pruning). Returns a probe that
     /// borrows from `node`, so the caller must keep `node` alive.
-    fn build_probe_for_stored_node<'a>(&self, node: &'a HnswNode) -> Option<DistanceContext<'a>> {
+    fn build_probe_for_stored_node<'a>(&'a self, node: &'a HnswNode) -> Option<DistanceContext<'a>> {
         match self.quantization {
             StoredQuantizationKind::Binary => {
                 let quantizer = self.binary_quantizer.as_ref()?;
                 let query_code = node.binary_code.as_ref()?.clone();
                 Some(DistanceContext::Binary {
                     query_code,
-                    quantizer: quantizer.clone(),
+                    quantizer: Cow::Borrowed(quantizer),
                 })
             }
             StoredQuantizationKind::Scalar => {
@@ -2500,7 +2539,7 @@ impl HnswIndex {
                 {
                     return Some(DistanceContext::Scalar {
                         query_code: code.clone(),
-                        quantizer: quantizer.clone(),
+                        quantizer: Cow::Borrowed(quantizer),
                     });
                 }
                 Some(self.build_raw_probe_for_node(node))
@@ -2756,9 +2795,9 @@ fn greedy_closest_in(
 /// parallel builder so each rayon worker owns its scratch state.
 fn build_probe_standalone<'a>(
     quantization: StoredQuantizationKind,
-    binary_quant: Option<&BinaryQuantizer>,
-    scalar_quant: Option<&ScalarQuantizer>,
-    product_quant: Option<&ProductQuantizer>,
+    binary_quant: Option<&'a BinaryQuantizer>,
+    scalar_quant: Option<&'a ScalarQuantizer>,
+    product_quant: Option<&'a ProductQuantizer>,
     distance_fn: DistanceFn,
     gpu_metric: aiondb_gpu::DistanceMetric,
     element_type: aiondb_core::VectorElementType,
@@ -2788,7 +2827,7 @@ fn build_probe_standalone<'a>(
             let query_code = quantizer.encode(query)?;
             Ok(DistanceContext::Binary {
                 query_code,
-                quantizer: quantizer.clone(),
+                quantizer: Cow::Borrowed(quantizer),
             })
         }
         StoredQuantizationKind::Scalar => {
@@ -2796,7 +2835,7 @@ fn build_probe_standalone<'a>(
                 let query_code = quantizer.encode(query)?;
                 Ok(DistanceContext::Scalar {
                     query_code,
-                    quantizer: quantizer.clone(),
+                    quantizer: Cow::Borrowed(quantizer),
                 })
             } else {
                 Ok(raw_fallback())

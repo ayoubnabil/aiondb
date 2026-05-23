@@ -206,14 +206,17 @@ pub(super) fn execute_final_aggregate_plan(
 
     // 4. Build a `ProjectValues` plan that materializes all partial rows
     //    so they can be fed into a local re-aggregation.
+    // Consume `partial_rows` so each per-row `Value` moves directly into the
+    // `TypedExpr::literal` it backs; the previous iter().cloned() path copied
+    // every cell on the wire one extra time before re-aggregation.
     let value_rows: Vec<Vec<TypedExpr>> = partial_rows
-        .iter()
+        .into_iter()
         .map(|row| {
             row.values
-                .iter()
+                .into_iter()
                 .zip(output_fields.iter())
                 .map(|(value, field)| {
-                    TypedExpr::literal(value.clone(), field.data_type.clone(), field.nullable)
+                    TypedExpr::literal(value, field.data_type.clone(), field.nullable)
                 })
                 .collect()
         })

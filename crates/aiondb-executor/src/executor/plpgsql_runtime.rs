@@ -306,7 +306,9 @@ pub(super) fn try_invoke_plpgsql_trigger(
     forward_notices(&adapter);
     let mut return_value = match flow {
         aiondb_plpgsql::Flow::Return(v) => v,
-        _ => interpreter.scalar_return.clone().unwrap_or(Value::Null),
+        // `scalar_return` isn't read again past this point, so take the
+        // value out of the interpreter instead of cloning it.
+        _ => interpreter.scalar_return.take().unwrap_or(Value::Null),
     };
     // Reconstruct NEW from the per-column bindings. The interpreter stores
     // each `NEW.col := expr` write as `new.<col>` in its frame stack, so we
@@ -420,19 +422,20 @@ pub(super) fn try_invoke_plpgsql(
     };
     forward_notices(&adapter);
     if !interpreter.returned_rows.is_empty() {
-        let rows = interpreter
-            .returned_rows
-            .iter()
+        // Take ownership of `returned_rows` so single-column rows can move
+        // their Value out (via `into_iter().next()`) instead of cloning.
+        let rows = std::mem::take(&mut interpreter.returned_rows)
+            .into_iter()
             .map(|row| {
                 if row.len() == 1 {
-                    match row.first().cloned().unwrap_or(Value::Null) {
+                    match row.into_iter().next().unwrap_or(Value::Null) {
                         Value::Array(fields) if fields.len() > 1 => {
                             Value::Array(normalize_composite_fields(&fields))
                         }
                         other => other,
                     }
                 } else {
-                    Value::Array(normalize_composite_fields(row))
+                    Value::Array(normalize_composite_fields(&row))
                 }
             })
             .collect();

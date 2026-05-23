@@ -238,14 +238,17 @@ impl IvfFlatIndex {
             return Ok(index);
         }
         let ordinal = index.column_ordinal.unwrap();
-        // Extract + validate every vector in parallel.
+        // Extract + validate every vector in parallel. `row` is owned at this
+        // point, so we move the target Value out of `row.values` (cheaper than
+        // cloning the whole Vec<f32>) and consume the inner VectorValue.
         let entries: Vec<(TupleId, Vec<f32>)> = collected
             .into_par_iter()
             .map(|(tid, row)| -> DbResult<(TupleId, Vec<f32>)> {
-                let value = row
-                    .values
-                    .get(ordinal)
-                    .ok_or_else(|| DbError::internal("row is missing indexed vector value"))?;
+                let mut values_vec = row.values;
+                if ordinal >= values_vec.len() {
+                    return Err(DbError::internal("row is missing indexed vector value"));
+                }
+                let value = std::mem::replace(&mut values_vec[ordinal], Value::Null);
                 let values = match value {
                     Value::Vector(v) => {
                         enforce_dimension_limit(v.values.len())?;
@@ -254,7 +257,7 @@ impl IvfFlatIndex {
                                 "IVF-flat index does not support non-finite vector values",
                             ));
                         }
-                        v.values.clone()
+                        v.values
                     }
                     Value::Null => {
                         return Err(DbError::internal(

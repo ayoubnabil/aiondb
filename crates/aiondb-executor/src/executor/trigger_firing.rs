@@ -334,7 +334,9 @@ impl Executor {
             context,
         )?;
         for trigger in &triggers {
-            let prior_values = values.clone();
+            // We only need the prior column count for the mismatch check;
+            // skip the full `values` clone.
+            let prior_len = values.len();
             let (result, modified_new) =
                 self.invoke_trigger(trigger, table_id, Some(values), None, "INSERT", context)?;
             if result.is_null() {
@@ -345,7 +347,7 @@ impl Executor {
             } else if let Value::Array(tuple) = &result {
                 *values = tuple.clone();
             }
-            if values.len() != prior_values.len() {
+            if values.len() != prior_len {
                 // PG raises `record type mismatch` (42804) when a BEFORE
                 // trigger returns a record with a different number of
                 // surface the mismatch instead.
@@ -354,7 +356,7 @@ impl Executor {
                     format!(
                         "trigger returned a record with {} columns, expected {}",
                         values.len(),
-                        prior_values.len()
+                        prior_len
                     ),
                 ))));
             }
@@ -443,7 +445,8 @@ impl Executor {
         context: &ExecutionContext,
     ) -> DbResult<bool> {
         for trigger in triggers {
-            let prior_new = new_values.clone();
+            // Only the length is needed for the post-trigger resize check.
+            let prior_len = new_values.len();
             let (result, modified_new) = self.invoke_trigger(
                 trigger,
                 table_id,
@@ -460,11 +463,11 @@ impl Executor {
             } else if let Value::Array(tuple) = &result {
                 *new_values = tuple.clone();
             }
-            if new_values.len() != prior_new.len() {
-                if new_values.len() > prior_new.len() {
-                    new_values.truncate(prior_new.len());
+            if new_values.len() != prior_len {
+                if new_values.len() > prior_len {
+                    new_values.truncate(prior_len);
                 } else {
-                    new_values.resize(prior_new.len(), Value::Null);
+                    new_values.resize(prior_len, Value::Null);
                 }
             }
         }

@@ -111,10 +111,11 @@ impl Executor {
 
                     let mut values = vec![Value::Null; table.columns.len()];
 
-                    // Auto-generate the id for the first column.
+                    // Auto-generate the id for the first column; move it into
+                    // `values[0]` once we know we're going to use it.
                     let id_value = self.generate_node_id(context, table_id)?;
                     if !id_value.is_null() && !values.is_empty() {
-                        values[0] = id_value.clone();
+                        values[0] = id_value;
                     }
 
                     for prop in &node.properties {
@@ -133,11 +134,14 @@ impl Executor {
                     pattern_node_ids[node_index] = Some(final_id.clone());
 
                     let row = Row::new(values);
-                    let tuple_id = self.insert_locked(context, table_id, row.clone())?;
+                    // Only clone the row if it will be reused for a binding.
+                    // Otherwise we move it straight into `insert_locked`.
+                    let row_for_binding = node.variable.as_ref().map(|_| row.clone());
+                    let tuple_id = self.insert_locked(context, table_id, row)?;
                     count = count.saturating_add(1);
 
                     if let Some(ref var) = node.variable {
-                        let shared_row = Arc::new(row);
+                        let shared_row = Arc::new(row_for_binding.unwrap());
                         // Carry the table's column names through the
                         // binding so subsequent `n.prop` lookups (in the
                         // same statement's RETURN) resolve to actual
@@ -327,11 +331,13 @@ impl Executor {
                     }
 
                     let row = Row::new(values);
-                    let tuple_id = self.insert_locked(context, table_id, row.clone())?;
+                    // Only clone the row if it will be reused for a binding.
+                    let row_for_binding = rel.variable.as_ref().map(|_| row.clone());
+                    let tuple_id = self.insert_locked(context, table_id, row)?;
                     count = count.saturating_add(1);
 
                     if let Some(ref var) = rel.variable {
-                        let shared_row = Arc::new(row);
+                        let shared_row = Arc::new(row_for_binding.unwrap());
                         let column_names: Arc<Vec<String>> =
                             Arc::new(table.columns.iter().map(|c| c.name.clone()).collect());
                         current_binding = current_binding.with_binding(
@@ -724,18 +730,14 @@ impl Executor {
                             context.check_deadline()?;
                             let compat_row =
                                 self.compat_scan_row_for_table_id(context, edge_table_id, &record)?;
-                            let src = compat_row
-                                .values
-                                .get(src_col_idx)
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            let tgt = compat_row
-                                .values
-                                .get(tgt_col_idx)
-                                .cloned()
-                                .unwrap_or(Value::Null);
+                            // Only equality against `node_id` is needed; compare
+                            // references rather than cloning the endpoint values.
+                            let src = compat_row.values.get(src_col_idx);
+                            let tgt = compat_row.values.get(tgt_col_idx);
+                            let matches_endpoint = src.is_some_and(|v| *v == node_id)
+                                || tgt.is_some_and(|v| *v == node_id);
 
-                            if src == node_id || tgt == node_id {
+                            if matches_endpoint {
                                 match self.delete_locked(
                                     context,
                                     edge_table_id,
@@ -825,33 +827,38 @@ impl Executor {
             let mut stream = self.scan_table_locked(context, edge_table_id, None)?;
             while let Some(record) = stream.next()? {
                 context.check_deadline()?;
-                let mut values = record.row.clone().into_values();
-                let mut touched = false;
-
-                if values
+                // Skip the Vec<Value> clone for edges that don't reference the
+                // rewritten id — only materialise an owned value vector when we
+                // are about to mutate it.
+                let src_matches = record
+                    .row
+                    .values
                     .get(src_col_idx)
-                    .is_some_and(|value| value == previous_id)
-                {
-                    values[src_col_idx] = next_id.clone();
-                    touched = true;
-                }
-                if values
+                    .is_some_and(|value| value == previous_id);
+                let tgt_matches = record
+                    .row
+                    .values
                     .get(tgt_col_idx)
-                    .is_some_and(|value| value == previous_id)
-                {
-                    values[tgt_col_idx] = next_id.clone();
-                    touched = true;
+                    .is_some_and(|value| value == previous_id);
+                if !src_matches && !tgt_matches {
+                    continue;
                 }
 
-                if touched {
-                    self.update_locked(
-                        context,
-                        edge_table_id,
-                        record.tuple_id,
-                        Some(&record.row),
-                        Row::new(values),
-                    )?;
+                let mut values = record.row.values.clone();
+                if src_matches {
+                    values[src_col_idx] = next_id.clone();
                 }
+                if tgt_matches {
+                    values[tgt_col_idx] = next_id.clone();
+                }
+
+                self.update_locked(
+                    context,
+                    edge_table_id,
+                    record.tuple_id,
+                    Some(&record.row),
+                    Row::new(values),
+                )?;
             }
         }
         Ok(())
@@ -1129,7 +1136,7 @@ impl Executor {
                 }
 
                 let mut rows = Vec::with_capacity(groups.len());
-                for (_, (group_values, accumulators)) in groups {
+                for (_, (mut group_values, accumulators)) in groups {
                     context.check_deadline()?;
                     let mut projected_values = Vec::with_capacity(returns.len());
                     let mut group_idx = 0usize;
@@ -1146,8 +1153,15 @@ impl Executor {
                             )?);
                             aggregate_idx = aggregate_idx.saturating_add(1);
                         } else {
-                            projected_values
-                                .push(group_values.get(group_idx).cloned().unwrap_or(Value::Null));
+                            // Move the group-by value out of the owned vec
+                            // instead of cloning it; each `group_idx` is read
+                            // exactly once.
+                            let val = if group_idx < group_values.len() {
+                                std::mem::replace(&mut group_values[group_idx], Value::Null)
+                            } else {
+                                Value::Null
+                            };
+                            projected_values.push(val);
                             group_idx = group_idx.saturating_add(1);
                         }
                     }
@@ -1266,81 +1280,102 @@ impl Executor {
                 });
                 top_rows.into_iter().map(|(_, row)| row).collect()
             } else {
-                // Keep both the flattened input row and the projected output row so
-                // ORDER BY can evaluate expressions that are not part of RETURN.
                 let projected_capacity =
                     early_limit.map_or(bindings.len(), |limit| bindings.len().min(limit));
-                let mut projected_rows: Vec<(BindingRow, Row)> =
-                    Vec::with_capacity(projected_capacity);
-                for binding in &bindings {
-                    if early_limit.is_some_and(|limit| projected_rows.len() >= limit) {
-                        break;
-                    }
-                    context.check_deadline()?;
-                    let mut projected_values = Vec::with_capacity(returns.len());
-                    for item in returns {
-                        let value =
-                            self.evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
-                        projected_values.push(value);
-                    }
-                    projected_rows.push((binding.clone(), Row::new(projected_values)));
-                }
-
-                if distinct {
-                    projected_rows = dedup_projected_rows_by_values(projected_rows)?;
-                }
-
-                if order_by.is_empty() {
-                    projected_rows.into_iter().map(|(_, row)| row).collect()
-                } else {
-                    let mut keyed_rows: Vec<(Vec<Value>, Row)> =
-                        Vec::with_capacity(projected_rows.len());
-                    for (binding, row) in projected_rows.drain(..) {
+                // Common case (RETURN without DISTINCT and without ORDER BY):
+                // we never need the binding downstream, so emit projected
+                // `Row`s directly and skip the per-row BindingRow clone.
+                if !distinct && order_by.is_empty() {
+                    let mut projected_rows: Vec<Row> = Vec::with_capacity(projected_capacity);
+                    for binding in &bindings {
+                        if early_limit.is_some_and(|limit| projected_rows.len() >= limit) {
+                            break;
+                        }
                         context.check_deadline()?;
-                        let mut keys = Vec::with_capacity(order_by.len());
-                        for ob in order_by {
-                            keys.push(
-                                self.evaluate_cypher_expr_with_binding(
+                        let mut projected_values = Vec::with_capacity(returns.len());
+                        for item in returns {
+                            let value = self
+                                .evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
+                            projected_values.push(value);
+                        }
+                        projected_rows.push(Row::new(projected_values));
+                    }
+                    projected_rows
+                } else {
+                    // Keep both the flattened input row and the projected output row so
+                    // ORDER BY can evaluate expressions that are not part of RETURN.
+                    let mut projected_rows: Vec<(BindingRow, Row)> =
+                        Vec::with_capacity(projected_capacity);
+                    for binding in &bindings {
+                        if early_limit.is_some_and(|limit| projected_rows.len() >= limit) {
+                            break;
+                        }
+                        context.check_deadline()?;
+                        let mut projected_values = Vec::with_capacity(returns.len());
+                        for item in returns {
+                            let value = self
+                                .evaluate_cypher_expr_with_binding(&item.expr, binding, context)?;
+                            projected_values.push(value);
+                        }
+                        projected_rows.push((binding.clone(), Row::new(projected_values)));
+                    }
+
+                    if distinct {
+                        projected_rows = dedup_projected_rows_by_values(projected_rows)?;
+                    }
+
+                    if order_by.is_empty() {
+                        projected_rows.into_iter().map(|(_, row)| row).collect()
+                    } else {
+                        let mut keyed_rows: Vec<(Vec<Value>, Row)> =
+                            Vec::with_capacity(projected_rows.len());
+                        for (binding, row) in projected_rows.drain(..) {
+                            context.check_deadline()?;
+                            let mut keys = Vec::with_capacity(order_by.len());
+                            for ob in order_by {
+                                keys.push(self.evaluate_cypher_expr_with_binding(
                                     &ob.expr, &binding, context,
-                                )?,
-                            );
-                        }
-                        keyed_rows.push((keys, row));
-                    }
-
-                    let failed = std::cell::Cell::new(false);
-                    let error: std::cell::RefCell<Option<DbError>> = std::cell::RefCell::new(None);
-                    keyed_rows.sort_by(|(a_keys, _), (b_keys, _)| {
-                        if failed.get() {
-                            return Ordering::Equal;
-                        }
-                        if let Err(e) = context.check_deadline() {
-                            failed.set(true);
-                            *error.borrow_mut() = Some(e);
-                            return Ordering::Equal;
-                        }
-                        for (i, (a, b)) in a_keys.iter().zip(b_keys.iter()).enumerate() {
-                            let descending = order_by.get(i).is_some_and(|o| o.descending);
-                            let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
-                            let cmp = match compare_sort_values(a, b, descending, nulls_first) {
-                                Ok(cmp) => cmp,
-                                Err(e) => {
-                                    failed.set(true);
-                                    *error.borrow_mut() = Some(e);
-                                    return Ordering::Equal;
-                                }
-                            };
-                            if cmp != Ordering::Equal {
-                                return cmp;
+                                )?);
                             }
+                            keyed_rows.push((keys, row));
                         }
-                        Ordering::Equal
-                    });
-                    if let Some(e) = error.into_inner() {
-                        return Err(e);
-                    }
 
-                    keyed_rows.into_iter().map(|(_, row)| row).collect()
+                        let failed = std::cell::Cell::new(false);
+                        let error: std::cell::RefCell<Option<DbError>> =
+                            std::cell::RefCell::new(None);
+                        keyed_rows.sort_by(|(a_keys, _), (b_keys, _)| {
+                            if failed.get() {
+                                return Ordering::Equal;
+                            }
+                            if let Err(e) = context.check_deadline() {
+                                failed.set(true);
+                                *error.borrow_mut() = Some(e);
+                                return Ordering::Equal;
+                            }
+                            for (i, (a, b)) in a_keys.iter().zip(b_keys.iter()).enumerate() {
+                                let descending = order_by.get(i).is_some_and(|o| o.descending);
+                                let nulls_first = order_by.get(i).and_then(|o| o.nulls_first);
+                                let cmp =
+                                    match compare_sort_values(a, b, descending, nulls_first) {
+                                        Ok(cmp) => cmp,
+                                        Err(e) => {
+                                            failed.set(true);
+                                            *error.borrow_mut() = Some(e);
+                                            return Ordering::Equal;
+                                        }
+                                    };
+                                if cmp != Ordering::Equal {
+                                    return cmp;
+                                }
+                            }
+                            Ordering::Equal
+                        });
+                        if let Some(e) = error.into_inner() {
+                            return Err(e);
+                        }
+
+                        keyed_rows.into_iter().map(|(_, row)| row).collect()
+                    }
                 }
             }
         };
