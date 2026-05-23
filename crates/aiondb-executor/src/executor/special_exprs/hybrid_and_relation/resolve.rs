@@ -8,6 +8,76 @@
 
 use super::*;
 
+fn keep_top_k_ordered_by<T, F>(values: &mut Vec<T>, k: usize, mut compare: F)
+where
+    F: FnMut(&T, &T) -> std::cmp::Ordering,
+{
+    if k == 0 {
+        values.clear();
+        return;
+    }
+    if values.len() > k {
+        values.select_nth_unstable_by(k - 1, |left, right| compare(left, right));
+        values.truncate(k);
+    }
+    values.sort_by(compare);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VectorTopKScore {
+    distance: f64,
+    id: i64,
+}
+
+impl PartialEq for VectorTopKScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance.total_cmp(&other.distance) == Ordering::Equal && self.id == other.id
+    }
+}
+
+impl Eq for VectorTopKScore {}
+
+impl PartialOrd for VectorTopKScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VectorTopKScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+fn vector_top_k_score_is_better(distance: f64, id: i64, other: &VectorTopKScore) -> bool {
+    match distance.total_cmp(&other.distance) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => id < other.id,
+    }
+}
+
+fn push_vector_top_k_score(
+    top_scores: &mut std::collections::BinaryHeap<VectorTopKScore>,
+    limit: usize,
+    distance: f64,
+    id: i64,
+) {
+    if limit == 0 {
+        return;
+    }
+    let score = VectorTopKScore { distance, id };
+    if top_scores.len() < limit {
+        top_scores.push(score);
+    } else if let Some(mut worst) = top_scores.peek_mut() {
+        if vector_top_k_score_is_better(score.distance, score.id, &worst) {
+            *worst = score;
+        }
+    }
+}
+
 fn vector_hit_payload_columns(
     table: &TableDescriptor,
     vector_ordinal: usize,
@@ -706,12 +776,11 @@ impl Executor {
             Option<serde_json::Map<String, serde_json::Value>>,
         )> = scored_opts.into_iter().flatten().collect();
 
-        scored.sort_by(|left, right| {
+        keep_top_k_ordered_by(&mut scored, requested_result_count, |left, right| {
             left.0
                 .total_cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
         });
-        scored.truncate(requested_result_count);
 
         let final_count = requested_result_count.saturating_sub(offset);
         let mut hits = Vec::with_capacity(final_count);
@@ -783,8 +852,11 @@ impl Executor {
             .unwrap_or(60);
         let rrf_k = if rrf_k == 0 { 1 } else { rrf_k };
 
-        let mut fused = std::collections::BTreeMap::<i64, HybridRrfFusionEntry>::new();
-        let mut seen_dense = std::collections::HashSet::new();
+        let fused_capacity = dense_hits.len().saturating_add(sparse_hits.len());
+        let mut fused = std::collections::HashMap::<i64, HybridRrfFusionEntry<'_>>::with_capacity(
+            fused_capacity,
+        );
+        let mut seen_dense = std::collections::HashSet::with_capacity(dense_hits.len());
         for (rank, hit) in dense_hits.iter().enumerate() {
             context.check_deadline()?;
             let id = read_hit_id(hit, "hybrid_fuse_rrf_hits() dense hits")?;
@@ -804,11 +876,11 @@ impl Executor {
             entry.dense_score = hit.get("score").and_then(serde_json::Value::as_f64);
             entry.dense_distance = hit.get("distance").and_then(serde_json::Value::as_f64);
             if entry.payload.is_none() {
-                entry.payload = hit.get("payload").cloned();
+                entry.payload = hit.get("payload");
             }
         }
 
-        let mut seen_sparse = std::collections::HashSet::new();
+        let mut seen_sparse = std::collections::HashSet::with_capacity(sparse_hits.len());
         for (rank, hit) in sparse_hits.iter().enumerate() {
             context.check_deadline()?;
             let id = read_hit_id(hit, "hybrid_fuse_rrf_hits() sparse hits")?;
@@ -828,12 +900,12 @@ impl Executor {
             entry.sparse_score = hit.get("score").and_then(serde_json::Value::as_f64);
             entry.sparse_distance = hit.get("distance").and_then(serde_json::Value::as_f64);
             if entry.payload.is_none() {
-                entry.payload = hit.get("payload").cloned();
+                entry.payload = hit.get("payload");
             }
         }
 
-        let mut ordered: Vec<(i64, HybridRrfFusionEntry)> = fused.into_iter().collect();
-        ordered.sort_by(|left, right| {
+        let mut ordered: Vec<(i64, HybridRrfFusionEntry<'_>)> = fused.into_iter().collect();
+        keep_top_k_ordered_by(&mut ordered, k, |left, right| {
             right
                 .1
                 .fused_score
@@ -841,8 +913,8 @@ impl Executor {
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        let mut hits = Vec::new();
-        for (id, entry) in ordered.into_iter().take(k) {
+        let mut hits = Vec::with_capacity(ordered.len());
+        for (id, entry) in ordered {
             context.check_deadline()?;
             let mut object = serde_json::Map::new();
             object.insert("id".to_owned(), serde_json::Value::Number(id.into()));
@@ -879,7 +951,7 @@ impl Executor {
                 object.insert("sparse".to_owned(), serde_json::Value::Object(sparse));
             }
             if let Some(payload) = entry.payload {
-                object.insert("payload".to_owned(), payload);
+                object.insert("payload".to_owned(), payload.to_owned());
             }
             hits.push(Value::Jsonb(serde_json::Value::Object(object)));
         }
@@ -1024,13 +1096,13 @@ impl Executor {
         }
 
         let positive_vectors = materialize_recommend_vectors(
-            &positive_specs,
+            positive_specs,
             &id_vectors,
             vector_dims,
             "vector_recommend_top_k_hits() positive examples",
         )?;
         let negative_vectors = materialize_recommend_vectors(
-            &negative_specs,
+            negative_specs,
             &id_vectors,
             vector_dims,
             "vector_recommend_top_k_hits() negative examples",
@@ -1050,13 +1122,16 @@ impl Executor {
             )?)
         };
 
-        let mut query_values = positive_centroid.values.clone();
+        // Move the centroid out instead of cloning; we then mutate it in place
+        // before wrapping it back into a `VectorValue` for the query vector.
+        let positive_dims = positive_centroid.dims;
+        let mut query_values = positive_centroid.values;
         if let Some(negative) = negative_centroid.as_ref() {
             for (index, value) in query_values.iter_mut().enumerate() {
                 *value -= negative.values.get(index).copied().unwrap_or(0.0);
             }
         }
-        let query_vector = aiondb_core::VectorValue::new(positive_centroid.dims, query_values);
+        let query_vector = aiondb_core::VectorValue::new(positive_dims, query_values);
 
         let requested_metric = hybrid_vector_metric_to_distance_metric(metric);
         let payload_filter =
@@ -1360,13 +1435,17 @@ impl Executor {
                 let mut top_hits = std::collections::BinaryHeap::<FullTextTopHit>::new();
                 let mut id_matches_tuple_order = stream_is_tuple_id_ascending;
                 let mut last_ordered_id: Option<i64> = None;
-                while let Some(record) = stream.next()? {
+                while let Some(mut record) = stream.next()? {
                     context.check_deadline()?;
-                    let id = aiondb_eval::coerce_value(
-                        record.row.values.first().cloned().unwrap_or(Value::Null),
-                        &DataType::BigInt,
-                    )?;
-                    let Value::BigInt(id) = id else {
+                    // Move column 0 out of the row (replacing it with Null)
+                    // instead of cloning. text_ordinal is always > 0 in this
+                    // path, so leaving Null at index 0 is harmless.
+                    let first_val = if record.row.values.is_empty() {
+                        Value::Null
+                    } else {
+                        std::mem::replace(&mut record.row.values[0], Value::Null)
+                    };
+                    let Some(id) = read_bigint_value(first_val)? else {
                         continue;
                     };
                     if id_matches_tuple_order {
@@ -1675,7 +1754,7 @@ impl Executor {
             .into_iter()
             .skip(offset)
             .take(k)
-            .map(|hit| Value::Jsonb(serde_json::Value::Object(hit)))
+            .map(|hit| Value::Jsonb(serde_json::Value::Object(hit.clone())))
             .collect();
         Ok(Value::Array(final_hits))
     }
@@ -1723,39 +1802,46 @@ impl Executor {
             collect_dbsf_source_hits(&dense_hits, "hybrid_fuse_dbsf_hits() dense hits", context)?;
         let sparse_source_hits =
             collect_dbsf_source_hits(&sparse_hits, "hybrid_fuse_dbsf_hits() sparse hits", context)?;
-        let dense_normalized = compute_dbsf_normalized_scores(&dense_source_hits);
-        let sparse_normalized = compute_dbsf_normalized_scores(&sparse_source_hits);
+        let dense_normalizer = compute_dbsf_score_normalizer(&dense_source_hits);
+        let sparse_normalizer = compute_dbsf_score_normalizer(&sparse_source_hits);
 
-        let mut fused = std::collections::BTreeMap::<i64, HybridDbsfFusionEntry>::new();
+        let fused_capacity = dense_source_hits
+            .len()
+            .saturating_add(sparse_source_hits.len());
+        let mut fused = std::collections::HashMap::<i64, HybridDbsfFusionEntry<'_>>::with_capacity(
+            fused_capacity,
+        );
 
-        for (hit, normalized_score) in dense_source_hits.iter().zip(dense_normalized.iter()) {
+        for hit in &dense_source_hits {
             context.check_deadline()?;
+            let normalized_score = dense_normalizer.normalize(hit.raw_score);
             let entry = fused.entry(hit.id).or_default();
-            entry.fused_score += dense_weight * *normalized_score;
+            entry.fused_score += dense_weight * normalized_score;
             entry.dense_rank = Some(hit.rank);
             entry.dense_score = hit.score;
             entry.dense_distance = hit.distance;
-            entry.dense_normalized_score = Some(*normalized_score);
+            entry.dense_normalized_score = Some(normalized_score);
             if entry.payload.is_none() {
-                entry.payload = hit.payload.clone();
+                entry.payload = hit.payload;
             }
         }
 
-        for (hit, normalized_score) in sparse_source_hits.iter().zip(sparse_normalized.iter()) {
+        for hit in &sparse_source_hits {
             context.check_deadline()?;
+            let normalized_score = sparse_normalizer.normalize(hit.raw_score);
             let entry = fused.entry(hit.id).or_default();
-            entry.fused_score += sparse_weight * *normalized_score;
+            entry.fused_score += sparse_weight * normalized_score;
             entry.sparse_rank = Some(hit.rank);
             entry.sparse_score = hit.score;
             entry.sparse_distance = hit.distance;
-            entry.sparse_normalized_score = Some(*normalized_score);
+            entry.sparse_normalized_score = Some(normalized_score);
             if entry.payload.is_none() {
-                entry.payload = hit.payload.clone();
+                entry.payload = hit.payload;
             }
         }
 
-        let mut ordered: Vec<(i64, HybridDbsfFusionEntry)> = fused.into_iter().collect();
-        ordered.sort_by(|left, right| {
+        let mut ordered: Vec<(i64, HybridDbsfFusionEntry<'_>)> = fused.into_iter().collect();
+        keep_top_k_ordered_by(&mut ordered, k, |left, right| {
             right
                 .1
                 .fused_score
@@ -1763,8 +1849,8 @@ impl Executor {
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        let mut hits = Vec::new();
-        for (id, entry) in ordered.into_iter().take(k) {
+        let mut hits = Vec::with_capacity(ordered.len());
+        for (id, entry) in ordered {
             context.check_deadline()?;
             let mut object = serde_json::Map::new();
             object.insert("id".to_owned(), serde_json::Value::Number(id.into()));
@@ -1813,7 +1899,7 @@ impl Executor {
                 object.insert("sparse".to_owned(), serde_json::Value::Object(sparse));
             }
             if let Some(payload) = entry.payload {
-                object.insert("payload".to_owned(), payload);
+                object.insert("payload".to_owned(), payload.to_owned());
             }
             hits.push(Value::Jsonb(serde_json::Value::Object(object)));
         }
@@ -1864,16 +1950,17 @@ impl Executor {
             .unwrap_or(usize::MAX);
 
         #[derive(Clone, Debug)]
-        struct GroupBucket {
+        struct GroupBucket<'a> {
             group: serde_json::Value,
-            hits: Vec<serde_json::Map<String, serde_json::Value>>,
+            hits: Vec<&'a serde_json::Map<String, serde_json::Value>>,
             count: usize,
             best_score: f64,
             first_hit_ordinal: usize,
             stable_key: String,
         }
 
-        let mut grouped = std::collections::BTreeMap::<String, GroupBucket>::new();
+        let mut grouped =
+            std::collections::HashMap::<String, GroupBucket>::with_capacity(hits.len());
         for (ordinal, hit) in hits.into_iter().enumerate() {
             context.check_deadline()?;
             let group_value = hit
@@ -1884,7 +1971,7 @@ impl Executor {
                 .unwrap_or(serde_json::Value::Null);
             let stable_key =
                 serde_json::to_string(&group_value).unwrap_or_else(|_| "null".to_owned());
-            let rank_score = read_hit_score_for_dbsf(&hit).unwrap_or(f64::NEG_INFINITY);
+            let rank_score = read_hit_score_for_dbsf(hit).unwrap_or(f64::NEG_INFINITY);
             let bucket = grouped
                 .entry(stable_key.clone())
                 .or_insert_with(|| GroupBucket {
@@ -1905,7 +1992,7 @@ impl Executor {
         }
 
         let mut ordered: Vec<GroupBucket> = grouped.into_values().collect();
-        ordered.sort_by(|left, right| {
+        keep_top_k_ordered_by(&mut ordered, group_limit, |left, right| {
             right
                 .best_score
                 .total_cmp(&left.best_score)
@@ -1913,8 +2000,8 @@ impl Executor {
                 .then_with(|| left.stable_key.cmp(&right.stable_key))
         });
 
-        let mut grouped_hits = Vec::new();
-        for bucket in ordered.into_iter().take(group_limit) {
+        let mut grouped_hits = Vec::with_capacity(ordered.len());
+        for bucket in ordered {
             context.check_deadline()?;
             let mut object = serde_json::Map::new();
             object.insert("group".to_owned(), bucket.group);
@@ -1928,7 +2015,7 @@ impl Executor {
                     bucket
                         .hits
                         .into_iter()
-                        .map(serde_json::Value::Object)
+                        .map(|hit| serde_json::Value::Object(hit.clone()))
                         .collect(),
                 ),
             );
@@ -2056,7 +2143,7 @@ impl Executor {
                             CompiledVectorTopKFilterPredicate::MatchExcept(excluded_values)
                         }
                         VectorTopKFilterPredicateSpec::MatchText(text) => {
-                            CompiledVectorTopKFilterPredicate::MatchText(text.clone())
+                            CompiledVectorTopKFilterPredicate::MatchText(text.to_lowercase())
                         }
                         VectorTopKFilterPredicateSpec::IsNull => {
                             CompiledVectorTopKFilterPredicate::IsNull
@@ -2111,7 +2198,7 @@ impl Executor {
                 Ok(compiled)
             };
 
-        let filter = CompiledVectorTopKFilter {
+        let mut filter = CompiledVectorTopKFilter {
             must: compile_clause(&filter_spec.must)?,
             should: compile_clause(&filter_spec.should)?,
             must_not: compile_clause(&filter_spec.must_not)?,
@@ -2126,6 +2213,13 @@ impl Executor {
                 })
                 .transpose()?,
         };
+        if filter
+            .min_should
+            .as_ref()
+            .is_some_and(|min_should| min_should.min_count == 0)
+        {
+            filter.min_should = None;
+        }
         if filter.must.is_empty()
             && filter.should.is_empty()
             && filter.must_not.is_empty()
@@ -2143,6 +2237,10 @@ impl Executor {
         table_id: RelationId,
         payload_filter: &CompiledVectorTopKFilter,
     ) -> DbResult<std::collections::HashSet<aiondb_core::TupleId>> {
+        if payload_filter.is_impossible() {
+            return Ok(std::collections::HashSet::new());
+        }
+
         let btree_indexes_by_column = self
             .catalog_reader
             .list_indexes(context.txn_id, table_id)?
@@ -2204,6 +2302,22 @@ impl Executor {
             .iter()
             .filter(|condition| is_indexable(condition))
             .collect::<Vec<_>>();
+        let indexed_min_should = payload_filter
+            .min_should
+            .as_ref()
+            .map(|min_should| {
+                min_should
+                    .conditions
+                    .iter()
+                    .filter(|condition| is_indexable(condition))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let all_must_indexed = indexed_must.len() == payload_filter.must.len();
+        let all_should_indexed = !payload_filter.should.is_empty()
+            && indexed_should.len() == payload_filter.should.len();
+        let all_should_covered = payload_filter.should.is_empty() || all_should_indexed;
+        let all_must_not_indexed = indexed_must_not.len() == payload_filter.must_not.len();
 
         let mut required_ids = if let Some(first_must) = indexed_must.first() {
             collect_condition_matches(first_must)?
@@ -2219,21 +2333,69 @@ impl Executor {
         }
 
         let mut should_ids = std::collections::HashSet::new();
-        for condition in &indexed_should {
-            let matches = collect_condition_matches(condition)?;
-            should_ids.extend(matches);
+        if all_should_indexed {
+            for condition in &indexed_should {
+                let matches = collect_condition_matches(condition)?;
+                should_ids.extend(matches);
+            }
         }
 
-        let mut excluded_ids = std::collections::HashSet::new();
-        for condition in &indexed_must_not {
-            let matches = collect_condition_matches(condition)?;
-            excluded_ids.extend(matches);
+        let all_min_should_indexed = payload_filter.min_should.as_ref().is_some_and(|min_should| {
+            min_should.min_count > 0 && indexed_min_should.len() == min_should.conditions.len()
+        });
+        let mut min_should_ids = std::collections::HashSet::new();
+        if all_min_should_indexed {
+            let min_count = payload_filter
+                .min_should
+                .as_ref()
+                .map_or(usize::MAX, |min_should| min_should.min_count);
+            if min_count == 1 {
+                for condition in &indexed_min_should {
+                    let matches = collect_condition_matches(condition)?;
+                    min_should_ids.extend(matches);
+                }
+            } else {
+                let mut counts = std::collections::HashMap::new();
+                for condition in &indexed_min_should {
+                    let matches = collect_condition_matches(condition)?;
+                    for tuple_id in matches {
+                        let count = counts.entry(tuple_id).or_insert(0usize);
+                        *count = count.saturating_add(1);
+                        if *count >= min_count {
+                            min_should_ids.insert(tuple_id);
+                        }
+                    }
+                }
+            }
+            if min_should_ids.is_empty() {
+                return Ok(min_should_ids);
+            }
         }
 
-        let all_should_indexed = !payload_filter.should.is_empty()
-            && indexed_should.len() == payload_filter.should.len();
-        let anchored = !indexed_must.is_empty() || all_should_indexed;
-        if !anchored {
+        let all_min_should_covered =
+            payload_filter.min_should.is_none() || all_min_should_indexed;
+        let intersect_candidate_ids = |
+            candidate_ids: &mut Option<std::collections::HashSet<aiondb_core::TupleId>>,
+            ids: std::collections::HashSet<aiondb_core::TupleId>,
+        | {
+            if let Some(candidate_ids) = candidate_ids {
+                candidate_ids.retain(|tuple_id| ids.contains(tuple_id));
+            } else {
+                *candidate_ids = Some(ids);
+            }
+        };
+        let mut candidate_ids = None;
+        if !indexed_must.is_empty() {
+            candidate_ids = Some(required_ids);
+        }
+        if all_should_indexed {
+            intersect_candidate_ids(&mut candidate_ids, should_ids);
+        }
+        if all_min_should_indexed {
+            intersect_candidate_ids(&mut candidate_ids, min_should_ids);
+        }
+
+        let Some(mut candidate_ids) = candidate_ids else {
             let mut stream = self.scan_table_locked(context, table_id, None)?;
             let mut tuple_ids = std::collections::HashSet::new();
             while let Some(record) = stream.next()? {
@@ -2243,27 +2405,26 @@ impl Executor {
                 }
             }
             return Ok(tuple_ids);
-        }
-
-        let mut candidate_ids = if indexed_must.is_empty() {
-            should_ids
-        } else if payload_filter.should.is_empty() {
-            required_ids
-        } else if all_should_indexed {
-            required_ids
-                .into_iter()
-                .filter(|tuple_id| should_ids.contains(tuple_id))
-                .collect()
-        } else {
-            required_ids
         };
         if candidate_ids.is_empty() {
             return Ok(candidate_ids);
+        }
+        let mut excluded_ids = std::collections::HashSet::new();
+        for condition in &indexed_must_not {
+            let matches = collect_condition_matches(condition)?;
+            excluded_ids.extend(matches);
         }
         if !excluded_ids.is_empty() {
             candidate_ids.retain(|tuple_id| !excluded_ids.contains(tuple_id));
         }
         if candidate_ids.is_empty() {
+            return Ok(candidate_ids);
+        }
+        if all_must_indexed
+            && all_should_covered
+            && all_must_not_indexed
+            && all_min_should_covered
+        {
             return Ok(candidate_ids);
         }
 
@@ -2430,10 +2591,10 @@ impl Executor {
             tuple_id_filter,
             max_search_duration,
         )?;
-        let mut ids = Vec::new();
-        let mut seen_ids = std::collections::HashSet::<i64>::new();
+        let mut ids = Vec::with_capacity(search_limit);
+        let mut seen_ids = std::collections::HashSet::<i64>::with_capacity(search_limit);
         let mut fetched_rows = 0usize;
-        while let Some(record) = stream.next()? {
+        while let Some(mut record) = stream.next()? {
             fetched_rows = fetched_rows.saturating_add(1);
             context.check_deadline()?;
             if tuple_id_filter.is_none()
@@ -2458,11 +2619,12 @@ impl Executor {
                     continue;
                 }
             }
-            let id = aiondb_eval::coerce_value(
-                record.row.values.first().cloned().unwrap_or(Value::Null),
-                &DataType::BigInt,
-            )?;
-            let Value::BigInt(id) = id else {
+            let first_val = if record.row.values.is_empty() {
+                Value::Null
+            } else {
+                std::mem::replace(&mut record.row.values[0], Value::Null)
+            };
+            let Some(id) = read_bigint_value(first_val)? else {
                 continue;
             };
             if seen_ids.insert(id) {
@@ -2493,7 +2655,7 @@ impl Executor {
                 1,
             )
         };
-        let mut scored = Vec::new();
+        let mut top_scores = std::collections::BinaryHeap::<VectorTopKScore>::new();
         let mut used_tuple_fetch = false;
         if let Some(payload_filter) = payload_filter {
             let tuple_id_filter = self.collect_vector_filter_matching_tuple_ids(
@@ -2526,11 +2688,7 @@ impl Executor {
                     .with_min_len(32)
                     .map(|row| -> DbResult<Option<(f64, i64)>> {
                         context.check_deadline()?;
-                        let id = aiondb_eval::coerce_value(
-                            row.values.first().cloned().unwrap_or(Value::Null),
-                            &DataType::BigInt,
-                        )?;
-                        let Value::BigInt(id_value) = id else {
+                        let Some(id_value) = read_bigint_first_value(&row.values)? else {
                             return Ok(None);
                         };
                         let Some(Value::Vector(candidate_vector)) = row.values.get(1) else {
@@ -2554,13 +2712,15 @@ impl Executor {
                         Ok(Some((sortable_distance, id_value)))
                     })
                     .collect::<DbResult<Vec<_>>>()?;
-                scored.extend(scored_opts.into_iter().flatten());
+                for (distance, id) in scored_opts.into_iter().flatten() {
+                    push_vector_top_k_score(&mut top_scores, requested_result_count, distance, id);
+                }
                 used_tuple_fetch = true;
             }
         }
         if !used_tuple_fetch {
             let mut stream = self.scan_table_locked(context, table.table_id, projected_columns)?;
-            while let Some(record) = stream.next()? {
+            while let Some(mut record) = stream.next()? {
                 context.check_deadline()?;
                 if payload_filter
                     .as_ref()
@@ -2568,11 +2728,16 @@ impl Executor {
                 {
                     continue;
                 }
-                let id = aiondb_eval::coerce_value(
-                    record.row.values.first().cloned().unwrap_or(Value::Null),
-                    &DataType::BigInt,
-                )?;
-                let Value::BigInt(id_value) = id else {
+                // Move the first column out of the row (replaced by Null) so
+                // `coerce_value` consumes an owned Value without cloning. The
+                // candidate vector lives at a later ordinal so leaving Null at
+                // index 0 does not disturb the subsequent access.
+                let first_val = if record.row.values.is_empty() {
+                    Value::Null
+                } else {
+                    std::mem::replace(&mut record.row.values[0], Value::Null)
+                };
+                let Some(id_value) = read_bigint_value(first_val)? else {
                     continue;
                 };
                 let Some(Value::Vector(candidate_vector)) =
@@ -2594,11 +2759,17 @@ impl Executor {
                 } else {
                     distance
                 };
-                scored.push((sortable_distance, id_value));
+                push_vector_top_k_score(
+                    &mut top_scores,
+                    requested_result_count,
+                    sortable_distance,
+                    id_value,
+                );
             }
         }
         let failed = std::cell::Cell::new(false);
         let error: std::cell::RefCell<Option<DbError>> = std::cell::RefCell::new(None);
+        let mut scored = top_scores.into_vec();
         scored.sort_by(|left, right| {
             if failed.get() {
                 return Ordering::Equal;
@@ -2608,20 +2779,19 @@ impl Executor {
                 *error.borrow_mut() = Some(e);
                 return Ordering::Equal;
             }
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.id.cmp(&right.id))
         });
         if let Some(e) = error.into_inner() {
             return Err(e);
         }
-        scored.truncate(requested_result_count);
         let final_count = requested_result_count.saturating_sub(offset);
         Ok(scored
             .into_iter()
             .skip(offset)
             .take(final_count)
-            .map(|(_, id)| Value::BigInt(id))
+            .map(|score| Value::BigInt(score.id))
             .collect())
     }
 
@@ -3047,4 +3217,81 @@ fn resolve_vector_filter_key<'a>(
 
 fn strip_qdrant_array_marker(key: &str) -> Option<&str> {
     key.strip_suffix("[]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keep_top_k_ordered_by, push_vector_top_k_score};
+
+    #[test]
+    fn keep_top_k_ordered_by_keeps_stable_top_window() {
+        let mut values = vec![(5_i64, 0.4_f64), (2, 0.9), (9, 0.7), (1, 0.9), (3, 0.2)];
+
+        keep_top_k_ordered_by(&mut values, 3, |left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        assert_eq!(values, vec![(1, 0.9), (2, 0.9), (9, 0.7)]);
+    }
+
+    #[test]
+    fn keep_top_k_ordered_by_zero_clears_values() {
+        let mut values = vec![3_i64, 2, 1];
+
+        keep_top_k_ordered_by(&mut values, 0, Ord::cmp);
+
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn keep_top_k_ordered_by_matches_full_sort_across_window_sizes() {
+        let input = (0_i64..257)
+            .map(|id| {
+                let score = ((id * 37 + 11) % 19) as f64 / 19.0;
+                (id, score)
+            })
+            .collect::<Vec<_>>();
+
+        for k in [1_usize, 2, 3, 5, 8, 13, 21, 34, 55, 144, 257, 300] {
+            let mut expected = input.clone();
+            expected.sort_by(compare_score_desc_id_asc);
+            expected.truncate(k);
+
+            let mut actual = input.clone();
+            keep_top_k_ordered_by(&mut actual, k, compare_score_desc_id_asc);
+
+            assert_eq!(actual, expected, "k={k}");
+        }
+    }
+
+    fn compare_score_desc_id_asc(left: &(i64, f64), right: &(i64, f64)) -> std::cmp::Ordering {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    }
+
+    #[test]
+    fn push_vector_top_k_score_keeps_best_distance_window() {
+        let mut heap = std::collections::BinaryHeap::new();
+        for (distance, id) in [(0.5, 5), (0.2, 9), (0.2, 3), (0.1, 8), (0.4, 1)] {
+            push_vector_top_k_score(&mut heap, 3, distance, id);
+        }
+
+        let mut scores = heap.into_vec();
+        scores.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let actual = scores
+            .into_iter()
+            .map(|score| (score.distance, score.id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, vec![(0.1, 8), (0.2, 3), (0.2, 9)]);
+    }
 }

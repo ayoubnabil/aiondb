@@ -13,7 +13,7 @@ PACKAGE_CONTENTS := target/$(PACKAGE_BASENAME).contents
 PACKAGE_EXTRACT_DIR := target/$(PACKAGE_BASENAME)-verify
 PACKAGE_HELP := target/$(PACKAGE_BASENAME).help
 
-.PHONY: all check test clippy fmt doc clean ci-policy dependency-inventory spdx-sbom package-local package-verify package-reproducible release-local release-verify product-smoke product-smoke-neo4j-p0 product-smoke-neo4j-browser-p0 docker-build docker-run deployment-validate docker-validate dashboard-studio pg-regress-safe pg-regress-oomsafe pg-regress-suite-safe pg-regress-resume-safe bench bench-pgbench bench-surreal-suite bench-tpch bench-job bench-tpcds
+.PHONY: all check test clippy fmt doc clean ci-policy dependency-inventory spdx-sbom package-local package-verify package-reproducible release-local release-verify product-smoke product-smoke-neo4j-p0 product-smoke-neo4j-browser-p0 docker-build docker-run deployment-validate docker-validate dashboard-studio pg-regress-safe pg-regress-oomsafe pg-regress-suite-safe pg-regress-resume-safe bench bench-pgbench bench-surreal-suite bench-tpch bench-job bench-tpcds bench-hybrid-fusion-micro
 
 all: check test clippy fmt
 
@@ -275,3 +275,6 @@ bench-job:
 
 bench-tpcds:
 	./benchmarks/run.sh tpcds
+
+bench-hybrid-fusion-micro:
+	cargo xtask hybrid-fusion-microbench

@@ -5,6 +5,7 @@ mod compat_debt_report;
 mod ecosystem_compat;
 mod ecosystem_compat_trend;
 mod file_limits;
+mod hybrid_fusion_microbench;
 mod pg_compat;
 mod runtime_crash_lints;
 mod storage_upgrade_matrix;
@@ -23,6 +24,7 @@ enum Task {
     EcosystemCompatTrend(ecosystem_compat_trend::EcosystemCompatTrendOptions),
     TestMatrix(test_matrix::TestMatrixOptions),
     FileLimits(file_limits::FileLimitOptions),
+    HybridFusionMicrobench(hybrid_fusion_microbench::HybridFusionMicrobenchOptions),
     PgCompat(pg_compat::PgCompatOptions),
     RuntimeCrashLints,
     StorageUpgradeMatrix(storage_upgrade_matrix::StorageUpgradeMatrixOptions),
@@ -49,6 +51,9 @@ fn parse_args() -> Result<Task, String> {
         }
         Some("test-matrix") => test_matrix::parse_args(&args[2..]).map(Task::TestMatrix),
         Some("file-limits") => file_limits::parse_args(&args[2..]).map(Task::FileLimits),
+        Some("hybrid-fusion-microbench") => {
+            hybrid_fusion_microbench::parse_args(&args[2..]).map(Task::HybridFusionMicrobench)
+        }
         Some("pg-compat") => pg_compat::parse_args(&args[2..]).map(Task::PgCompat),
         Some("runtime-crash-lints") => {
             runtime_crash_lints::parse_args(&args[2..]).map(|()| Task::RuntimeCrashLints)
@@ -81,6 +86,7 @@ Usage:
   cargo xtask ecosystem-compat-trend [OPTIONS]
   cargo xtask test-matrix [OPTIONS]
   cargo xtask file-limits [OPTIONS]
+  cargo xtask hybrid-fusion-microbench [--check]
   cargo xtask pg-compat [OPTIONS]
   cargo xtask runtime-crash-lints
   cargo xtask storage-upgrade-matrix [OPTIONS]
@@ -99,6 +105,7 @@ Commands:
   ecosystem-compat-trend  Render a per-commit/per-suite trend over the JSONL history
   test-matrix   Run the local CI matrix
   file-limits   Enforce the architecture line limit across Rust source files
+  hybrid-fusion-microbench  Run the hybrid/vector fusion microbenchmark
   pg-compat     Run the PostgreSQL regression compatibility runner
   runtime-crash-lints  Reject unwrap/expect/panic in production Rust code
   storage-upgrade-matrix  Copy old storage fixtures and run doctor/upgrade/doctor
@@ -158,6 +165,13 @@ fn main() -> ExitCode {
         },
         Task::TestMatrix(opts) => test_matrix::run(opts),
         Task::FileLimits(opts) => match file_limits::run(opts) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Task::HybridFusionMicrobench(opts) => match hybrid_fusion_microbench::run(opts) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error}");
