@@ -22,6 +22,12 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.gg/v9gwAFS7Yp">
+    <img alt="Join Discord" src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white">
+  </a>
+</p>
+
+<p align="center">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-database-orange">
   <img alt="PostgreSQL wire" src="https://img.shields.io/badge/PostgreSQL-wire%20compatible-336791">
   <img alt="Vector search" src="https://img.shields.io/badge/vector-HNSW%20%2B%20IVF-4f46e5">
