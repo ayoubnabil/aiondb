@@ -18,7 +18,7 @@
   ·
   <a href="docs/content/documentation/query/vector-reference.md">Vector Reference</a>
   ·
-  <a href="docs/content/documentation/evaluate/benchmark-results.md">Benchmarks</a>
+  <a href="docs/content/documentation/evaluate/benchmark-results.md">Benchmark Results</a>
 </p>
 
 <p align="center">
