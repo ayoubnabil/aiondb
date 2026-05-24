@@ -720,12 +720,18 @@ impl Executor {
         let mut rows = Vec::new();
         for user_row in user_rows {
             context.check_deadline()?;
-            let Some(user_id) = user_row.values.get(user_id_idx).cloned() else {
+            // Move user_id and user_tenant out of the consumed row instead of
+            // cloning them. The two ordinals are distinct (id vs tenant) so
+            // each mem::replace targets its own slot.
+            let mut row_values = user_row.values;
+            let Some(user_id_slot) = row_values.get_mut(user_id_idx) else {
                 continue;
             };
-            let Some(user_tenant) = user_row.values.get(user_tenant_idx).cloned() else {
+            let user_id = std::mem::replace(user_id_slot, Value::Null);
+            let Some(user_tenant_slot) = row_values.get_mut(user_tenant_idx) else {
                 continue;
             };
+            let user_tenant = std::mem::replace(user_tenant_slot, Value::Null);
             let post_rows = self.fetch_join_index_lookup_rows_cached(
                 context,
                 posts_table_id,
@@ -744,11 +750,14 @@ impl Executor {
                     }
                 }
                 post_count = post_count.saturating_add(1);
-                let likes = post_row
-                    .values
-                    .get(posts_likes_idx)
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                // Move the likes Value out of the consumed row instead of
+                // cloning it via `.cloned()`.
+                let mut post_values = post_row.values;
+                let likes = if posts_likes_idx < post_values.len() {
+                    std::mem::replace(&mut post_values[posts_likes_idx], Value::Null)
+                } else {
+                    Value::Null
+                };
                 if matches!(max_likes, Value::Null)
                     || compare_runtime_values(&likes, &max_likes)?
                         == Some(std::cmp::Ordering::Greater)
@@ -990,7 +999,6 @@ impl Executor {
                 context.check_deadline()?;
             }
             scanned_rows = scanned_rows.wrapping_add(1);
-            let id_value = record.row.values.first().cloned().unwrap_or(Value::Null);
             let split_value = record
                 .row
                 .values
@@ -1002,6 +1010,9 @@ impl Executor {
             if text.is_empty() {
                 continue;
             }
+            // Defer the id clone past the rejection checks; non-text or empty
+            // splits no longer pay it.
+            let id_value = record.row.values.first().cloned().unwrap_or(Value::Null);
 
             let mut emit_part = |part: &str| -> DbResult<bool> {
                 if skipped < total_offset {
@@ -1677,7 +1688,7 @@ impl Executor {
             let expanded_rows = if srf_indices.is_empty() {
                 vec![Row::new(projected)]
             } else {
-                super::projection_plans::expand_srf_rows(&projected, &srf_indices)
+                super::projection_plans::expand_srf_rows(projected, &srf_indices)
             };
             if has_ordering {
                 context.track_memory(
@@ -2078,24 +2089,38 @@ impl Executor {
             }
 
             group_key_scratch.clear();
-            let mut group_values = Vec::with_capacity(group_positions.len());
+            // First pass: build the hash key from borrows only. We only
+            // materialise `group_values` (one Value clone per group column)
+            // when the key is new — existing groups pay the lookup but skip
+            // the Vec build entirely.
             for position in &group_positions {
-                let value = record
-                    .row
-                    .values
-                    .get(*position)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                group_key_scratch.push(build_hash_key(&value)?);
-                group_values.push(value);
+                let value = record.row.values.get(*position).unwrap_or(&Value::Null);
+                group_key_scratch.push(build_hash_key(value)?);
             }
             let group_idx = if let Some(&idx) = groups.get(&group_key_scratch) {
                 idx
             } else {
                 context.track_memory(64)?;
                 let group_idx = ordered_groups.len();
+                let mut group_values = Vec::with_capacity(group_positions.len());
+                for position in &group_positions {
+                    group_values.push(
+                        record
+                            .row
+                            .values
+                            .get(*position)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
                 ordered_groups.push(DerivedSimpleAggState::new(group_values, output_count));
-                groups.insert(group_key_scratch.clone(), group_idx);
+                // Move the freshly built key into the HashMap rather than cloning
+                // it. Next iteration starts by `clear()`ing scratch, so an empty
+                // Vec with the same capacity is the right starting state.
+                let key_capacity = group_key_scratch.capacity();
+                let key =
+                    std::mem::replace(&mut group_key_scratch, Vec::with_capacity(key_capacity));
+                groups.insert(key, group_idx);
                 group_idx
             };
             let group = ordered_groups
@@ -2125,7 +2150,11 @@ impl Executor {
             .map(|projection| classify_agg_expr(&projection.expr))
             .collect();
         let mut rows = Vec::with_capacity(ordered_groups.len());
-        for group in &ordered_groups {
+        // Consume `ordered_groups` so we can move the per-group sum out of
+        // `group.sums[i]` instead of cloning it before handing it to the
+        // finalizer (each `output_idx` reads its slot exactly once, so a take
+        // is safe).
+        for mut group in ordered_groups {
             context.check_deadline()?;
             let mut values = Vec::with_capacity(output_plan.len());
             for (output_idx, output) in output_plan.iter().enumerate() {
@@ -2139,7 +2168,7 @@ impl Executor {
                     DerivedSimpleAggOutput::Sum { .. } | DerivedSimpleAggOutput::Avg { .. } => {
                         let mut acc = AggAccumulator::new(false);
                         acc.count = group.counts[output_idx];
-                        acc.sum = group.sums[output_idx].clone();
+                        acc.sum = std::mem::take(&mut group.sums[output_idx]);
                         finalize_accumulator(
                             &acc,
                             &agg_templates[output_idx],

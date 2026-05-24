@@ -24,9 +24,14 @@ pub(super) fn merge_procedure_rows_into_bindings(
             })
             .collect::<Vec<_>>();
         let missing_yields = yield_slots.iter().filter(|slot| slot.is_none()).count();
-        for procedure_row in procedure_rows {
-            context.check_deadline()?;
-            let mut binding = input.clone();
+        // Process every procedure row but the last with a cloned input, then
+        // move `input` directly into the binding produced by the last row —
+        // saves one BindingRow clone per outer iteration.
+        let mut procedure_iter = procedure_rows.iter();
+        let Some(last_row) = procedure_iter.next_back() else {
+            continue;
+        };
+        let apply_row = |binding: &mut BindingRow, procedure_row: &Vec<SharedBoundValue>| {
             if missing_yields > 0 {
                 binding.entries.reserve(missing_yields);
             }
@@ -41,8 +46,17 @@ pub(super) fn merge_procedure_rows_into_bindings(
                     binding.entries.push((name.clone(), value.clone()));
                 }
             }
+        };
+        for procedure_row in procedure_iter {
+            context.check_deadline()?;
+            let mut binding = input.clone();
+            apply_row(&mut binding, procedure_row);
             push_graph_binding(context, &mut output, binding)?;
         }
+        context.check_deadline()?;
+        let mut binding = input;
+        apply_row(&mut binding, last_row);
+        push_graph_binding(context, &mut output, binding)?;
     }
     Ok(output)
 }

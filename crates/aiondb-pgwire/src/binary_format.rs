@@ -631,7 +631,15 @@ pub fn decode_binary_param(
 
             let zone_bytes = read_fixed_binary::<4>(index, &data[8..12], "TIMETZ")?;
             let zone_west = i32::from_be_bytes(zone_bytes);
-            let offset = UtcOffset::from_whole_seconds(-zone_west).map_err(|e| {
+            // V2-10 : `-zone_west` overflows when `zone_west == i32::MIN`,
+            // which panics in debug builds. Validate with checked_neg so
+            // the worst case becomes a clean protocol error.
+            let east_seconds = zone_west.checked_neg().ok_or_else(|| {
+                DbError::protocol(format!(
+                    "binary bind parameter ${index}: invalid TIMETZ: zone offset {zone_west} out of range"
+                ))
+            })?;
+            let offset = UtcOffset::from_whole_seconds(east_seconds).map_err(|e| {
                 DbError::protocol(format!(
                     "binary bind parameter ${index}: invalid TIMETZ: {e}"
                 ))

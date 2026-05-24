@@ -7,14 +7,19 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time;
 use tracing::{debug, warn};
 
 use crate::distrib_metrics::DistribMetrics;
+
+const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_REQUEST_BUFFER_BYTES: usize = 4096;
 
 pub struct MetricsServer {
     handle: JoinHandle<()>,
@@ -69,22 +74,29 @@ impl MetricsServer {
 }
 
 async fn serve_one(metrics: Arc<DistribMetrics>, stream: &mut TcpStream) -> io::Result<()> {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
+    let mut buf = vec![0u8; HTTP_REQUEST_BUFFER_BYTES];
+    let n = time::timeout(HTTP_REQUEST_READ_TIMEOUT, stream.read(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "metrics request read timeout"))??;
     if n == 0 {
         return Ok(());
     }
     let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
-    let (body, content_type) = match path.as_str() {
-        "/metrics" => (metrics.prometheus(), "text/plain; version=0.0.4"),
-        "/metrics/json" => (metrics.json().to_string(), "application/json"),
-        _ => ("not found\n".to_string(), "text/plain"),
-    };
-    let status = if path == "/metrics" || path == "/metrics/json" {
-        "200 OK"
+    let mut request_parts = head.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("/").to_string();
+    let (status, body, content_type) = if method != "GET" {
+        (
+            "405 Method Not Allowed",
+            "method not allowed\n".to_string(),
+            "text/plain",
+        )
     } else {
-        "404 Not Found"
+        match path.as_str() {
+            "/metrics" => ("200 OK", metrics.prometheus(), "text/plain; version=0.0.4"),
+            "/metrics/json" => ("200 OK", metrics.json().to_string(), "application/json"),
+            _ => ("404 Not Found", "not found\n".to_string(), "text/plain"),
+        }
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -97,8 +109,6 @@ async fn serve_one(metrics: Arc<DistribMetrics>, stream: &mut TcpStream) -> io::
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::kv_engine::KvEngine;
     use crate::multi_raft::{MultiRaftGroupId, MultiRaftRegistry};
@@ -119,8 +129,12 @@ mod tests {
     }
 
     async fn fetch(addr: SocketAddr, path: &str) -> String {
+        fetch_method(addr, "GET", path).await
+    }
+
+    async fn fetch_method(addr: SocketAddr, method: &str, path: &str) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];
@@ -163,6 +177,15 @@ mod tests {
         let addr = server.local_addr();
         let body = fetch(addr, "/foo").await;
         assert!(body.contains("HTTP/1.1 404 Not Found"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_get_method_returns_405() {
+        let (_t, server) = boot().await;
+        let addr = server.local_addr();
+        let body = fetch_method(addr, "POST", "/metrics").await;
+        assert!(body.contains("HTTP/1.1 405 Method Not Allowed"));
         server.shutdown().await;
     }
 }

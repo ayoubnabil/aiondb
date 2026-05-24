@@ -265,6 +265,97 @@ fn project_table_output_table_ordinals(outputs: &[ProjectionExpr]) -> Option<Vec
         .collect()
 }
 
+#[derive(Clone)]
+struct ParameterizedIndexJoinRightTarget {
+    table_id: RelationId,
+    filter: Option<TypedExpr>,
+    order_by: Vec<SortExpr>,
+    limit: Option<TypedExpr>,
+    offset: Option<TypedExpr>,
+    distinct: bool,
+    distinct_on: Vec<TypedExpr>,
+    projected_width: Option<usize>,
+    table_ordinals: Vec<usize>,
+}
+
+fn parameterized_index_join_right_target(
+    plan: &PhysicalPlan,
+) -> Option<ParameterizedIndexJoinRightTarget> {
+    match plan {
+        PhysicalPlan::ProjectTable {
+            table_id,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct,
+            distinct_on,
+            ..
+        } => Some(ParameterizedIndexJoinRightTarget {
+            table_id: *table_id,
+            filter: filter.clone(),
+            order_by: order_by.clone(),
+            limit: limit.clone(),
+            offset: offset.clone(),
+            distinct: *distinct,
+            distinct_on: distinct_on.clone(),
+            projected_width: (!outputs.is_empty()).then_some(outputs.len().max(1)),
+            table_ordinals: if outputs.is_empty() {
+                Vec::new()
+            } else {
+                project_table_output_table_ordinals(outputs)?
+            },
+        }),
+        PhysicalPlan::SeqScan { table_id } => Some(ParameterizedIndexJoinRightTarget {
+            table_id: *table_id,
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on: Vec::new(),
+            projected_width: None,
+            table_ordinals: Vec::new(),
+        }),
+        PhysicalPlan::ProjectSource {
+            source,
+            outputs,
+            filter: None,
+            order_by,
+            limit: None,
+            offset: None,
+            distinct: false,
+            distinct_on,
+        } if order_by.is_empty() && distinct_on.is_empty() => {
+            let mut target = parameterized_index_join_right_target(source)?;
+            if outputs.is_empty() {
+                return Some(target);
+            }
+
+            let mut table_ordinals = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                let (_, source_ordinal) = output.expr.kind.as_column_ref()?;
+                if let Some(source_width) = target.projected_width {
+                    if source_ordinal >= source_width {
+                        return None;
+                    }
+                }
+                let table_ordinal = target
+                    .table_ordinals
+                    .get(source_ordinal)
+                    .copied()
+                    .unwrap_or(source_ordinal);
+                table_ordinals.push(table_ordinal);
+            }
+            target.projected_width = Some(outputs.len().max(1));
+            target.table_ordinals = table_ordinals;
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
 fn remap_join_right_projected_ordinals(
     expr: TypedExpr,
     left_width: usize,
@@ -355,6 +446,48 @@ fn collect_project_table_required_column_ids(
         .into_iter()
         .map(|ordinal| table.columns.get(ordinal).map(|column| column.column_id))
         .collect()
+}
+
+fn collect_aggregate_required_column_ids(
+    table: &TableDescriptor,
+    group_by: &[TypedExpr],
+    aggregates: &[ProjectionExpr],
+    having: Option<&TypedExpr>,
+    filter: Option<&TypedExpr>,
+    order_by: &[SortExpr],
+    distinct_on: &[TypedExpr],
+) -> Option<Vec<ColumnId>> {
+    let mut ordinals = std::collections::BTreeSet::new();
+    for expr in group_by {
+        collect_expr_column_ref_ordinals(expr, &mut ordinals);
+    }
+    for aggregate in aggregates {
+        collect_expr_column_ref_ordinals(&aggregate.expr, &mut ordinals);
+    }
+    if let Some(having) = having {
+        collect_expr_column_ref_ordinals(having, &mut ordinals);
+    }
+    if let Some(filter) = filter {
+        collect_expr_column_ref_ordinals(filter, &mut ordinals);
+    }
+    for sort in order_by {
+        collect_expr_column_ref_ordinals(&sort.expr, &mut ordinals);
+    }
+    for expr in distinct_on {
+        collect_expr_column_ref_ordinals(expr, &mut ordinals);
+    }
+
+    ordinals
+        .into_iter()
+        .map(|ordinal| table.columns.get(ordinal).map(|column| column.column_id))
+        .collect()
+}
+
+fn project_source_outputs_are_passthrough(outputs: &[ProjectionExpr]) -> bool {
+    outputs.is_empty()
+        || outputs
+            .iter()
+            .all(|projection| matches!(projection.expr.kind, TypedExprKind::ColumnRef { .. }))
 }
 
 fn rebind_project_source_distinct_on_expr(
@@ -685,63 +818,14 @@ impl Optimizer {
             return Ok(None);
         }
 
-        // Right child must be a direct table access. Depending on earlier
-        // projection pruning, a full-table child may already have been
-        // lowered from ProjectTable to the join leaf SeqScan.
-        let empty_outputs: &[ProjectionExpr] = &[];
-        let empty_order_by: &[SortExpr] = &[];
-        let empty_distinct_on: &[TypedExpr] = &[];
-        let no_expr: Option<TypedExpr> = None;
-        let false_distinct = false;
-        let (
-            right_table_id,
-            right_outputs,
-            right_filter,
-            right_order_by,
-            right_limit,
-            right_offset,
-            right_distinct,
-            right_distinct_on,
-        ) = match right {
-            PhysicalPlan::ProjectTable {
-                table_id,
-                outputs,
-                filter,
-                order_by,
-                limit,
-                offset,
-                distinct,
-                distinct_on,
-                ..
-            } => (
-                *table_id,
-                outputs.as_slice(),
-                filter,
-                order_by.as_slice(),
-                limit,
-                offset,
-                distinct,
-                distinct_on.as_slice(),
-            ),
-            PhysicalPlan::SeqScan { table_id } => (
-                *table_id,
-                empty_outputs,
-                &no_expr,
-                empty_order_by,
-                &no_expr,
-                &no_expr,
-                &false_distinct,
-                empty_distinct_on,
-            ),
-            _ => {
-                return Ok(None);
-            }
-        };
-
-        // Extract equi-join keys from the condition.
-        let Some(condition_expr) = condition else {
+        // Right child must expose a table access directly or through passive
+        // projection wrappers. Depending on earlier projection pruning, a
+        // full-table child may already have been lowered from ProjectTable to
+        // the join leaf SeqScan.
+        let Some(right_target) = parameterized_index_join_right_target(right) else {
             return Ok(None);
         };
+        let right_table_id = right_target.table_id;
 
         // Look for a B-tree index on the right table matching a right key.
         let indexes = self.catalog_reader.list_indexes(txn_id, right_table_id)?;
@@ -751,39 +835,40 @@ impl Optimizer {
         let Some(table) = table else {
             return Ok(None);
         };
-        if !right_order_by.is_empty()
-            || right_limit.is_some()
-            || right_offset.is_some()
-            || *right_distinct
-            || !right_distinct_on.is_empty()
+        if !right_target.order_by.is_empty()
+            || right_target.limit.is_some()
+            || right_target.offset.is_some()
+            || right_target.distinct
+            || !right_target.distinct_on.is_empty()
         {
             return Ok(None);
         }
         let right_width =
             predicate_pushdown::table_column_count(&self.catalog_reader, txn_id, right_table_id)?
                 .unwrap_or_else(|| table.columns.len().max(1));
-        let right_table_ordinals = if right_outputs.is_empty() {
-            Vec::new()
-        } else {
-            let Some(ordinals) = project_table_output_table_ordinals(right_outputs) else {
+        let right_table_ordinals = right_target.table_ordinals;
+        let right_projected_width = right_target.projected_width.unwrap_or(right_width).max(1);
+
+        let (left_keys, right_keys, residual, output_filter) =
+            if let Some((left_keys, right_keys, residual)) =
+                physical_builder::extract_equi_join_keys_public(
+                    condition.as_ref(),
+                    left_width,
+                    right_projected_width,
+                )
+            {
+                (left_keys, right_keys, residual, filter.clone())
+            } else if let Some((left_keys, right_keys, filter_residual)) =
+                physical_builder::extract_equi_join_keys_public(
+                    filter.as_ref(),
+                    left_width,
+                    right_projected_width,
+                )
+            {
+                (left_keys, right_keys, condition.clone(), filter_residual)
+            } else {
                 return Ok(None);
             };
-            ordinals
-        };
-        let right_projected_width = if right_outputs.is_empty() {
-            right_width
-        } else {
-            right_outputs.len().max(1)
-        };
-
-        let equi = physical_builder::extract_equi_join_keys_public(
-            Some(condition_expr),
-            left_width,
-            right_projected_width,
-        );
-        let Some((left_keys, right_keys, residual)) = equi else {
-            return Ok(None);
-        };
         if left_keys.is_empty() {
             return Ok(None);
         }
@@ -823,7 +908,8 @@ impl Optimizer {
             let nlij_total = PlanCost(left_rows * param_cost.0);
             let hj_cost = PlanCost::hash_join(left_rows, right_rows);
             let small_outer_index_probe = left_rows <= 256.0;
-            let index_join_with_residual_right_filter = right_filter.is_some() && left_rows > 64.0;
+            let index_join_with_residual_right_filter =
+                right_target.filter.is_some() && left_rows > 64.0;
 
             if index_join_with_residual_right_filter
                 || (!small_outer_index_probe && !nlij_total.cheaper_than(hj_cost))
@@ -846,7 +932,7 @@ impl Optimizer {
                     )
                 })
                 .collect();
-            let filter = filter.clone().map(|expr| {
+            let filter = output_filter.clone().map(|expr| {
                 remap_join_right_projected_ordinals(expr, left_width, &right_table_ordinals)
             });
             let order_by = order_by
@@ -876,7 +962,7 @@ impl Optimizer {
                 right_width,
                 outer_key_ordinal: left_keys[i],
                 join_type,
-                right_filter: right_filter.clone(),
+                right_filter: right_target.filter.clone(),
                 residual,
                 outputs,
                 filter,
@@ -1055,6 +1141,30 @@ impl Optimizer {
                 distinct,
                 distinct_on,
             } => {
+                let (source, filter) = if let Some(filter_expr) = filter {
+                    if limit.is_none()
+                        && offset.is_none()
+                        && !distinct
+                        && distinct_on.is_empty()
+                        && project_source_outputs_are_passthrough(&outputs)
+                        && predicate_pushdown::can_push_into_child(&source)
+                    {
+                        let remapped_filter =
+                            predicate_pushdown::rewrite_project_source_refs(filter_expr, &outputs);
+                        (
+                            Box::new(predicate_pushdown::push_into_child(
+                                *source,
+                                remapped_filter,
+                            )),
+                            None,
+                        )
+                    } else {
+                        (source, Some(filter_expr))
+                    }
+                } else {
+                    (source, None)
+                };
+
                 // --- Projection pruning ---
                 // When the parent has explicit outputs, narrow the
                 // child to only the needed columns.
@@ -1137,6 +1247,9 @@ impl Optimizer {
                 distinct,
                 distinct_on,
             } => {
+                let filter = filter.and_then(simplify_filter);
+                let having = having.and_then(simplify_filter);
+
                 // MIN/MAX → index scan optimization (planagg.c equivalent).
                 // When the query is `SELECT MIN(col1), MAX(col2), ...` with
                 // no GROUP BY, no HAVING, no DISTINCT, and every aggregate
@@ -1200,6 +1313,25 @@ impl Optimizer {
                     });
                 let count_only_projection: Option<&[ColumnId]> =
                     count_only_filter_scan.then_some(&[]);
+                let aggregate_required_column_ids = if count_only_projection.is_some() {
+                    None
+                } else {
+                    self.catalog_reader
+                        .get_table_by_id(txn_id, table_id)?
+                        .and_then(|table| {
+                            collect_aggregate_required_column_ids(
+                                &table,
+                                &group_by,
+                                &aggregates,
+                                having.as_ref(),
+                                filter.as_ref(),
+                                &order_by,
+                                &distinct_on,
+                            )
+                        })
+                };
+                let projected_column_ids =
+                    count_only_projection.or(aggregate_required_column_ids.as_deref());
 
                 // Fall through to normal aggregate plan.
                 Ok(OptimizedPlan::stable(PhysicalPlan::Aggregate {
@@ -1212,7 +1344,7 @@ impl Optimizer {
                         txn_id,
                         table_id,
                         filter.as_ref(),
-                        count_only_projection,
+                        projected_column_ids,
                     )?,
                     filter,
                     order_by,
@@ -1235,6 +1367,21 @@ impl Optimizer {
                 distinct,
                 distinct_on,
             } => {
+                let filter = filter.and_then(simplify_filter);
+                let having = having.and_then(simplify_filter);
+                let (source, filter) = if let Some(filter_expr) = filter {
+                    if predicate_pushdown::can_push_into_child(&source) {
+                        (
+                            Box::new(predicate_pushdown::push_into_child(*source, filter_expr)),
+                            None,
+                        )
+                    } else {
+                        (source, Some(filter_expr))
+                    }
+                } else {
+                    (source, None)
+                };
+
                 let optimized_source = self.optimize_internal(
                     OptimizeRequest {
                         logical_plan: *source,
@@ -1638,7 +1785,10 @@ impl Optimizer {
                                 exposed_join_swap_remap: None,
                             });
                         }
-                        if matches!(join_type, JoinType::Inner) && !outputs.is_empty() {
+                        if matches!(join_type, JoinType::Inner)
+                            && (!outputs.is_empty()
+                                || exposed_join_swap_policy.allows_empty_outputs())
+                        {
                             let remap = JoinSwapOrdinalRemap::new(left_width, right_width);
                             let swapped_condition = condition
                                 .clone()
@@ -2226,11 +2376,8 @@ fn child_satisfies_order(child: &PhysicalPlan, required: &[SortExpr]) -> bool {
         return true;
     }
     // Extract the child's explicit ORDER BY (the only reliable source).
-    let child_order_by: &[SortExpr] = match child {
-        PhysicalPlan::ProjectTable { order_by, .. }
-        | PhysicalPlan::ProjectSource { order_by, .. }
-        | PhysicalPlan::ProjectOnce { order_by, .. } => order_by,
-        _ => return false,
+    let Some(child_order_by) = physical_plan_explicit_order_by(child) else {
+        return false;
     };
     if child_order_by.len() < required.len() {
         return false;
@@ -2247,6 +2394,30 @@ fn child_satisfies_order(child: &PhysicalPlan, required: &[SortExpr]) -> bool {
             }
             req.expr == child_sort.expr
         })
+}
+
+fn physical_plan_explicit_order_by(plan: &PhysicalPlan) -> Option<&[SortExpr]> {
+    match plan {
+        PhysicalPlan::ProjectOnce { order_by, .. }
+        | PhysicalPlan::ProjectTable { order_by, .. }
+        | PhysicalPlan::LockingProjectTable { order_by, .. }
+        | PhysicalPlan::ProjectSource { order_by, .. }
+        | PhysicalPlan::NestedLoopJoin { order_by, .. }
+        | PhysicalPlan::NestedLoopIndexJoin { order_by, .. }
+        | PhysicalPlan::HashJoin { order_by, .. }
+        | PhysicalPlan::MergeJoin { order_by, .. }
+        | PhysicalPlan::Aggregate { order_by, .. }
+        | PhysicalPlan::AggregateSource { order_by, .. }
+        | PhysicalPlan::SetOperation { order_by, .. }
+        | PhysicalPlan::DistributedAppend { order_by, .. }
+        | PhysicalPlan::ProjectValues { order_by, .. }
+        | PhysicalPlan::FinalAggregate { order_by, .. }
+            if !order_by.is_empty() =>
+        {
+            Some(order_by)
+        }
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------
@@ -2307,6 +2478,52 @@ fn try_push_limit_into_source(
                 table_id,
                 outputs,
                 filter,
+                order_by: pushed_order_by,
+                limit: effective_limit,
+                offset: None,
+                distinct: false,
+                distinct_on: Vec::new(),
+            }
+        }
+        LogicalPlan::ProjectSource {
+            source,
+            outputs,
+            filter: None,
+            order_by: ref child_order_by,
+            limit: ref child_limit,
+            offset: ref child_offset,
+            distinct,
+            distinct_on: ref child_distinct_on,
+        } if child_limit.is_none()
+            && child_order_by.is_empty()
+            && child_offset.is_none()
+            && !distinct
+            && child_distinct_on.is_empty() =>
+        {
+            let pushed_order_by = match remap_project_source_order_by_for_project_table_pushdown(
+                parent_order_by,
+                &outputs,
+            ) {
+                Some(order_by) => order_by,
+                None if parent_order_by.is_empty() => Vec::new(),
+                None => {
+                    return LogicalPlan::ProjectSource {
+                        source,
+                        outputs,
+                        filter: None,
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        distinct,
+                        distinct_on: Vec::new(),
+                    }
+                }
+            };
+            let effective_limit = compute_effective_limit(parent_limit, parent_offset);
+            LogicalPlan::ProjectSource {
+                source,
+                outputs,
+                filter: None,
                 order_by: pushed_order_by,
                 limit: effective_limit,
                 offset: None,

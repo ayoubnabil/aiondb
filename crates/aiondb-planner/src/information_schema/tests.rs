@@ -184,6 +184,7 @@ fn active_users_view() -> ViewDescriptor {
                 default_value: None,
             },
         ],
+        owner: String::new(),
     }
 }
 
@@ -219,6 +220,7 @@ fn active_users_matview_sidecar() -> ViewDescriptor {
                 default_value: None,
             },
         ],
+        owner: String::new(),
     }
 }
 

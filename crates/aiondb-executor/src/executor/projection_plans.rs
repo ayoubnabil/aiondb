@@ -282,7 +282,6 @@ impl Executor {
                 context.check_deadline()?;
             }
             scanned_rows = scanned_rows.wrapping_add(1);
-            let id_value = record.row.values.first().cloned().unwrap_or(Value::Null);
             let split_value = record
                 .row
                 .values
@@ -294,6 +293,9 @@ impl Executor {
             if text.is_empty() {
                 continue;
             }
+            // Defer the id-column clone past the split-value rejection checks
+            // so rows with non-text or empty split values don't pay it.
+            let id_value = record.row.values.first().cloned().unwrap_or(Value::Null);
 
             let mut emit_part = |part: &str| -> DbResult<bool> {
                 if skipped < total_offset {
@@ -1086,7 +1088,7 @@ impl Executor {
                 let mut rows = if srf_indices.is_empty() {
                     vec![Row::new(values)]
                 } else {
-                    expand_srf_rows(&values, &srf_indices)
+                    expand_srf_rows(values, &srf_indices)
                 };
                 enforce_final_row_limits(context, &mut rows)?;
                 Ok(ExecutionResult::Query {
@@ -2221,12 +2223,13 @@ impl Executor {
                                                 output_ordinals,
                                             )?
                                         {
+                                            // Consume `filters` so each
+                                            // `Bound<Value>` moves into the
+                                            // storage tuple instead of cloning.
                                             let storage_filters: Vec<_> = filters
-                                                .iter()
+                                                .into_iter()
                                                 .zip(filter_column_ids.into_iter())
-                                                .map(|((_, lo, hi), col)| {
-                                                    (col, lo.clone(), hi.clone())
-                                                })
+                                                .map(|((_, lo, hi), col)| (col, lo, hi))
                                                 .collect();
                                             match self.storage_dml.scan_table_multi_range_filter(
                                                 context.txn_id,
@@ -3598,12 +3601,15 @@ impl Executor {
                                         context.check_deadline()?;
                                     }
                                     row_idx = row_idx.wrapping_add(1);
-                                    let key =
-                                        record.row.values.first().cloned().unwrap_or(Value::Null);
+                                    // Compare via the borrowed key first; only
+                                    // clone when this record will actually be
+                                    // inserted into the Top-K heap.
+                                    let key_ref =
+                                        record.row.values.first().unwrap_or(&Value::Null);
                                     if top.len() == top_bound {
                                         let worst = &top[top_bound - 1];
                                         let cmp = compare_sort_values(
-                                            &key,
+                                            key_ref,
                                             &worst.key,
                                             sort.descending,
                                             sort.nulls_first,
@@ -3612,6 +3618,7 @@ impl Executor {
                                             continue;
                                         }
                                     }
+                                    let key = key_ref.clone();
                                     let candidate = ScalarTopKCandidate {
                                         key,
                                         tuple_id: record.tuple_id,

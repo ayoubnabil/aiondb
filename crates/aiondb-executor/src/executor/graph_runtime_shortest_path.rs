@@ -553,8 +553,12 @@ impl Executor {
         let node_label_by_table: HashMap<RelationId, SharedStrings> = if path_variable.is_some() {
             let mut map = HashMap::new();
             for desc in self.catalog_reader.list_node_labels(context.txn_id)? {
-                map.entry(desc.table_id)
-                    .or_insert_with(|| Arc::new(vec![desc.label.clone()]));
+                // `or_insert_with` only invokes the closure on Vacant
+                // entries — move the `desc.label` `String` into the
+                // closure so the per-row clone disappears on miss.
+                let table_id = desc.table_id;
+                map.entry(table_id)
+                    .or_insert_with(|| Arc::new(vec![desc.label]));
             }
             map
         } else {
@@ -1225,17 +1229,21 @@ impl Executor {
                         continue;
                     }
 
-                    let mut new_path = path.clone();
-                    new_path.push(edge.tuple_id);
-                    let mut new_path_set = path_set.clone();
-                    new_path_set.insert(edge.tuple_id);
+                    // Defer the path / path_set clones until we know we'll
+                    // actually extend the BFS frontier. The visited-pruning
+                    // branch below otherwise discarded freshly cloned Vec /
+                    // HashSet pairs every time a previously-explored target
+                    // shadowed the current candidate.
+                    let next_depth = usize_to_u32(path.len().saturating_add(1));
 
                     if edge_tgt == *end_id {
-                        let depth = usize_to_u32(new_path.len());
+                        let depth = next_depth;
                         match found_depth {
                             None => {
                                 found_depth = Some(depth);
                                 ensure_graph_result_row_capacity(context, found_paths.len())?;
+                                let mut new_path = path.clone();
+                                new_path.push(edge.tuple_id);
                                 context.track_memory(estimate_bfs_path_bytes(new_path.len()))?;
                                 found_paths.push(new_path);
                                 if !all {
@@ -1244,6 +1252,8 @@ impl Executor {
                             }
                             Some(fd) if depth == fd => {
                                 ensure_graph_result_row_capacity(context, found_paths.len())?;
+                                let mut new_path = path.clone();
+                                new_path.push(edge.tuple_id);
                                 context.track_memory(estimate_bfs_path_bytes(new_path.len()))?;
                                 found_paths.push(new_path);
                             }
@@ -1254,11 +1264,11 @@ impl Executor {
 
                     if let Some(k) = value_to_bfs_key(&edge_tgt) {
                         if let Some(&prev_depth) = visited.get(&k) {
-                            if !all || usize_to_u32(new_path.len()) > prev_depth {
+                            if !all || next_depth > prev_depth {
                                 continue;
                             }
                         }
-                        if visited.insert(k, usize_to_u32(new_path.len())).is_none() {
+                        if visited.insert(k, next_depth).is_none() {
                             context.track_memory(
                                 size_of_u64::<u64>()
                                     .saturating_add(size_of_u64::<u32>())
@@ -1267,6 +1277,10 @@ impl Executor {
                         }
                     }
 
+                    let mut new_path = path.clone();
+                    new_path.push(edge.tuple_id);
+                    let mut new_path_set = path_set.clone();
+                    new_path_set.insert(edge.tuple_id);
                     context.track_memory(estimate_shortest_path_queue_entry_bytes(
                         &edge_tgt,
                         new_path.len(),

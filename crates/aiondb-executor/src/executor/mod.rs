@@ -229,9 +229,12 @@ impl TupleStream for ExpandIndexOnlyTupleStream {
             return Ok(None);
         };
         let mut expanded = vec![Value::Null; self.table_width];
+        // Each `source_ordinal` is read exactly once (0..source.len()), so we
+        // can move the Value out of the source row instead of cloning it.
+        let mut source_values = record.row.values;
         for (source_ordinal, table_ordinal) in self.table_ordinals.iter().copied().enumerate() {
-            if let Some(value) = record.row.values.get(source_ordinal).cloned() {
-                expanded[table_ordinal] = value;
+            if let Some(slot) = source_values.get_mut(source_ordinal) {
+                expanded[table_ordinal] = std::mem::replace(slot, Value::Null);
             }
         }
         record.row = Row::new(expanded);
@@ -3314,7 +3317,7 @@ impl Executor {
             return Ok(vec![projected]);
         }
         Ok(self::projection_plans::expand_srf_rows(
-            &projected.values,
+            projected.into_values(),
             &srf_indices,
         ))
     }

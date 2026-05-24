@@ -10,6 +10,7 @@ aiondb-core = { path = "../aiondb-core" }
 aiondb-ha = { path = "../aiondb-ha" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+subtle = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt", "macros"] }
 tracing = { workspace = true }
 

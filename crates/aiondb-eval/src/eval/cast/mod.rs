@@ -27,6 +27,14 @@ use super::scalar_functions::value_convert::{
 use date_time::*;
 pub(crate) use interval::cast_interval_with_fields;
 use interval::parse_interval;
+
+/// Borrow-friendly entry point for the text → interval coercion. The arithmetic
+/// operators use this on per-row temporal+text additions/subtractions so they
+/// can pass a `&str` straight through to the parser instead of wrapping a
+/// cloned `String` in `Value::Text` just to satisfy `cast_value`.
+pub(crate) fn cast_text_to_interval(text: &str) -> DbResult<Value> {
+    parse_interval(text)
+}
 use numeric::*;
 use time_parse::{parse_pg_time_components, TimeParseError};
 

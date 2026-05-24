@@ -585,3 +585,19 @@ fn qualified_name_long_strings() {
     let displayed = format!("{qn}");
     assert_eq!(displayed.len(), 20_001); // schema + '.' + name
 }
+
+#[test]
+fn role_descriptor_debug_redacts_password_hash() {
+    let role = RoleDescriptor {
+        name: "admin".to_owned(),
+        login: true,
+        superuser: true,
+        password_hash: Some("SCRAM-SHA-256$secret-verifier".to_owned()),
+        ..RoleDescriptor::default()
+    };
+
+    let debug = format!("{role:?}");
+
+    assert!(!debug.contains("secret-verifier"));
+    assert!(debug.contains("redacted"));
+}

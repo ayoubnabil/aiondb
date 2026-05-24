@@ -350,6 +350,7 @@ fn sales_snapshot_sidecar() -> ViewDescriptor {
                 default_value: None,
             },
         ],
+        owner: String::new(),
     }
 }
 

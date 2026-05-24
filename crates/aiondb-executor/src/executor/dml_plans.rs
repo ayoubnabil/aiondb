@@ -3298,11 +3298,14 @@ impl Executor {
                                 };
                                 self.lock_table(context, *table_id, mode)?;
                                 context.record_relation_read(*table_id)?;
+                                // `column_predicates` isn't needed after this
+                                // point; move it into the bounds vec instead
+                                // of cloning.
                                 let bounds_for_call: Vec<(
                                     ColumnId,
                                     std::ops::Bound<Value>,
                                     std::ops::Bound<Value>,
-                                )> = column_predicates.clone();
+                                )> = column_predicates;
                                 match self.storage_dml.scan_table_multi_range_filter(
                                     context.txn_id,
                                     &context.snapshot,
@@ -4143,8 +4146,15 @@ impl Executor {
             return Ok(());
         }
         if table_index >= from_rows.len() {
-            let combined = Row::new(scratch.clone());
-            *keep_going = callback(&combined)?;
+            // Move `scratch` into the leaf Row, run the callback, then move it
+            // back. This skips the previous per-combination Vec<Value> clone
+            // (which dominated UPDATE/DELETE ... FROM cross-product builds);
+            // the parent iteration only resumes after we restore scratch.
+            let combined_values = std::mem::take(scratch);
+            let combined = Row::new(combined_values);
+            let res = callback(&combined);
+            *scratch = combined.into_values();
+            *keep_going = res?;
             return Ok(());
         }
         for from_row in &from_rows[table_index] {

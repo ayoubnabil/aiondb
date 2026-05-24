@@ -7,6 +7,12 @@
 use aiondb_core::{DbError, DbResult};
 use subtle::ConstantTimeEq;
 
+/// V2-06 : production-grade fragment-transport auth tokens must be at
+/// least this many bytes. Matches the floor used for the Raft TCP
+/// transport (`MIN_RAFT_SHARED_SECRET_BYTES`) so a single leaked
+/// fragment-transport token is not catastrophically short.
+pub const MIN_AUTH_TOKEN_BYTES: usize = 32;
+
 /// Shared-secret authentication token for inter-node communication.
 #[derive(Clone)]
 pub struct AuthToken(String);
@@ -47,6 +53,27 @@ impl AuthToken {
             return Err(DbError::invalid_authorization(
                 "inter-node auth token must not be empty when remote nodes are configured",
             ));
+        }
+        Ok(())
+    }
+
+    /// V2-06 : production-grade strength check. Rejects empty tokens
+    /// and any token shorter than [`MIN_AUTH_TOKEN_BYTES`]. Call this
+    /// from production wire-up so a single-byte AuthToken cannot be
+    /// configured by accident.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authorization error when the token is empty or
+    /// shorter than [`MIN_AUTH_TOKEN_BYTES`] bytes.
+    pub fn require_production_strength(&self) -> DbResult<()> {
+        self.require_non_empty()?;
+        if self.0.len() < MIN_AUTH_TOKEN_BYTES {
+            return Err(DbError::invalid_authorization(format!(
+                "inter-node auth token must be at least {MIN_AUTH_TOKEN_BYTES} bytes ; \
+                 got {} bytes",
+                self.0.len()
+            )));
         }
         Ok(())
     }
@@ -168,6 +195,30 @@ mod tests {
     #[test]
     fn require_non_empty_accepts_nonempty() {
         assert!(AuthToken::new("secret").require_non_empty().is_ok());
+    }
+
+    #[test]
+    fn v2_06_require_production_strength_rejects_short_token() {
+        assert!(AuthToken::new("").require_production_strength().is_err());
+        assert!(AuthToken::new("a")
+            .require_production_strength()
+            .is_err());
+        // 31 bytes — one shy of the floor.
+        assert!(AuthToken::new("a".repeat(MIN_AUTH_TOKEN_BYTES - 1))
+            .require_production_strength()
+            .is_err());
+    }
+
+    #[test]
+    fn v2_06_require_production_strength_accepts_long_token() {
+        // 32 bytes exactly.
+        assert!(AuthToken::new("a".repeat(MIN_AUTH_TOKEN_BYTES))
+            .require_production_strength()
+            .is_ok());
+        // 64 bytes — typical hex-encoded 32-byte secret.
+        assert!(AuthToken::new("a".repeat(64))
+            .require_production_strength()
+            .is_ok());
     }
 
     #[test]

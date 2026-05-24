@@ -28,6 +28,9 @@ use tracing::{debug, error, trace, warn};
 
 use crate::multi_raft::{MultiRaftGroupId, MultiRaftRegistry};
 use crate::raft::{AppendEntriesRequest, AppendEntriesResponse};
+use crate::raft_auth::{
+    decode_authenticated, encode_authenticated, RaftSharedSecret, MIN_RAFT_SHARED_SECRET_BYTES,
+};
 
 /// Maximum on-the-wire frame size. Generous default for a single
 /// AppendEntries batch.
@@ -58,6 +61,7 @@ pub type PeerAddressBook = HashMap<u64, SocketAddr>;
 pub struct RaftTcpServer {
     registry: Arc<MultiRaftRegistry>,
     peers: Arc<Mutex<PeerAddressBook>>,
+    secret: RaftSharedSecret,
     listener_handle: JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
     local_addr: SocketAddr,
@@ -67,7 +71,16 @@ impl RaftTcpServer {
     pub async fn start(
         registry: Arc<MultiRaftRegistry>,
         bind_addr: SocketAddr,
+        secret: RaftSharedSecret,
     ) -> io::Result<Self> {
+        if !secret.is_strong_enough() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "raft tcp shared secret must be at least {MIN_RAFT_SHARED_SECRET_BYTES} bytes"
+                ),
+            ));
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let peers: Arc<Mutex<PeerAddressBook>> = Arc::new(Mutex::new(HashMap::new()));
@@ -76,15 +89,17 @@ impl RaftTcpServer {
         let listener_handle = {
             let registry = Arc::clone(&registry);
             let peers = Arc::clone(&peers);
+            let secret = secret.clone();
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                run_listener(registry, peers, listener, &mut shutdown_rx).await;
+                run_listener(registry, peers, listener, secret, &mut shutdown_rx).await;
             })
         };
 
         Ok(Self {
             registry,
             peers,
+            secret,
             listener_handle,
             shutdown_tx,
             local_addr,
@@ -123,8 +138,11 @@ impl RaftTcpServer {
                 request: req,
             };
             let registry = Arc::clone(&self.registry);
+            let secret = self.secret.clone();
             tokio::spawn(async move {
-                if let Err(err) = send_and_apply_response(addr, &msg, &registry, group).await {
+                if let Err(err) =
+                    send_and_apply_response(addr, &msg, &registry, group, &secret).await
+                {
                     trace!(target = target_id, addr = %addr, error = %err, "raft tcp send failed");
                 }
             });
@@ -142,6 +160,7 @@ async fn run_listener(
     registry: Arc<MultiRaftRegistry>,
     _peers: Arc<Mutex<PeerAddressBook>>,
     listener: TcpListener,
+    secret: RaftSharedSecret,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     loop {
@@ -154,8 +173,9 @@ async fn run_listener(
             accept = listener.accept() => match accept {
                 Ok((mut stream, peer)) => {
                     let registry = Arc::clone(&registry);
+                    let secret = secret.clone();
                     tokio::spawn(async move {
-                        match read_frame(&mut stream).await {
+                        match read_frame(&mut stream, &secret).await {
                             Ok(Some(RaftWireMessage::AppendEntries { group, request })) => {
                                 match registry.handle_append_entries(
                                     MultiRaftGroupId::new(group),
@@ -166,7 +186,7 @@ async fn run_listener(
                                             group,
                                             response,
                                         };
-                                        if let Err(err) = write_frame(&mut stream, &reply).await {
+                                        if let Err(err) = write_frame(&mut stream, &reply, &secret).await {
                                             debug!(error = %err, "raft reply write failed");
                                         }
                                     }
@@ -198,15 +218,16 @@ async fn send_and_apply_response(
     msg: &RaftWireMessage,
     registry: &Arc<MultiRaftRegistry>,
     group: MultiRaftGroupId,
+    secret: &RaftSharedSecret,
 ) -> io::Result<()> {
     let mut stream = time::timeout(Duration::from_millis(500), TcpStream::connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "raft connect timeout"))??;
-    write_frame(&mut stream, msg).await?;
+    write_frame(&mut stream, msg, secret).await?;
     stream.flush().await?;
     // Read the response back on the same connection so we can apply it
     // locally without setting up a separate inbound path.
-    match read_frame(&mut stream).await? {
+    match read_frame(&mut stream, secret).await? {
         Some(RaftWireMessage::AppendEntriesResponse { group: g, response }) => {
             if g == group.get() {
                 let _ = registry.handle_append_entries_response(group, &response);
@@ -217,7 +238,10 @@ async fn send_and_apply_response(
     Ok(())
 }
 
-async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<RaftWireMessage>> {
+async fn read_frame(
+    stream: &mut TcpStream,
+    secret: &RaftSharedSecret,
+) -> io::Result<Option<RaftWireMessage>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -225,20 +249,33 @@ async fn read_frame(stream: &mut TcpStream) -> io::Result<Option<RaftWireMessage
         Err(err) => return Err(err),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_RAFT_FRAME_BYTES {
+    if len == 0 || len > MAX_RAFT_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("raft frame {len} bytes exceeds MAX_RAFT_FRAME_BYTES"),
         ));
     }
-    let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload).await?;
+    let mut frame = Vec::with_capacity(4 + len as usize + 32);
+    frame.extend_from_slice(&len_buf);
+    let mut payload_and_tag = vec![0u8; len as usize + 32];
+    stream.read_exact(&mut payload_and_tag).await?;
+    frame.extend_from_slice(&payload_and_tag);
+    let payload = decode_authenticated(secret, &frame).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "raft frame authentication failed",
+        )
+    })?;
     let msg = serde_json::from_slice::<RaftWireMessage>(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("raft decode: {e}")))?;
     Ok(Some(msg))
 }
 
-async fn write_frame(stream: &mut TcpStream, msg: &RaftWireMessage) -> io::Result<()> {
+async fn write_frame(
+    stream: &mut TcpStream,
+    msg: &RaftWireMessage,
+    secret: &RaftSharedSecret,
+) -> io::Result<()> {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("raft encode: {e}")))?;
     let len = u32::try_from(payload.len())
@@ -249,8 +286,8 @@ async fn write_frame(stream: &mut TcpStream, msg: &RaftWireMessage) -> io::Resul
             format!("raft frame {len} bytes exceeds MAX_RAFT_FRAME_BYTES"),
         ));
     }
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&payload).await?;
+    let frame = encode_authenticated(secret, &payload);
+    stream.write_all(&frame).await?;
     Ok(())
 }
 
@@ -259,6 +296,10 @@ mod tests {
     use super::*;
     use crate::kv_engine::KvEngine;
     use crate::protocol::NodeId;
+
+    fn test_secret() -> RaftSharedSecret {
+        RaftSharedSecret::new(vec![0x42; MIN_RAFT_SHARED_SECRET_BYTES])
+    }
 
     async fn make_server(
         id: u64,
@@ -271,11 +312,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = Arc::new(MultiRaftRegistry::new(NodeId::new(id), tmp.path()).unwrap());
         let engine = KvEngine::new(Arc::clone(&registry));
-        let server =
-            RaftTcpServer::start(Arc::clone(&registry), SocketAddr::from(([127, 0, 0, 1], 0)))
-                .await
-                .unwrap();
+        let server = RaftTcpServer::start(
+            Arc::clone(&registry),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            test_secret(),
+        )
+        .await
+        .unwrap();
         (server, registry, engine, tmp)
+    }
+
+    #[tokio::test]
+    async fn start_rejects_short_shared_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(MultiRaftRegistry::new(NodeId::new(1), tmp.path()).unwrap());
+
+        let result = RaftTcpServer::start(
+            registry,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            RaftSharedSecret::new(vec![0x42; MIN_RAFT_SHARED_SECRET_BYTES - 1]),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("short secret must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

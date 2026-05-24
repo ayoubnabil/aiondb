@@ -414,6 +414,21 @@ async fn init_fragment_transport_server_degrades_when_bind_fails_and_fail_fast_i
     assert!(task.is_none());
 }
 
+#[tokio::test]
+async fn init_fragment_transport_server_rejects_short_auth_token_before_bind() {
+    let mut config = RuntimeConfig::default();
+    config.pgwire.listen_addr = "127.0.0.1:5432".to_owned();
+    config.distributed.inter_node_auth_token = Some("too-short".to_owned());
+
+    let engine = build_server_engine(None, &config, StorageBackend::InMemory, false)
+        .expect("build server test engine");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let task = init_fragment_transport_server(engine, &config, shutdown_rx, false).await;
+
+    assert!(task.is_none());
+}
+
 #[test]
 fn server_session_authorizer_allows_authenticated_sql_workloads() {
     let authorizer = ServerSessionAuthorizer;
@@ -860,6 +875,79 @@ async fn query_api_route_requires_basic_auth() {
 }
 
 #[tokio::test]
+async fn query_api_route_rejects_oversized_basic_auth_header() {
+    let app = observability_router(test_server_with_admin(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/db/default/query/v2")
+                .header("authorization", format!("Basic {}", "A".repeat(9 * 1024)))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"statement":"SELECT 1 AS one"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("query api response");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn query_api_route_rejects_oversized_database_name() {
+    let app = observability_router(test_server_with_admin(), None);
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:StrongPass123!")
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/db/{}/query/v2", "d".repeat(129)))
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"statement":"SELECT 1 AS one"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("query api response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn query_api_route_rejects_deep_parameter_json() {
+    let app = observability_router(test_server_with_admin(), None);
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:StrongPass123!")
+    );
+    let mut value = serde_json::json!(1);
+    for _ in 0..40 {
+        value = serde_json::json!([value]);
+    }
+    let payload = serde_json::json!({
+        "statement": "SELECT $value::JSONB",
+        "parameters": {"value": value}
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/db/default/query/v2")
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("query api response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn query_api_route_executes_single_statement_with_basic_auth() {
     let app = observability_router(test_server_with_admin(), None);
     let auth = format!(
@@ -982,6 +1070,33 @@ async fn query_api_tx_commit_executes_multiple_statements() {
     assert_eq!(status, StatusCode::OK, "payload: {payload}");
     assert_eq!(payload["results"][2]["type"], serde_json::json!("query"));
     assert_eq!(payload["results"][2]["values"], serde_json::json!([[7]]));
+}
+
+#[tokio::test]
+async fn query_api_tx_commit_rejects_too_many_statements() {
+    let app = observability_router(test_server_with_admin(), None);
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("admin:StrongPass123!")
+    );
+    let statements = (0..33)
+        .map(|_| serde_json::json!({"statement": "SELECT 1"}))
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({ "statements": statements });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/db/default/tx/commit")
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("query api tx response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

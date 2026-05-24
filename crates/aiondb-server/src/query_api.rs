@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -19,7 +19,19 @@ use aiondb_engine::{
 use crate::ObservabilityState;
 
 const QUERY_API_APPLICATION_NAME: &str = "aiondb-query-api";
+const QUERY_API_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const QUERY_API_MAX_STATEMENT_BYTES: usize = 1024 * 1024;
+const QUERY_API_MAX_BASIC_AUTH_BYTES: usize = 8 * 1024;
+const QUERY_API_MAX_USER_BYTES: usize = 128;
+const QUERY_API_MAX_PASSWORD_BYTES: usize = 1024;
+const QUERY_API_MAX_DATABASE_BYTES: usize = 128;
+const QUERY_API_MAX_TX_ID_BYTES: usize = 128;
+const QUERY_API_MAX_STATEMENTS_PER_REQUEST: usize = 32;
+const QUERY_API_MAX_PARAMETERS_PER_STATEMENT: usize = 128;
+const QUERY_API_MAX_PARAMETER_JSON_DEPTH: usize = 32;
+const QUERY_API_MAX_PARAMETER_JSON_NODES: usize = 4096;
+const QUERY_API_MAX_PARAMETER_STRING_BYTES: usize = 64 * 1024;
+const QUERY_API_MAX_OPEN_TRANSACTIONS: usize = 64;
 const QUERY_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -40,6 +52,7 @@ pub(crate) struct QueryApiTransactionSession {
     pub session: SessionHandle,
     pub owner_user: String,
     pub database_name: String,
+    pub last_activity: Instant,
 }
 
 pub(crate) fn routes() -> Router<Arc<ObservabilityState>> {
@@ -57,6 +70,7 @@ pub(crate) fn routes() -> Router<Arc<ObservabilityState>> {
             "/db/{database_name}/tx/{tx_id}/commit",
             post(tx_id_commit_handler),
         )
+        .layer(DefaultBodyLimit::max(QUERY_API_MAX_REQUEST_BYTES))
 }
 
 async fn discovery_handler() -> impl IntoResponse {
@@ -92,19 +106,11 @@ async fn query_v2_handler(
         Err(response) => return response,
     };
 
-    if database_name.trim().is_empty() {
-        return bad_request("database name must not be empty");
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
     }
-    if body.statement.trim().is_empty() {
-        return bad_request("statement must not be empty");
-    }
-    if body.statement.len() > QUERY_API_MAX_STATEMENT_BYTES {
-        return bad_request("statement too large");
-    }
-    if let Some(mode) = body.access_mode.as_deref() {
-        if mode != "READ" && mode != "WRITE" {
-            return bad_request("accessMode must be READ or WRITE");
-        }
+    if let Err(response) = validate_query_api_request(&body) {
+        return response;
     }
 
     let engine = Arc::clone(state.server.engine());
@@ -177,8 +183,11 @@ async fn tx_begin_handler(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if database_name.trim().is_empty() {
-        return bad_request("database name must not be empty");
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
+    }
+    if let Err(response) = validate_statement_batch(&body.statements, true) {
+        return response;
     }
 
     let engine = Arc::clone(state.server.engine());
@@ -238,14 +247,36 @@ async fn tx_begin_handler(
         }
     };
 
-    state.query_api_transactions.lock().await.insert(
-        tx_id.clone(),
-        QueryApiTransactionSession {
-            session,
-            owner_user,
-            database_name,
-        },
+    terminate_transaction_sessions(
+        engine.as_ref(),
+        evict_expired_query_api_transactions(&state, Instant::now()).await,
     );
+
+    let replaced = {
+        let mut transactions = state.query_api_transactions.lock().await;
+        if transactions.len() >= QUERY_API_MAX_OPEN_TRANSACTIONS {
+            drop(transactions);
+            let _ = engine.execute_sql(&session, "ROLLBACK");
+            let _ = engine.terminate(session);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "too many open query api transactions"})),
+            )
+                .into_response();
+        }
+        transactions.insert(
+            tx_id.clone(),
+            QueryApiTransactionSession {
+                session,
+                owner_user,
+                database_name,
+                last_activity: Instant::now(),
+            },
+        )
+    };
+    if let Some(replaced) = replaced {
+        terminate_transaction_sessions(engine.as_ref(), vec![replaced]);
+    }
 
     (
         StatusCode::OK,
@@ -267,11 +298,11 @@ async fn tx_commit_handler(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if database_name.trim().is_empty() {
-        return bad_request("database name must not be empty");
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
     }
-    if body.statements.is_empty() {
-        return bad_request("statements must not be empty");
+    if let Err(response) = validate_statement_batch(&body.statements, false) {
+        return response;
     }
     let statement_count = body.statements.len();
 
@@ -344,6 +375,15 @@ async fn tx_continue_handler(
         Ok(identity) => identity,
         Err(response) => return response,
     };
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
+    }
+    if let Err(response) = validate_tx_id(&tx_id) {
+        return response;
+    }
+    if let Err(response) = validate_statement_batch(&body.statements, true) {
+        return response;
+    }
     let session =
         match authorize_existing_transaction(&state, &database_name, &tx_id, identity).await {
             Ok(session) => session,
@@ -399,6 +439,15 @@ async fn tx_id_commit_handler(
         Ok(identity) => identity,
         Err(response) => return response,
     };
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
+    }
+    if let Err(response) = validate_tx_id(&tx_id) {
+        return response;
+    }
+    if let Err(response) = validate_statement_batch(&body.statements, true) {
+        return response;
+    }
     let session =
         match authorize_existing_transaction(&state, &database_name, &tx_id, identity).await {
             Ok(session) => session,
@@ -460,6 +509,12 @@ async fn tx_rollback_handler(
         Ok(identity) => identity,
         Err(response) => return response,
     };
+    if let Err(response) = validate_database_name(&database_name) {
+        return response;
+    }
+    if let Err(response) = validate_tx_id(&tx_id) {
+        return response;
+    }
     let session =
         match authorize_existing_transaction(&state, &database_name, &tx_id, identity).await {
             Ok(session) => session,
@@ -484,6 +539,87 @@ async fn tx_rollback_handler(
         let _ = engine.terminate(existing.session);
     }
     response
+}
+
+fn validate_database_name(database_name: &str) -> Result<(), axum::response::Response> {
+    if database_name.trim().is_empty() {
+        return Err(bad_request("database name must not be empty"));
+    }
+    if database_name.len() > QUERY_API_MAX_DATABASE_BYTES {
+        return Err(bad_request("database name too large"));
+    }
+    Ok(())
+}
+
+fn validate_tx_id(tx_id: &str) -> Result<(), axum::response::Response> {
+    if tx_id.is_empty() {
+        return Err(bad_request("transaction id must not be empty"));
+    }
+    if tx_id.len() > QUERY_API_MAX_TX_ID_BYTES {
+        return Err(bad_request("transaction id too large"));
+    }
+    Ok(())
+}
+
+fn validate_statement_batch(
+    statements: &[QueryApiRequest],
+    allow_empty: bool,
+) -> Result<(), axum::response::Response> {
+    if statements.is_empty() && !allow_empty {
+        return Err(bad_request("statements must not be empty"));
+    }
+    if statements.len() > QUERY_API_MAX_STATEMENTS_PER_REQUEST {
+        return Err(bad_request("too many statements"));
+    }
+    for statement in statements {
+        validate_query_api_request(statement)?;
+    }
+    Ok(())
+}
+
+fn validate_query_api_request(request: &QueryApiRequest) -> Result<(), axum::response::Response> {
+    if request.statement.trim().is_empty() {
+        return Err(bad_request("statement must not be empty"));
+    }
+    if request.statement.len() > QUERY_API_MAX_STATEMENT_BYTES {
+        return Err(bad_request("statement too large"));
+    }
+    if let Some(mode) = request.access_mode.as_deref() {
+        if mode != "READ" && mode != "WRITE" {
+            return Err(bad_request("accessMode must be READ or WRITE"));
+        }
+    }
+    if request.parameters.len() > QUERY_API_MAX_PARAMETERS_PER_STATEMENT {
+        return Err(bad_request("too many parameters"));
+    }
+    for value in request.parameters.values() {
+        let mut nodes = 0usize;
+        if !json_value_within_limits(value, 0, &mut nodes) {
+            return Err(bad_request("parameter value too large"));
+        }
+    }
+    Ok(())
+}
+
+fn json_value_within_limits(value: &serde_json::Value, depth: usize, nodes: &mut usize) -> bool {
+    if depth > QUERY_API_MAX_PARAMETER_JSON_DEPTH {
+        return false;
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > QUERY_API_MAX_PARAMETER_JSON_NODES {
+        return false;
+    }
+    match value {
+        serde_json::Value::String(text) => text.len() <= QUERY_API_MAX_PARAMETER_STRING_BYTES,
+        serde_json::Value::Array(values) => values
+            .iter()
+            .all(|value| json_value_within_limits(value, depth + 1, nodes)),
+        serde_json::Value::Object(object) => object.iter().all(|(key, value)| {
+            key.len() <= QUERY_API_MAX_PARAMETER_STRING_BYTES
+                && json_value_within_limits(value, depth + 1, nodes)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
 }
 
 async fn startup_query_api_session(
@@ -580,12 +716,19 @@ async fn authorize_existing_transaction(
     tx_id: &str,
     identity: QueryApiIdentity,
 ) -> Result<SessionHandle, axum::response::Response> {
+    let engine = Arc::clone(state.server.engine());
+    terminate_transaction_sessions(
+        engine.as_ref(),
+        evict_expired_query_api_transactions(state, Instant::now()).await,
+    );
+
     let tx = {
         let sessions = state.query_api_transactions.lock().await;
         sessions.get(tx_id).map(|tx| QueryApiTransactionSession {
             session: tx.session.clone(),
             owner_user: tx.owner_user.clone(),
             database_name: tx.database_name.clone(),
+            last_activity: tx.last_activity,
         })
     };
     let Some(tx) = tx else {
@@ -599,14 +742,41 @@ async fn authorize_existing_transaction(
         return Err(unauthorized());
     }
 
-    let engine = Arc::clone(state.server.engine());
     let validation_session =
         match startup_query_api_session(&engine, database_name.to_owned(), identity).await {
             Ok(session) => session,
             Err(response) => return Err(response),
         };
     let _ = engine.terminate(validation_session.0);
+    if let Some(transaction) = state.query_api_transactions.lock().await.get_mut(tx_id) {
+        transaction.last_activity = Instant::now();
+    }
     Ok(tx.session)
+}
+
+async fn evict_expired_query_api_transactions(
+    state: &Arc<ObservabilityState>,
+    now: Instant,
+) -> Vec<QueryApiTransactionSession> {
+    let mut transactions = state.query_api_transactions.lock().await;
+    let expired_ids = transactions
+        .iter()
+        .filter(|(_, tx)| now.duration_since(tx.last_activity) >= QUERY_API_TIMEOUT)
+        .map(|(tx_id, _)| tx_id.clone())
+        .collect::<Vec<_>>();
+    expired_ids
+        .into_iter()
+        .filter_map(|tx_id| transactions.remove(&tx_id))
+        .collect()
+}
+
+fn terminate_transaction_sessions(engine: &Engine, sessions: Vec<QueryApiTransactionSession>) {
+    for tx in sessions {
+        let _ = engine.execute_sql(&tx.session, "ROLLBACK");
+        if let Err(err) = engine.terminate(tx.session) {
+            warn!(%err, "failed to terminate expired query api transaction");
+        }
+    }
 }
 
 fn generate_transaction_id() -> Result<String, getrandom::Error> {
@@ -926,6 +1096,9 @@ fn parse_basic_auth(headers: &HeaderMap) -> Result<QueryApiIdentity, axum::respo
     let Some(raw_header) = headers.get(header::AUTHORIZATION) else {
         return Err(unauthorized());
     };
+    if raw_header.as_bytes().len() > QUERY_API_MAX_BASIC_AUTH_BYTES {
+        return Err(unauthorized());
+    }
     let Ok(raw_header) = raw_header.to_str() else {
         return Err(unauthorized());
     };
@@ -942,6 +1115,9 @@ fn parse_basic_auth(headers: &HeaderMap) -> Result<QueryApiIdentity, axum::respo
         return Err(unauthorized());
     };
     if user.trim().is_empty() || password.is_empty() {
+        return Err(unauthorized());
+    }
+    if user.len() > QUERY_API_MAX_USER_BYTES || password.len() > QUERY_API_MAX_PASSWORD_BYTES {
         return Err(unauthorized());
     }
     Ok(QueryApiIdentity {

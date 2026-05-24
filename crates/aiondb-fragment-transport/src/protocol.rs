@@ -33,6 +33,13 @@ pub const MIN_PROTOCOL_VERSION: u8 = 1;
 /// Maximum payload size (64 MiB) to guard against unbounded allocations.
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+/// V2-05 : tight cap applied to the first envelope on a connection,
+/// i.e. before the auth handshake has succeeded. A peer that turns
+/// out to be unauthenticated cannot force the server to stream and
+/// JSON-parse the full 64 MiB. Any envelope larger than this on an
+/// unauthenticated connection is rejected at the header check.
+pub const MAX_PRE_AUTH_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// Message type: execute a query plan fragment.
 pub const MSG_EXECUTE_FRAGMENT: u8 = 0x01;
 
@@ -340,6 +347,16 @@ pub async fn write_envelope(
 /// Returns a `DbError` on I/O failure, unknown message type, or
 /// deserialization error.
 pub async fn read_envelope(stream: &mut (impl AsyncRead + Unpin)) -> DbResult<TransportEnvelope> {
+    read_envelope_with_limit(stream, MAX_PAYLOAD_BYTES).await
+}
+
+/// Same as [`read_envelope`] but bounded by an explicit per-frame limit.
+/// Used by the framed server during the pre-auth handshake so an
+/// unauthenticated peer cannot force a 64 MiB read+parse.
+pub async fn read_envelope_with_limit(
+    stream: &mut (impl AsyncRead + Unpin),
+    max_payload_bytes: usize,
+) -> DbResult<TransportEnvelope> {
     // Read the 5-byte header: msg_type (1) + payload_len (4 LE).
     let mut header = [0u8; 5];
     stream
@@ -363,15 +380,15 @@ pub async fn read_envelope(stream: &mut (impl AsyncRead + Unpin)) -> DbResult<Tr
 
     let payload_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
-    if payload_len > MAX_PAYLOAD_BYTES {
+    if payload_len > max_payload_bytes {
         return Err(DbError::protocol(format!(
-            "payload too large: {payload_len} bytes exceeds {MAX_PAYLOAD_BYTES} limit",
+            "payload too large: {payload_len} bytes exceeds {max_payload_bytes} limit",
         )));
     }
 
     // Stream into the buffer instead of pre-allocating `payload_len` bytes so a
     // peer that sends only the 5-byte header (auth has not yet run) cannot pin
-    // up to MAX_PAYLOAD_BYTES of physical memory per connection.
+    // up to `max_payload_bytes` of physical memory per connection.
     let mut payload = Vec::with_capacity(payload_len.min(64 * 1024));
     let mut chunk = [0u8; 8192];
     while payload.len() < payload_len {
@@ -833,5 +850,44 @@ mod tests {
             .validate()
             .expect_err("oversized active set must be rejected");
         assert!(err.to_string().contains("too large"));
+    }
+
+    // -----------------------------------------------------------------
+    // V2-05 — pre-auth payload cap
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn v2_05_read_envelope_with_limit_rejects_oversized_header() {
+        // Build a header that advertises a payload one byte over the
+        // pre-auth cap. The reader must reject it at the header check
+        // without consuming any payload bytes.
+        let payload_len = MAX_PRE_AUTH_PAYLOAD_BYTES + 1;
+        let mut bytes = vec![MSG_EXECUTE_FRAGMENT];
+        bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        // No payload bytes appended on purpose : the reader must
+        // refuse before attempting to read them.
+        let mut cursor = std::io::Cursor::new(bytes);
+        let err = read_envelope_with_limit(&mut cursor, MAX_PRE_AUTH_PAYLOAD_BYTES)
+            .await
+            .expect_err("oversized pre-auth envelope must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("payload too large"),
+            "expected too-large error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_05_read_envelope_with_limit_accepts_small_envelope() {
+        // A short, well-formed cancel envelope must pass under the
+        // tight pre-auth cap so the auth handshake can complete.
+        let envelope = make_cancel_envelope();
+        let bytes = encode_envelope(&envelope).unwrap();
+        assert!(bytes.len() <= MAX_PRE_AUTH_PAYLOAD_BYTES);
+        let mut cursor = std::io::Cursor::new(bytes);
+        let decoded = read_envelope_with_limit(&mut cursor, MAX_PRE_AUTH_PAYLOAD_BYTES)
+            .await
+            .expect("small envelope must pass pre-auth cap");
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
     }
 }

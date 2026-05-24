@@ -551,11 +551,7 @@ impl GraphOptimizer {
     /// executor can still exploit the seed choice through their own pivoted
     /// walk even when `project_cbo_plan(...)` cannot rewrite the pattern into a
     /// contiguous left-to-right path.
-    pub fn cbo_seed_index(
-        &self,
-        pattern: &CypherPattern,
-        filters: &[TypedExpr],
-    ) -> Option<usize> {
+    pub fn cbo_seed_index(&self, pattern: &CypherPattern, filters: &[TypedExpr]) -> Option<usize> {
         let plan = self.cbo_plan_for_pattern(pattern, filters)?;
         cbo_leaf_seed(&plan)
     }
@@ -621,9 +617,17 @@ impl GraphOptimizer {
             return;
         }
 
-        let original_patterns = match_clause.patterns.clone();
+        // Drain the patterns into Option<> slots so we can hand them out by
+        // move during the greedy pick loop. The original code cloned the
+        // entire vector and then cloned each chosen pattern; for large
+        // multi-pattern MATCH clauses that was O(N^2) full-pattern clones.
+        let mut original_patterns: Vec<Option<CypherPattern>> =
+            std::mem::take(&mut match_clause.patterns)
+                .into_iter()
+                .map(Some)
+                .collect();
         let mut remaining: Vec<usize> = (0..original_patterns.len()).collect();
-        let mut reordered = Vec::with_capacity(original_patterns.len());
+        let mut reordered: Vec<CypherPattern> = Vec::with_capacity(original_patterns.len());
         let mut bound_variables = HashMap::new();
 
         while !remaining.is_empty() {
@@ -632,13 +636,17 @@ impl GraphOptimizer {
                 .enumerate()
                 .min_by(|(_, left), (_, right)| {
                     let cost_left = estimate_pattern_cost_with_existing_bindings(
-                        &original_patterns[**left],
+                        original_patterns[**left]
+                            .as_ref()
+                            .expect("pattern still present"),
                         &self.stats,
                         filters,
                         &bound_variables,
                     );
                     let cost_right = estimate_pattern_cost_with_existing_bindings(
-                        &original_patterns[**right],
+                        original_patterns[**right]
+                            .as_ref()
+                            .expect("pattern still present"),
                         &self.stats,
                         filters,
                         &bound_variables,
@@ -651,18 +659,22 @@ impl GraphOptimizer {
                 .expect("remaining pattern indices should not be empty");
 
             estimate_single_pattern_cost(
-                &original_patterns[best_index],
+                original_patterns[best_index]
+                    .as_ref()
+                    .expect("pattern still present"),
                 &self.stats,
                 filters,
                 &mut bound_variables,
             );
-            reordered.push(original_patterns[best_index].clone());
+            reordered.push(
+                original_patterns[best_index]
+                    .take()
+                    .expect("pattern still present"),
+            );
             remaining.remove(best_pos);
         }
 
-        if reordered != match_clause.patterns {
-            match_clause.patterns = reordered;
-        }
+        match_clause.patterns = reordered;
     }
 
     /// Within a single path pattern, consider reversing the traversal direction

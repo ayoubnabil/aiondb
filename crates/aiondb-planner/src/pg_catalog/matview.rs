@@ -102,6 +102,7 @@ mod tests {
                 ordinal_position: 1,
                 default_value: None,
             }],
+            owner: String::new(),
         }
     }
 

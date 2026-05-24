@@ -34,12 +34,15 @@ fn extract_key_ordinals(keys: &[TypedExpr]) -> DbResult<Vec<usize>> {
 /// Build a `PhysicalPlan::ProjectValues` that emits the given rows as
 /// literal values.  Each `Value` in each `Row` is wrapped in a
 /// `TypedExpr::literal` using the type information from `output_fields`.
-fn build_values_plan(rows: &[Row], output_fields: &[ResultField]) -> PhysicalPlan {
+fn build_values_plan(rows: Vec<Row>, output_fields: &[ResultField]) -> PhysicalPlan {
+    // Consume the row vector so each `Value` moves directly into its
+    // `TypedExpr::literal`; the previous &[Row] signature forced a per-cell
+    // clone for every broadcast row.
     let expr_rows: Vec<Vec<TypedExpr>> = rows
-        .iter()
+        .into_iter()
         .map(|row| {
             row.values
-                .iter()
+                .into_iter()
                 .enumerate()
                 .map(|(col_idx, value)| {
                     let field = output_fields.get(col_idx);
@@ -48,7 +51,7 @@ fn build_values_plan(rows: &[Row], output_fields: &[ResultField]) -> PhysicalPla
                         .or_else(|| value.data_type())
                         .unwrap_or(aiondb_core::DataType::Text);
                     let nullable = field.map_or(true, |f| f.nullable);
-                    TypedExpr::literal(value.clone(), data_type, nullable)
+                    TypedExpr::literal(value, data_type, nullable)
                 })
                 .collect()
         })
@@ -111,7 +114,7 @@ pub(super) fn execute_broadcast_hash_join_plan(
     // ---------------------------------------------------------------
     // 3. Build per-node join fragments.
     // ---------------------------------------------------------------
-    let values_plan = build_values_plan(&broadcast_rows, &broadcast_columns);
+    let values_plan = build_values_plan(broadcast_rows, &broadcast_columns);
     let nodes = node_count(context);
     let use_hash_partitioning = context.distributed_hash_partitioning_enabled();
 
@@ -203,7 +206,7 @@ mod tests {
     fn build_values_plan_produces_project_values_with_correct_row_count() {
         let fields = make_output_fields();
         let rows = make_broadcast_rows();
-        let plan = build_values_plan(&rows, &fields);
+        let plan = build_values_plan(rows, &fields);
 
         match plan {
             PhysicalPlan::ProjectValues {
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn build_values_plan_empty_rows() {
         let fields = make_output_fields();
-        let plan = build_values_plan(&[], &fields);
+        let plan = build_values_plan(Vec::new(), &fields);
 
         match plan {
             PhysicalPlan::ProjectValues { rows, .. } => {
@@ -287,7 +290,7 @@ mod tests {
     fn join_fragment_structure_is_hash_join_with_values_left() {
         let fields = make_output_fields();
         let rows = make_broadcast_rows();
-        let values_plan = build_values_plan(&rows, &fields);
+        let values_plan = build_values_plan(rows, &fields);
         let local_plan = PhysicalPlan::ProjectValues {
             output_fields: fields.clone(),
             rows: Vec::new(),
@@ -351,7 +354,7 @@ mod tests {
     fn fragment_targets_assigned_correctly() {
         let fields = make_output_fields();
         let rows = make_broadcast_rows();
-        let values_plan = build_values_plan(&rows, &fields);
+        let values_plan = build_values_plan(rows, &fields);
         let local_plan = PhysicalPlan::ProjectValues {
             output_fields: fields.clone(),
             rows: Vec::new(),

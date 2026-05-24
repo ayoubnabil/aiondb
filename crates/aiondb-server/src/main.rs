@@ -86,8 +86,8 @@ use serde_json::json;
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
-mod ha_runtime;
 mod bolt_compat;
+mod ha_runtime;
 mod query_api;
 mod replica_runtime;
 mod runtime_bootstrap;
@@ -127,6 +127,7 @@ const MEMORY_GUARD_TIER16_MAX_PORTALS: usize = 64;
 const MEMORY_GUARD_TIER16_MAX_PREPARED: usize = 128;
 const MEMORY_GUARD_TIER16_MAX_RECURSIVE_ROWS: usize = 500_000;
 const MEMORY_GUARD_TIER16_MAX_RECURSIVE_ITERS: usize = 5_000;
+const SERVER_MIN_INTER_NODE_AUTH_TOKEN_BYTES: usize = 32;
 const SERVER_MIN_PASSWORD_LENGTH: usize = 12;
 const SERVER_DEFAULT_MAX_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 15);
 const SERVER_DEFAULT_MAX_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60 * 4);
@@ -2058,6 +2059,10 @@ fn spawn_fragment_transport_server(
             max_connections: config.pgwire.max_connections,
             request_timeout: config.limits.statement_timeout,
             max_concurrent_executions: None, // defaults to max_connections
+            // V2-06 : dev relaxations are honoured only outside the
+            // Production profile. In Production the listener enforces
+            // ≥32-byte auth tokens and refuses the no-mTLS opt-out.
+            allow_dev_mode_relaxations: config.security.profile != SecurityProfile::Production,
         },
         engine,
     );
@@ -2094,6 +2099,22 @@ async fn init_fragment_transport_server(
         .map_or(true, |token| token.trim().is_empty())
     {
         error!("inter_node_auth_token must be configured before fragment transport can start");
+        if fail_fast {
+            std::process::exit(1);
+        }
+        log_fragment_transport_degraded_mode();
+        return None;
+    }
+    if config
+        .distributed
+        .inter_node_auth_token
+        .as_ref()
+        .is_some_and(|token| token.trim().len() < SERVER_MIN_INTER_NODE_AUTH_TOKEN_BYTES)
+    {
+        error!(
+            min_bytes = SERVER_MIN_INTER_NODE_AUTH_TOKEN_BYTES,
+            "inter_node_auth_token is too short for fragment transport"
+        );
         if fail_fast {
             std::process::exit(1);
         }

@@ -42,72 +42,203 @@ pub(super) fn is_set_returning_function(func: &ScalarFunction) -> bool {
 /// catalog statistics (the physical builder has no catalog handle).  The
 /// heuristics below are modelled after PostgreSQL's default assumptions when
 /// no `ANALYZE` data is available.
+fn estimate_access_path_rows(access_path: &ScanAccessPath) -> f64 {
+    match access_path {
+        ScanAccessPath::IndexEq { .. } => 1.0,
+        ScanAccessPath::IndexEqComposite { values, .. } => {
+            if values.len() >= 2 {
+                1.0
+            } else {
+                5.0
+            }
+        }
+        ScanAccessPath::IndexRange { .. } => 100.0,
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } => {
+            if eq_values.is_empty() {
+                100.0
+            } else {
+                10.0
+            }
+        }
+        ScanAccessPath::GinContainment { .. } => 80.0,
+        ScanAccessPath::SeqScan => 1000.0,
+        ScanAccessPath::BitmapOr { paths } => paths
+            .iter()
+            .map(estimate_access_path_rows)
+            .sum::<f64>()
+            .clamp(1.0, 1000.0),
+        ScanAccessPath::BitmapAnd { paths } => estimate_bitmap_and_rows(paths),
+        ScanAccessPath::IndexOnlyScan { inner, .. } => estimate_access_path_rows(inner),
+    }
+}
+
+fn estimate_bitmap_and_rows(paths: &[ScanAccessPath]) -> f64 {
+    if paths.is_empty() {
+        return 1.0;
+    }
+    let base_rows = 1000.0;
+    let selectivity = paths
+        .iter()
+        .map(|path| (estimate_access_path_rows(path) / base_rows).clamp(0.001, 1.0))
+        .product::<f64>();
+    (base_rows * selectivity).clamp(1.0, base_rows)
+}
+
+fn filter_is_covered_by_access_path(access_path: &ScanAccessPath, filter: &TypedExpr) -> bool {
+    match access_path {
+        ScanAccessPath::IndexEq { .. } => filter_predicate_shape(filter) == PredicateShape::Eq,
+        ScanAccessPath::IndexRange { .. } => {
+            filter_predicate_shape(filter) == PredicateShape::Range
+        }
+        ScanAccessPath::IndexEqComposite { values, .. } => {
+            let shape = predicate_shape_counts(filter);
+            shape.eq_count == values.len() && shape.range_count == 0 && shape.other_count == 0
+        }
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } => {
+            let shape = predicate_shape_counts(filter);
+            shape.eq_count == eq_values.len() && shape.range_count == 1 && shape.other_count == 0
+        }
+        ScanAccessPath::BitmapAnd { .. } => {
+            let filter_shape = predicate_shape_counts(filter);
+            access_path_predicate_shape_counts(access_path).is_some_and(|access_shape| {
+                access_shape.eq_count == filter_shape.eq_count
+                    && access_shape.range_count == filter_shape.range_count
+                    && filter_shape.other_count == 0
+            })
+        }
+        ScanAccessPath::BitmapOr { .. } => bitmap_or_filter_is_covered_by_access_path(filter),
+        ScanAccessPath::IndexOnlyScan { inner, .. } => {
+            filter_is_covered_by_access_path(inner, filter)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PredicateShape {
+    Eq,
+    Range,
+    Other,
+}
+
+#[derive(Default)]
+struct PredicateShapeCounts {
+    eq_count: usize,
+    range_count: usize,
+    other_count: usize,
+}
+
+fn predicate_shape_counts(expr: &TypedExpr) -> PredicateShapeCounts {
+    match &expr.kind {
+        TypedExprKind::LogicalAnd { left, right } => {
+            let mut left_counts = predicate_shape_counts(left);
+            let right_counts = predicate_shape_counts(right);
+            left_counts.eq_count += right_counts.eq_count;
+            left_counts.range_count += right_counts.range_count;
+            left_counts.other_count += right_counts.other_count;
+            left_counts
+        }
+        _ => {
+            let mut counts = PredicateShapeCounts::default();
+            match filter_predicate_shape(expr) {
+                PredicateShape::Eq => counts.eq_count = 1,
+                PredicateShape::Range => counts.range_count = 1,
+                PredicateShape::Other => counts.other_count = 1,
+            }
+            counts
+        }
+    }
+}
+
+fn access_path_predicate_shape_counts(
+    access_path: &ScanAccessPath,
+) -> Option<PredicateShapeCounts> {
+    let mut counts = PredicateShapeCounts::default();
+    match access_path {
+        ScanAccessPath::IndexEq { .. } => counts.eq_count = 1,
+        ScanAccessPath::IndexRange { .. } => counts.range_count = 1,
+        ScanAccessPath::IndexEqComposite { values, .. } => counts.eq_count = values.len(),
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } => {
+            counts.eq_count = eq_values.len();
+            counts.range_count = 1;
+        }
+        ScanAccessPath::BitmapAnd { paths } => {
+            for path in paths {
+                let child_counts = access_path_predicate_shape_counts(path)?;
+                counts.eq_count += child_counts.eq_count;
+                counts.range_count += child_counts.range_count;
+                counts.other_count += child_counts.other_count;
+            }
+        }
+        ScanAccessPath::IndexOnlyScan { inner, .. } => {
+            return access_path_predicate_shape_counts(inner);
+        }
+        ScanAccessPath::SeqScan
+        | ScanAccessPath::GinContainment { .. }
+        | ScanAccessPath::BitmapOr { .. } => {
+            return None;
+        }
+    }
+    Some(counts)
+}
+
+fn filter_predicate_shape(filter: &TypedExpr) -> PredicateShape {
+    match &filter.kind {
+        TypedExprKind::BinaryEq { .. } => PredicateShape::Eq,
+        TypedExprKind::BinaryGe { .. }
+        | TypedExprKind::BinaryGt { .. }
+        | TypedExprKind::BinaryLe { .. }
+        | TypedExprKind::BinaryLt { .. }
+        | TypedExprKind::Between { negated: false, .. } => PredicateShape::Range,
+        _ => PredicateShape::Other,
+    }
+}
+
+fn bitmap_or_filter_is_covered_by_access_path(filter: &TypedExpr) -> bool {
+    match &filter.kind {
+        TypedExprKind::InList { negated, .. } => !*negated,
+        TypedExprKind::LogicalOr { left, right } => {
+            bitmap_or_filter_is_covered_by_access_path(left)
+                && bitmap_or_filter_is_covered_by_access_path(right)
+        }
+        TypedExprKind::BinaryEq { .. } => true,
+        _ => false,
+    }
+}
+
+fn estimate_access_path_rows_with_filter(
+    access_path: &ScanAccessPath,
+    filter: &Option<TypedExpr>,
+) -> f64 {
+    let base = estimate_access_path_rows(access_path);
+    if filter
+        .as_ref()
+        .is_some_and(|filter| filter_is_covered_by_access_path(access_path, filter))
+    {
+        return base;
+    }
+    apply_filter_selectivity(base, filter)
+}
+
 pub fn estimate_plan_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         // ----- ProjectTable: use access_path + filter + limit -----
         PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::IndexEq { .. } | ScanAccessPath::IndexEqComposite { .. },
+            access_path,
+            filter,
+            limit,
+            offset,
+            ..
+        }
+        | PhysicalPlan::LockingProjectTable {
+            access_path,
             filter,
             limit,
             offset,
             ..
         } => {
-            // Point lookup – typically returns 1 row (unique index) or a
-            // handful for non-unique.  Use 1.0 as the base estimate.
-            let base = 1.0;
-            let filtered = apply_filter_selectivity(base, filter);
+            let filtered = estimate_access_path_rows_with_filter(access_path, filter);
             let offset_rows = apply_offset(filtered, offset);
-            apply_limit(offset_rows, limit)
-        }
-        PhysicalPlan::ProjectTable {
-            access_path:
-                ScanAccessPath::IndexRange { .. } | ScanAccessPath::IndexEqRangeComposite { .. },
-            filter,
-            limit,
-            offset,
-            ..
-        } => {
-            // Range scan returns a subset of the table. Additional filters
-            // narrow it further based on predicate shape.
-            let filtered = apply_filter_selectivity(100.0, filter);
-            let offset_rows = apply_offset(filtered, offset);
-            apply_limit(offset_rows, limit)
-        }
-        PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::GinContainment { .. },
-            filter,
-            limit,
-            offset,
-            ..
-        } => {
-            // GIN containment scans are selective but can match multiple rows.
-            let filtered = apply_filter_selectivity(80.0, filter);
-            let offset_rows = apply_offset(filtered, offset);
-            apply_limit(offset_rows, limit)
-        }
-        PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::SeqScan,
-            filter: some_filter @ Some(_),
-            limit,
-            offset,
-            ..
-        } => {
-            // Sequential scan with a WHERE clause – estimate selectivity from
-            // the predicate shape on a default 1 000-row table.
-            let filtered = apply_filter_selectivity(1000.0, some_filter);
-            let offset_rows = apply_offset(filtered, offset);
-            apply_limit(offset_rows, limit)
-        }
-        PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::SeqScan,
-            filter: None,
-            limit,
-            offset,
-            ..
-        } => {
-            // Full sequential scan, no predicate.
-            let base = 1000.0;
-            let offset_rows = apply_offset(base, offset);
             apply_limit(offset_rows, limit)
         }
         PhysicalPlan::ProjectSource {
@@ -137,11 +268,7 @@ pub fn estimate_plan_rows(plan: &PhysicalPlan) -> f64 {
             ..
         } => {
             let filtered_source = apply_filter_selectivity(estimate_plan_rows(source), filter);
-            let base = if group_by.is_empty() {
-                1.0
-            } else {
-                (filtered_source * 0.1).max(1.0)
-            };
+            let base = apply_group_reduction(filtered_source, group_by);
             let having_filtered = apply_filter_selectivity(base, having);
             let deduped = apply_distinct_reduction(having_filtered, *distinct, distinct_on);
             let offset_rows = apply_offset(deduped, offset);
@@ -158,40 +285,8 @@ pub fn estimate_plan_rows(plan: &PhysicalPlan) -> f64 {
             offset,
             ..
         } => {
-            let filtered_source = match access_path {
-                ScanAccessPath::IndexEq { .. } | ScanAccessPath::IndexEqComposite { .. } => {
-                    apply_filter_selectivity(1.0, filter)
-                }
-                ScanAccessPath::IndexRange { .. }
-                | ScanAccessPath::IndexEqRangeComposite { .. } => {
-                    apply_filter_selectivity(100.0, filter)
-                }
-                ScanAccessPath::GinContainment { .. } => apply_filter_selectivity(80.0, filter),
-                ScanAccessPath::SeqScan => apply_filter_selectivity(1000.0, filter),
-                ScanAccessPath::BitmapOr { paths } => {
-                    apply_filter_selectivity(usize_to_f64(paths.len()) * 10.0, filter)
-                }
-                ScanAccessPath::BitmapAnd { .. } => apply_filter_selectivity(1.0, filter),
-                ScanAccessPath::IndexOnlyScan { inner, .. } => {
-                    // Delegate to inner path estimate but slightly cheaper.
-                    match inner.as_ref() {
-                        ScanAccessPath::IndexEq { .. }
-                        | ScanAccessPath::IndexEqComposite { .. } => {
-                            apply_filter_selectivity(1.0, filter)
-                        }
-                        ScanAccessPath::IndexRange { .. }
-                        | ScanAccessPath::IndexEqRangeComposite { .. } => {
-                            apply_filter_selectivity(100.0, filter)
-                        }
-                        _ => apply_filter_selectivity(1000.0, filter),
-                    }
-                }
-            };
-            let base = if group_by.is_empty() {
-                1.0
-            } else {
-                (filtered_source * 0.1).max(1.0)
-            };
+            let filtered_source = estimate_access_path_rows_with_filter(access_path, filter);
+            let base = apply_group_reduction(filtered_source, group_by);
             let having_filtered = apply_filter_selectivity(base, having);
             let deduped = apply_distinct_reduction(having_filtered, *distinct, distinct_on);
             let offset_rows = apply_offset(deduped, offset);
@@ -209,12 +304,18 @@ pub fn estimate_plan_rows(plan: &PhysicalPlan) -> f64 {
             right,
             join_type,
             condition,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
             ..
         } => {
             let left_rows = estimate_plan_rows(left);
             let right_rows = estimate_plan_rows(right);
             let selectivity = estimate_join_condition_selectivity(condition.as_ref());
-            estimate_join_rows(left_rows, right_rows, selectivity, *join_type)
+            let joined = estimate_join_rows(left_rows, right_rows, selectivity, *join_type);
+            apply_plan_output_shape(joined, filter, *distinct, distinct_on, offset, limit)
         }
         // HashJoin/MergeJoin are equi-joins by construction (left_keys ↔
         // right_keys), so the join condition is `col = col` and PG's
@@ -225,38 +326,257 @@ pub fn estimate_plan_rows(plan: &PhysicalPlan) -> f64 {
             left,
             right,
             join_type,
+            condition,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
             ..
         } => {
             let left_rows = estimate_plan_rows(left);
             let right_rows = estimate_plan_rows(right);
-            estimate_join_rows(left_rows, right_rows, 0.005, *join_type)
+            let joined = estimate_join_rows(left_rows, right_rows, 0.005, *join_type);
+            let residual_filtered = apply_filter_selectivity(joined, condition);
+            apply_plan_output_shape(
+                residual_filtered,
+                filter,
+                *distinct,
+                distinct_on,
+                offset,
+                limit,
+            )
         }
         PhysicalPlan::MergeJoin {
             left,
             right,
             join_type,
+            residual,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
             ..
         } => {
             let left_rows = estimate_plan_rows(left);
             let right_rows = estimate_plan_rows(right);
-            estimate_join_rows(left_rows, right_rows, 0.005, *join_type)
+            let joined = estimate_join_rows(left_rows, right_rows, 0.005, *join_type);
+            let residual_filtered = apply_filter_selectivity(joined, residual);
+            apply_plan_output_shape(
+                residual_filtered,
+                filter,
+                *distinct,
+                distinct_on,
+                offset,
+                limit,
+            )
         }
 
         // ----- Parameterized index join: left_rows * ~1 match per lookup -----
         PhysicalPlan::NestedLoopIndexJoin {
-            left, join_type, ..
+            left,
+            join_type,
+            residual,
+            filter,
+            distinct,
+            distinct_on,
+            limit,
+            offset,
+            ..
         } => {
             let left_rows = estimate_plan_rows(left);
             // Index lookup typically returns 1 row per outer row.
-            estimate_join_rows(left_rows, 1.0, 1.0, *join_type)
+            let joined = estimate_join_rows(left_rows, 1.0, 1.0, *join_type);
+            let residual_filtered = apply_filter_selectivity(joined, residual);
+            apply_plan_output_shape(
+                residual_filtered,
+                filter,
+                *distinct,
+                distinct_on,
+                offset,
+                limit,
+            )
         }
 
         // ----- Other plan nodes -----
-        PhysicalPlan::ProjectValues { rows, .. } => usize_to_f64(rows.len().max(1)),
-        PhysicalPlan::ProjectOnce { .. } => 1.0,
+        PhysicalPlan::DistributedScan { filter, .. } => {
+            // `DistributedScan` is a physical fan-out of one logical scan, so
+            // preserve the logical scan estimate instead of multiplying by
+            // node count.
+            apply_filter_selectivity(1000.0, filter)
+        }
+        PhysicalPlan::PartialAggregate {
+            source, group_by, ..
+        } => apply_group_reduction(estimate_plan_rows(source), group_by),
+        PhysicalPlan::FinalAggregate {
+            partials,
+            group_by,
+            having,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = if group_by.is_empty() {
+                1.0
+            } else {
+                partials
+                    .iter()
+                    .map(estimate_plan_rows)
+                    .reduce(f64::max)
+                    .unwrap_or(1.0)
+                    .max(1.0)
+            };
+            let having_filtered = apply_filter_selectivity(base, having);
+            let offset_rows = apply_offset(having_filtered, offset);
+            apply_limit(offset_rows, limit)
+        }
+        PhysicalPlan::BroadcastHashJoin {
+            broadcast,
+            local,
+            join_type,
+            condition,
+            ..
+        } => {
+            let local_rows = estimate_plan_rows(local);
+            let broadcast_rows = estimate_plan_rows(broadcast);
+            let joined = estimate_join_rows(local_rows, broadcast_rows, 0.005, *join_type);
+            apply_filter_selectivity(joined, condition)
+        }
+        PhysicalPlan::HnswScan { limit, .. } => usize_to_f64((*limit).max(1)),
+        PhysicalPlan::SetOperation {
+            op,
+            all,
+            left,
+            right,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = estimate_set_operation_rows(
+                *op,
+                *all,
+                estimate_plan_rows(left),
+                estimate_plan_rows(right),
+            );
+            let offset_rows = apply_offset(base, offset);
+            apply_limit(offset_rows, limit)
+        }
+        PhysicalPlan::DistributedAppend {
+            fragments,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = fragments.iter().map(estimate_plan_rows).sum::<f64>();
+            let offset_rows = apply_offset(base, offset);
+            apply_limit(offset_rows, limit)
+        }
+        PhysicalPlan::RecursiveCte {
+            base,
+            recursive,
+            union_all,
+            ..
+        } => estimate_recursive_cte_rows(
+            estimate_plan_rows(base),
+            estimate_plan_rows(recursive),
+            *union_all,
+        ),
+        PhysicalPlan::Gather { child, .. } => estimate_plan_rows(child),
+        PhysicalPlan::ProjectValues {
+            rows,
+            limit,
+            offset,
+            ..
+        } => {
+            let base = usize_to_f64(rows.len());
+            let offset_rows = apply_offset(base, offset);
+            apply_limit(offset_rows, limit)
+        }
+        PhysicalPlan::ProjectOnce { limit, offset, .. } => {
+            let offset_rows = apply_offset(1.0, offset);
+            apply_limit(offset_rows, limit)
+        }
         PhysicalPlan::SeqScan { .. } => 1000.0,
+        PhysicalPlan::CreateTableAs {
+            with_no_data,
+            source,
+            ..
+        } => {
+            if *with_no_data {
+                0.0
+            } else {
+                estimate_plan_rows(source)
+            }
+        }
+        PhysicalPlan::InsertValues { rows, .. } => usize_to_f64(rows.len()),
+        PhysicalPlan::InsertSelect { source, .. } => estimate_plan_rows(source),
+        PhysicalPlan::DeleteFromTable { filter, .. } | PhysicalPlan::UpdateTable { filter, .. } => {
+            apply_filter_selectivity(1000.0, filter)
+        }
         _ => 1000.0,
     }
+}
+
+fn estimate_recursive_cte_rows(base_rows: f64, recursive_rows: f64, union_all: bool) -> f64 {
+    let iterations = if union_all { 10.0 } else { 5.0 };
+    (base_rows + (recursive_rows * iterations)).max(1.0)
+}
+
+fn estimate_set_operation_rows(
+    op: SetOperationType,
+    all: bool,
+    left_rows: f64,
+    right_rows: f64,
+) -> f64 {
+    match op {
+        SetOperationType::Union if all => left_rows + right_rows,
+        SetOperationType::Union => {
+            let input_rows = left_rows + right_rows;
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                (input_rows * 0.5).max(1.0)
+            }
+        }
+        SetOperationType::Intersect if all => {
+            let input_rows = left_rows.min(right_rows);
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                input_rows.max(1.0)
+            }
+        }
+        SetOperationType::Intersect => {
+            let input_rows = left_rows.min(right_rows);
+            if input_rows <= 0.0 {
+                0.0
+            } else {
+                (input_rows * 0.5).max(1.0)
+            }
+        }
+        SetOperationType::Except => {
+            if left_rows <= 0.0 {
+                0.0
+            } else {
+                (left_rows * 0.5).max(1.0)
+            }
+        }
+    }
+}
+
+fn apply_plan_output_shape(
+    base: f64,
+    filter: &Option<TypedExpr>,
+    distinct: bool,
+    distinct_on: &[TypedExpr],
+    offset: &Option<TypedExpr>,
+    limit: &Option<TypedExpr>,
+) -> f64 {
+    let filtered = apply_filter_selectivity(base, filter);
+    let deduped = apply_distinct_reduction(filtered, distinct, distinct_on);
+    let offset_rows = apply_offset(deduped, offset);
+    apply_limit(offset_rows, limit)
 }
 
 /// Estimate join output rows accounting for join type semantics.
@@ -272,16 +592,55 @@ fn estimate_join_rows(
 ) -> f64 {
     match join_type {
         JoinType::Semi => {
+            if left_rows <= 0.0 || right_rows <= 0.0 {
+                return 0.0;
+            }
             // At most left_rows; reduced by join selectivity.
             (left_rows * selectivity).clamp(1.0, left_rows)
         }
         JoinType::Anti => {
+            if left_rows <= 0.0 {
+                return 0.0;
+            }
+            if right_rows <= 0.0 {
+                return left_rows;
+            }
             // Left rows that do NOT match.
             (left_rows * (1.0 - selectivity)).max(1.0)
         }
-        _ => {
+        JoinType::Inner => {
+            if left_rows <= 0.0 || right_rows <= 0.0 {
+                return 0.0;
+            }
             // INNER / LEFT / RIGHT / FULL: cross-product × selectivity.
             (left_rows * right_rows * selectivity).max(1.0)
+        }
+        JoinType::Left => {
+            if left_rows <= 0.0 {
+                return 0.0;
+            }
+            if right_rows <= 0.0 {
+                return left_rows;
+            }
+            (left_rows * right_rows * selectivity).max(left_rows)
+        }
+        JoinType::Right => {
+            if right_rows <= 0.0 {
+                return 0.0;
+            }
+            if left_rows <= 0.0 {
+                return right_rows;
+            }
+            (left_rows * right_rows * selectivity).max(right_rows)
+        }
+        JoinType::Full => {
+            if left_rows <= 0.0 {
+                return right_rows.max(0.0);
+            }
+            if right_rows <= 0.0 {
+                return left_rows.max(0.0);
+            }
+            (left_rows * right_rows * selectivity).max(left_rows.max(right_rows))
         }
     }
 }
@@ -326,6 +685,7 @@ impl VectorTopKLayout {
 
 #[derive(Default)]
 struct VectorTopKOptionHints {
+    limit: Option<u64>,
     offset: u64,
     has_filter: bool,
     has_threshold: bool,
@@ -336,10 +696,7 @@ fn vector_top_k_option_hints(expr: &TypedExpr) -> VectorTopKOptionHints {
         return VectorTopKOptionHints::default();
     };
     match value {
-        Value::Jsonb(json) => json
-            .as_object()
-            .map(hints_from_object)
-            .unwrap_or_default(),
+        Value::Jsonb(json) => json.as_object().map(hints_from_object).unwrap_or_default(),
         Value::Text(text) => serde_json::from_str::<serde_json::Value>(text)
             .ok()
             .as_ref()
@@ -354,6 +711,11 @@ fn hints_from_object(object: &serde_json::Map<String, serde_json::Value>) -> Vec
     let mut hints = VectorTopKOptionHints::default();
     for (raw_key, raw_value) in object {
         match raw_key.to_ascii_lowercase().as_str() {
+            "limit" => {
+                hints.limit = raw_value
+                    .as_u64()
+                    .or_else(|| raw_value.as_i64().map(|limit| limit.max(0) as u64));
+            }
             "offset" => {
                 if let Some(offset) = raw_value.as_u64() {
                     hints.offset = offset;
@@ -371,10 +733,34 @@ fn hints_from_object(object: &serde_json::Map<String, serde_json::Value>) -> Vec
                     hints.has_threshold = true;
                 }
             }
+            "vector_distance_threshold" | "vector_score_threshold" | "text_score_threshold" => {
+                if !raw_value.is_null() {
+                    hints.has_threshold = true;
+                }
+            }
             _ => {}
         }
     }
     hints
+}
+
+fn estimate_top_k_rows(k: f64, hints: VectorTopKOptionHints, threshold_in_args: bool) -> f64 {
+    let base = hints.limit.map_or(k, u64_to_f64_saturating);
+    if base <= 0.0 {
+        return 0.0;
+    }
+    let _offset = hints.offset;
+    // Payload filter or explicit threshold prunes some candidates. Without
+    // catalog statistics we apply a conservative 0.5 default per hint, so
+    // the join planner sees a tighter cardinality without underestimating
+    // by more than an order of magnitude.
+    let filter_multiplier = if hints.has_filter { 0.5 } else { 1.0 };
+    let threshold_multiplier = if hints.has_threshold || threshold_in_args {
+        0.5
+    } else {
+        1.0
+    };
+    (base * filter_multiplier * threshold_multiplier).max(1.0)
 }
 
 /// Estimate the row count for a `vector_top_k_*` special function.
@@ -386,7 +772,10 @@ fn hints_from_object(object: &serde_json::Map<String, serde_json::Value>) -> Vec
 /// present. Each restrictive option scales the estimate down so downstream
 /// join planning sees a tighter cardinality.
 fn estimate_vector_top_k_rows(args: &[TypedExpr], layout: VectorTopKLayout) -> f64 {
-    let k = args.get(layout.k_idx).and_then(literal_row_count_hint).unwrap_or(10.0);
+    let k = args
+        .get(layout.k_idx)
+        .and_then(literal_row_count_hint)
+        .unwrap_or(10.0);
     let threshold_in_args = [layout.distance_threshold_idx, layout.score_threshold_idx]
         .into_iter()
         .flatten()
@@ -401,15 +790,7 @@ fn estimate_vector_top_k_rows(args: &[TypedExpr], layout: VectorTopKLayout) -> f
         .and_then(|idx| args.get(idx))
         .map(vector_top_k_option_hints)
         .unwrap_or_default();
-    let base = (k - u64_to_f64_saturating(hints.offset)).max(1.0);
-    // Payload filter or explicit threshold prunes some candidates. Without
-    // catalog statistics we apply a conservative 0.5 default per hint, so
-    // the join planner sees a tighter cardinality without underestimating
-    // by more than an order of magnitude.
-    let filter_multiplier = if hints.has_filter { 0.5 } else { 1.0 };
-    let threshold_multiplier =
-        if hints.has_threshold || threshold_in_args { 0.5 } else { 1.0 };
-    (base * filter_multiplier * threshold_multiplier).max(1.0)
+    estimate_top_k_rows(k, hints, threshold_in_args)
 }
 
 fn u64_to_f64_saturating(value: u64) -> f64 {
@@ -420,7 +801,7 @@ fn u64_to_f64_saturating(value: u64) -> f64 {
     }
 }
 
-pub(super) fn estimate_hybrid_function_rows(function_name: &str, args: &[TypedExpr]) -> f64 {
+pub(crate) fn estimate_hybrid_function_rows(function_name: &str, args: &[TypedExpr]) -> f64 {
     if function_name.eq_ignore_ascii_case("vector_top_k_ids")
         || function_name.eq_ignore_ascii_case("vector_top_k_hits")
     {
@@ -433,10 +814,23 @@ pub(super) fn estimate_hybrid_function_rows(function_name: &str, args: &[TypedEx
         return estimate_vector_top_k_rows(args, VectorTopKLayout::RECOMMEND);
     }
     if function_name.eq_ignore_ascii_case("full_text_top_k_hits") {
-        return args.get(3).and_then(literal_row_count_hint).unwrap_or(10.0);
+        let k = args.get(3).and_then(literal_row_count_hint).unwrap_or(10.0);
+        let threshold_in_args = args
+            .get(6)
+            .is_some_and(|arg| !matches!(&arg.kind, TypedExprKind::Literal(Value::Null)));
+        let hints = args
+            .get(7)
+            .map(vector_top_k_option_hints)
+            .unwrap_or_default();
+        return estimate_top_k_rows(k, hints, threshold_in_args);
     }
     if function_name.eq_ignore_ascii_case("hybrid_search_top_k_hits") {
-        return args.get(5).and_then(literal_row_count_hint).unwrap_or(10.0);
+        let k = args.get(5).and_then(literal_row_count_hint).unwrap_or(10.0);
+        let hints = args
+            .get(6)
+            .map(vector_top_k_option_hints)
+            .unwrap_or_default();
+        return estimate_top_k_rows(k, hints, false);
     }
     if function_name.eq_ignore_ascii_case("hybrid_fuse_rrf_hits") {
         return args.get(2).and_then(literal_row_count_hint).unwrap_or(10.0);
@@ -456,16 +850,31 @@ pub(super) fn estimate_hybrid_function_rows(function_name: &str, args: &[TypedEx
 }
 
 pub(super) fn graph_neighbors_limit_hint(args: &[TypedExpr]) -> Option<f64> {
-    match args.len() {
+    let positional_limit = match args.len() {
         3 => args.get(2).and_then(literal_row_count_hint),
         4 => args.get(3).and_then(literal_row_count_hint),
         _ => None,
-    }
+    };
+    positional_limit.or_else(|| {
+        args.last().and_then(|arg| {
+            vector_top_k_option_hints(arg)
+                .limit
+                .map(u64_to_f64_saturating)
+        })
+    })
 }
 
 pub(super) fn apply_filter_selectivity(base: f64, filter: &Option<TypedExpr>) -> f64 {
+    if base <= 0.0 {
+        return 0.0;
+    }
     filter.as_ref().map_or(base, |expr| {
-        (base * estimate_filter_selectivity(expr)).max(1.0)
+        let selectivity = estimate_filter_selectivity(expr);
+        if selectivity <= 0.0 {
+            0.0
+        } else {
+            (base * selectivity).max(1.0)
+        }
     })
 }
 
@@ -474,6 +883,9 @@ pub(super) fn apply_distinct_reduction(
     distinct: bool,
     distinct_on: &[TypedExpr],
 ) -> f64 {
+    if base <= 0.0 {
+        return 0.0;
+    }
     if distinct || !distinct_on.is_empty() {
         (base * 0.5).max(1.0)
     } else {
@@ -481,7 +893,18 @@ pub(super) fn apply_distinct_reduction(
     }
 }
 
-pub(super) fn estimate_filter_selectivity(expr: &TypedExpr) -> f64 {
+fn apply_group_reduction(base: f64, group_by: &[TypedExpr]) -> f64 {
+    if base <= 0.0 && !group_by.is_empty() {
+        return 0.0;
+    }
+    if group_by.is_empty() {
+        1.0
+    } else {
+        (base * 0.1).max(1.0)
+    }
+}
+
+pub(crate) fn estimate_filter_selectivity(expr: &TypedExpr) -> f64 {
     match &expr.kind {
         TypedExprKind::Literal(Value::Boolean(true)) => 1.0,
         TypedExprKind::Literal(Value::Boolean(false) | Value::Null) => 0.0,
@@ -634,7 +1057,11 @@ pub fn estimate_join_condition_selectivity(condition: Option<&TypedExpr>) -> f64
 
 pub(super) fn clamp_selectivity(selectivity: f64) -> f64 {
     if selectivity.is_finite() {
-        selectivity.clamp(0.01, 1.0)
+        if selectivity <= 0.0 {
+            0.0
+        } else {
+            selectivity.clamp(0.01, 1.0)
+        }
     } else {
         0.3
     }
@@ -642,8 +1069,8 @@ pub(super) fn clamp_selectivity(selectivity: f64) -> f64 {
 
 pub(super) fn literal_row_count_hint(expr: &TypedExpr) -> Option<f64> {
     match &expr.kind {
-        TypedExprKind::Literal(Value::Int(value)) => Some(f64::from((*value).max(1))),
-        TypedExprKind::Literal(Value::BigInt(value)) => Some(i64_to_f64((*value).max(1))),
+        TypedExprKind::Literal(Value::Int(value)) => Some(f64::from((*value).max(0))),
+        TypedExprKind::Literal(Value::BigInt(value)) => Some(i64_to_f64((*value).max(0))),
         _ => None,
     }
 }
@@ -651,8 +1078,8 @@ pub(super) fn literal_row_count_hint(expr: &TypedExpr) -> Option<f64> {
 pub(super) fn apply_offset(base: f64, offset: &Option<TypedExpr>) -> f64 {
     match offset {
         Some(expr) => match &expr.kind {
-            TypedExprKind::Literal(Value::Int(n)) => (base - f64::from((*n).max(0))).max(1.0),
-            TypedExprKind::Literal(Value::BigInt(n)) => (base - i64_to_f64((*n).max(0))).max(1.0),
+            TypedExprKind::Literal(Value::Int(n)) => (base - f64::from((*n).max(0))).max(0.0),
+            TypedExprKind::Literal(Value::BigInt(n)) => (base - i64_to_f64((*n).max(0))).max(0.0),
             _ => base,
         },
         None => base,
@@ -666,9 +1093,9 @@ pub(super) fn apply_limit(base: f64, limit: &Option<TypedExpr>) -> f64 {
     match limit {
         Some(expr) => {
             if let TypedExprKind::Literal(Value::Int(n)) = &expr.kind {
-                base.min(f64::from(*n))
+                base.min(f64::from((*n).max(0)))
             } else if let TypedExprKind::Literal(Value::BigInt(n)) = &expr.kind {
-                base.min(i64_to_f64(*n))
+                base.min(i64_to_f64((*n).max(0)))
             } else {
                 base
             }
@@ -771,48 +1198,115 @@ pub(super) fn max_column_ordinal(expr: &TypedExpr) -> Option<usize> {
 /// already-sorted output (ascending, nulls-last -- the default BTree order).
 /// Returns an empty vec when the ordering is unknown.
 pub(crate) fn plan_sorted_prefix(plan: &PhysicalPlan) -> Vec<usize> {
+    if let Some(order_by) = explicit_plan_order_by(plan) {
+        return sorted_prefix_from_order_by(order_by);
+    }
+
     match plan {
         // An index-range or index-eq scan on a BTree index produces rows
         // sorted by the index key columns.
-        PhysicalPlan::ProjectTable {
-            access_path:
-                ScanAccessPath::IndexRange { .. } | ScanAccessPath::IndexEqRangeComposite { .. },
-            ..
+        PhysicalPlan::ProjectTable { access_path, .. }
+        | PhysicalPlan::LockingProjectTable { access_path, .. } => {
+            access_path_sorted_prefix(access_path)
         }
-        | PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::IndexEq { .. },
+        PhysicalPlan::ProjectSource {
+            source,
+            outputs,
+            distinct,
+            distinct_on,
             ..
+        } => project_source_sorted_prefix(source, outputs, *distinct, distinct_on),
+        PhysicalPlan::Gather {
+            child,
+            preserve_order: true,
+            ..
+        } => plan_sorted_prefix(child),
+        _ => Vec::new(),
+    }
+}
+
+fn explicit_plan_order_by(plan: &PhysicalPlan) -> Option<&[SortExpr]> {
+    match plan {
+        PhysicalPlan::ProjectOnce { order_by, .. }
+        | PhysicalPlan::ProjectTable { order_by, .. }
+        | PhysicalPlan::LockingProjectTable { order_by, .. }
+        | PhysicalPlan::ProjectSource { order_by, .. }
+        | PhysicalPlan::NestedLoopJoin { order_by, .. }
+        | PhysicalPlan::NestedLoopIndexJoin { order_by, .. }
+        | PhysicalPlan::HashJoin { order_by, .. }
+        | PhysicalPlan::MergeJoin { order_by, .. }
+        | PhysicalPlan::Aggregate { order_by, .. }
+        | PhysicalPlan::AggregateSource { order_by, .. }
+        | PhysicalPlan::SetOperation { order_by, .. }
+        | PhysicalPlan::DistributedAppend { order_by, .. }
+        | PhysicalPlan::ProjectValues { order_by, .. }
+        | PhysicalPlan::FinalAggregate { order_by, .. }
+            if !order_by.is_empty() =>
+        {
+            Some(order_by)
         }
-        | PhysicalPlan::ProjectTable {
-            access_path: ScanAccessPath::IndexEqComposite { .. },
-            ..
-        } => {
+        _ => None,
+    }
+}
+
+fn sorted_prefix_from_order_by(order_by: &[SortExpr]) -> Vec<usize> {
+    let mut cols = Vec::new();
+    for sort in order_by {
+        if sort.descending {
+            break;
+        }
+        if let Some((_, ordinal)) = sort.expr.kind.as_column_ref() {
+            cols.push(ordinal);
+        } else {
+            break;
+        }
+    }
+    cols
+}
+
+fn access_path_sorted_prefix(access_path: &ScanAccessPath) -> Vec<usize> {
+    match access_path {
+        ScanAccessPath::IndexRange { .. }
+        | ScanAccessPath::IndexEqRangeComposite { .. }
+        | ScanAccessPath::IndexEq { .. }
+        | ScanAccessPath::IndexEqComposite { .. } => {
             // For the common single-column BTree index case, column 0 is
             // sorted.  A more sophisticated version would inspect the
             // catalog to derive the full key column list.
             vec![0]
         }
-        // An ORDER BY clause guarantees output order.  Extract leading
-        // simple column-ref ordinals (ascending only, since merge join
-        // assumes ASC order on both sides).
-        PhysicalPlan::ProjectTable { order_by, .. }
-        | PhysicalPlan::ProjectSource { order_by, .. }
-        | PhysicalPlan::ProjectOnce { order_by, .. } => {
-            let mut cols = Vec::new();
-            for sort in order_by {
-                if sort.descending {
-                    break;
-                }
-                if let Some((_, ordinal)) = sort.expr.kind.as_column_ref() {
-                    cols.push(ordinal);
-                } else {
-                    break;
-                }
-            }
-            cols
-        }
+        ScanAccessPath::IndexOnlyScan { inner, .. } => access_path_sorted_prefix(inner),
         _ => Vec::new(),
     }
+}
+
+fn project_source_sorted_prefix(
+    source: &PhysicalPlan,
+    outputs: &[ProjectionExpr],
+    distinct: bool,
+    distinct_on: &[TypedExpr],
+) -> Vec<usize> {
+    if distinct || !distinct_on.is_empty() {
+        return Vec::new();
+    }
+    let child_sorted = plan_sorted_prefix(source);
+    if outputs.is_empty() {
+        return child_sorted;
+    }
+    let mut parent_sorted = Vec::new();
+    for child_ordinal in child_sorted {
+        match outputs.iter().position(|output| {
+            output
+                .expr
+                .kind
+                .as_column_ref()
+                .is_some_and(|(_, ordinal)| ordinal == child_ordinal)
+        }) {
+            Some(parent_ordinal) => parent_sorted.push(parent_ordinal),
+            None => break,
+        }
+    }
+    parent_sorted
 }
 
 /// Returns `true` when both physical plans produce output sorted on
@@ -827,10 +1321,12 @@ pub(super) fn inputs_sorted_on_keys(
     if left_keys.is_empty() {
         return false;
     }
-    let left_sorted = plan_sorted_prefix(left);
-    let right_sorted = plan_sorted_prefix(right);
-    sorted_prefix_matches_keys(&left_sorted, left_keys)
-        && sorted_prefix_matches_keys(&right_sorted, right_keys)
+    plan_sorted_on_keys(left, left_keys) && plan_sorted_on_keys(right, right_keys)
+}
+
+pub(crate) fn plan_sorted_on_keys(plan: &PhysicalPlan, keys: &[usize]) -> bool {
+    let sorted_prefix = plan_sorted_prefix(plan);
+    sorted_prefix_matches_keys(&sorted_prefix, keys)
 }
 
 pub(super) fn sorted_prefix_matches_keys(sorted_prefix: &[usize], keys: &[usize]) -> bool {

@@ -243,7 +243,7 @@ pub(super) fn compute_window_values_for_partition(
                     let result = if running_count == 0 {
                         Value::Null
                     } else {
-                        let s = value_to_double(&running_sum.clone().unwrap_or(Value::Null))?;
+                        let s = value_to_double(running_sum.as_ref().unwrap_or(&Value::Null))?;
                         Value::Double(s / i64_to_f64(running_count))
                     };
                     assign_value_to_rows(context, values, &sorted_indices[*start..*end], result)?;

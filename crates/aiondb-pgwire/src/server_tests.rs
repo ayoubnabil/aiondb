@@ -238,11 +238,17 @@ fn generate_cancel_secret_fail_on_weak_rng_returns_error() {
 }
 
 #[test]
-fn generate_cancel_secret_falls_back_when_weak_rng_allowed() {
+fn generate_cancel_secret_v2_08_no_fallback_even_when_weak_rng_allowed() {
+    // V2-08 regression : the predictable counter+nanos+pid+tid fallback
+    // is removed. Even with the legacy `fail_on_weak_rng=false` flag, a
+    // broken RNG must now surface as an error rather than silently
+    // emitting a forgeable cancel secret.
     super::inject_cancel_secret_rng_failure();
-    let secret = super::generate_cancel_secret(false)
-        .expect("fallback secret generation must succeed when weak RNG is allowed");
-    assert_ne!(secret, 0);
+    let err = super::generate_cancel_secret(false)
+        .expect_err("RNG failure must error regardless of fail_on_weak_rng");
+    assert!(err
+        .to_string()
+        .contains("refusing to generate a predictable cancel secret"));
 }
 
 #[test]

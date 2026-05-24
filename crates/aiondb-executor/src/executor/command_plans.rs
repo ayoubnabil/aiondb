@@ -484,19 +484,17 @@ impl Executor {
                             .get_sequence(context.txn_id, &qn)?
                             .is_none()
                         {
-                            let mut desc = identities
-                                .get(index)
-                                .and_then(|spec| spec.as_ref())
-                                .map_or_else(
-                                    || new_owned_sequence_descriptor(qn.clone(), &col.data_type),
-                                    |spec| {
-                                        new_identity_sequence_descriptor(
-                                            qn.clone(),
-                                            &col.data_type,
-                                            &spec.options,
-                                        )
-                                    },
-                                );
+                            // Use a match so we can move `qn` into the branch
+                            // that actually runs instead of cloning twice.
+                            let spec = identities.get(index).and_then(|spec| spec.as_ref());
+                            let mut desc = match spec {
+                                None => new_owned_sequence_descriptor(qn, &col.data_type),
+                                Some(spec) => new_identity_sequence_descriptor(
+                                    qn,
+                                    &col.data_type,
+                                    &spec.options,
+                                ),
+                            };
                             desc.owned_by = Some((table.table_id, col.column_id));
                             desc.owner = context.current_user_name();
                             self.catalog_writer.create_sequence(context.txn_id, desc)?;
@@ -1441,20 +1439,33 @@ impl Executor {
             } => {
                 context.check_deadline()?;
                 let resolved_name = parse_qualified_name(view_name);
+                let current_user = context
+                    .current_user_name()
+                    .map(|name| name.to_ascii_lowercase())
+                    .unwrap_or_default();
                 let existing_view = self
                     .catalog_reader
                     .get_view(context.txn_id, &resolved_name)?;
                 if let Some(existing_view) = existing_view {
-                    if let Some(current_user) = context.current_user_name() {
-                        if !current_user.is_empty()
-                            && self
-                                .catalog_reader
-                                .get_role(context.txn_id, &current_user)?
-                                .is_some()
-                            && !self.role_is_superuser(&current_user, context)?
-                        {
-                            return Err(DbError::insufficient_privilege("must be owner of view"));
-                        }
+                    // V2-04 : require the caller to be the recorded
+                    // owner OR a superuser. An empty `owner` field on
+                    // the descriptor means the view was created before
+                    // owners were tracked — treat it as "owner
+                    // unknown" and force superuser-only replacement so
+                    // legacy descriptors cannot be hijacked by any
+                    // identity not in the role catalogue.
+                    let is_super = if current_user.is_empty() {
+                        false
+                    } else {
+                        self.role_is_superuser(&current_user, context)?
+                    };
+                    let owner_matches = !existing_view.owner.is_empty()
+                        && existing_view.owner.eq_ignore_ascii_case(&current_user);
+                    if !is_super && !owner_matches {
+                        return Err(DbError::insufficient_privilege(format!(
+                            "must be owner of view \"{}\"",
+                            resolved_name.name
+                        )));
                     }
                     if !*or_replace {
                         return Err(DbError::bind_error(
@@ -1486,6 +1497,9 @@ impl Executor {
                             default_value: None,
                         })
                         .collect(),
+                    // V2-04 : record the creator so subsequent OR
+                    // REPLACE attempts can verify ownership.
+                    owner: current_user,
                 };
                 self.catalog_writer
                     .create_view(context.txn_id, descriptor)?;

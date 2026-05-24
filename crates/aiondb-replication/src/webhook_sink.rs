@@ -65,6 +65,11 @@ pub const DEFAULT_RETRY_MAX: usize = 5;
 /// Default initial retry delay; doubles per attempt up to 30s.
 pub const DEFAULT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(200);
 
+const MAX_WEBHOOK_ADDR_BYTES: usize = 512;
+const MAX_WEBHOOK_HOST_HEADER_BYTES: usize = 512;
+const MAX_WEBHOOK_PATH_BYTES: usize = 2048;
+const MAX_WEBHOOK_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Configuration for one [`WebhookSink`] worker.
 #[derive(Clone, Debug)]
 pub struct WebhookSinkConfig {
@@ -243,7 +248,13 @@ async fn deliver(
             format!("webhook batch encode: {e}"),
         )
     })?;
-    let request = build_request(config, &body);
+    if body.len() > MAX_WEBHOOK_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("webhook body exceeds {MAX_WEBHOOK_BODY_BYTES} bytes"),
+        ));
+    }
+    let request = build_request(config, &body)?;
     let mut delay = config.retry_initial_delay;
     for attempt in 0..=config.retry_max {
         metrics.batches_attempted.fetch_add(1, Ordering::Relaxed);
@@ -288,7 +299,8 @@ async fn deliver(
     Err(io::Error::other("retry budget exhausted"))
 }
 
-fn build_request(config: &WebhookSinkConfig, body: &[u8]) -> Vec<u8> {
+fn build_request(config: &WebhookSinkConfig, body: &[u8]) -> io::Result<Vec<u8>> {
+    validate_request_target(config)?;
     let host = if config.host_header.is_empty() {
         config.addr.as_str()
     } else {
@@ -304,7 +316,49 @@ fn build_request(config: &WebhookSinkConfig, body: &[u8]) -> Vec<u8> {
     req.extend_from_slice(body.len().to_string().as_bytes());
     req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     req.extend_from_slice(body);
-    req
+    Ok(req)
+}
+
+fn validate_request_target(config: &WebhookSinkConfig) -> io::Result<()> {
+    if config.addr.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "webhook addr must not be empty",
+        ));
+    }
+    validate_printable_ascii("webhook addr", &config.addr, MAX_WEBHOOK_ADDR_BYTES)?;
+    if config.path.is_empty() || !config.path.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "webhook path must start with '/'",
+        ));
+    }
+    validate_printable_ascii("webhook path", &config.path, MAX_WEBHOOK_PATH_BYTES)?;
+
+    if !config.host_header.is_empty() {
+        validate_printable_ascii(
+            "webhook Host header",
+            &config.host_header,
+            MAX_WEBHOOK_HOST_HEADER_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_printable_ascii(label: &str, value: &str, max_len: usize) -> io::Result<()> {
+    if value.len() > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} exceeds {max_len} bytes"),
+        ));
+    }
+    if value.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} contains invalid HTTP characters"),
+        ));
+    }
+    Ok(())
 }
 
 async fn send_one(addr: &str, request: &[u8]) -> io::Result<()> {
@@ -593,10 +647,32 @@ mod tests {
     fn build_request_includes_content_length_and_path() {
         let cfg = WebhookSinkConfig::new("127.0.0.1:9999", "/cdc/v1");
         let body = b"[]".to_vec();
-        let req = build_request(&cfg, &body);
+        let req = build_request(&cfg, &body).expect("valid webhook request");
         let text = std::str::from_utf8(&req).unwrap();
         assert!(text.starts_with("POST /cdc/v1 HTTP/1.1"));
         assert!(text.contains("Content-Length: 2"));
         assert!(text.ends_with("[]"));
+    }
+
+    #[test]
+    fn build_request_rejects_header_injection_in_path() {
+        let cfg = WebhookSinkConfig::new("127.0.0.1:9999", "/cdc\r\nX-Evil: 1");
+        let err = build_request(&cfg, b"[]").expect_err("CRLF path must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn build_request_rejects_header_injection_in_host() {
+        let mut cfg = WebhookSinkConfig::new("127.0.0.1:9999", "/cdc");
+        cfg.host_header = "primary\r\nX-Evil: 1".to_owned();
+        let err = build_request(&cfg, b"[]").expect_err("CRLF host must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn build_request_rejects_relative_path() {
+        let cfg = WebhookSinkConfig::new("127.0.0.1:9999", "cdc");
+        let err = build_request(&cfg, b"[]").expect_err("relative path must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

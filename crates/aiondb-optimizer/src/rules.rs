@@ -1,16 +1,31 @@
-use aiondb_catalog::{CatalogReader, IndexKind, TableDescriptor, VectorDistanceMetric};
+use crate::{
+    access_path::{
+        extract_index_lookup_value, extract_index_prefix_access_path, extract_index_range,
+        extract_small_in_list_values, extract_small_or_chain_values,
+    },
+    predicate_pushdown, Optimizer,
+};
+use aiondb_catalog::{
+    CatalogReader, IndexDescriptor, IndexKind, TableDescriptor, TableStatistics,
+    VectorDistanceMetric,
+};
 use aiondb_core::{
     bounded_hnsw_ef_search, ColumnId, DataType, DbError, DbResult, RelationId, TxnId, Value,
     VectorValue, HNSW_MAX_EF_SEARCH, VECTOR_MAX_K,
 };
 use aiondb_plan::{
-    PhysicalPlan, ProjectionExpr, ResultField, ScalarFunction, SortExpr, TypedExpr, TypedExprKind,
+    PhysicalPlan, ProjectionExpr, ResultField, ScalarFunction, ScanAccessPath, SortExpr, TypedExpr,
+    TypedExprKind,
 };
-
-use crate::{predicate_pushdown, Optimizer};
 
 const HNSW_FILTER_OVERSAMPLE_FACTOR: usize = 4;
 const HNSW_FILTER_MIN_CANDIDATES: usize = 64;
+const SELECTIVE_BITMAP_AND_SELECTIVITY: f64 = 0.02;
+const SELECTIVE_BITMAP_OR_SELECTIVITY: f64 = 0.20;
+const DEFAULT_BITMAP_AND_EQ_SELECTIVITY: f64 = 0.01;
+const DEFAULT_BITMAP_AND_RANGE_SELECTIVITY: f64 = 0.33;
+const DEFAULT_BITMAP_AND_BOUNDED_RANGE_SELECTIVITY: f64 = 0.10;
+const MAX_BITMAP_OR_LITERAL_COUNT: usize = 64;
 
 /// Map a scalar distance function used in `ORDER BY` to the index metric it
 /// requires for a valid HNSW lowering.
@@ -106,6 +121,15 @@ impl Optimizer {
         let Some(table) = self.catalog_reader.get_table_by_id(txn_id, table_id)? else {
             return Ok(None);
         };
+
+        if let Some(filter) = filter.as_ref() {
+            let stats = self.catalog_reader.get_statistics(txn_id, table_id)?;
+            if filter_has_selective_sql_lookup(filter, &table, &indexes, column_id, stats.as_ref())
+            {
+                return Ok(None);
+            }
+        }
+
         let requested_rows = k_usize.saturating_add(offset_rows);
         if requested_rows > VECTOR_MAX_K {
             return Ok(None);
@@ -165,6 +189,787 @@ impl Optimizer {
             distinct_on: Vec::new(),
         }))
     }
+}
+
+fn filter_has_selective_sql_lookup(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    indexes: &[IndexDescriptor],
+    vector_column_id: ColumnId,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if !indexes.iter().any(|index| {
+        index.kind == IndexKind::BTree
+            && !index.key_columns.is_empty()
+            && !index
+                .key_columns
+                .iter()
+                .any(|column| column.column_id == vector_column_id)
+    }) {
+        return false;
+    }
+
+    if filter_has_selective_bitmap_and(filter, table, indexes, vector_column_id, stats) {
+        return true;
+    }
+
+    indexes.iter().any(|index| {
+        if index.kind != IndexKind::BTree
+            || index.key_columns.is_empty()
+            || index
+                .key_columns
+                .iter()
+                .any(|column| column.column_id == vector_column_id)
+        {
+            return false;
+        }
+        let leading_column_id = index.key_columns[0].column_id;
+        let exact_unique_lookup = index.unique
+            && index.key_columns.iter().all(|column| {
+                extract_index_lookup_value(filter, table, column.column_id).is_some()
+            });
+        if exact_unique_lookup {
+            return true;
+        }
+        let small_in_list = filter_has_small_indexed_in_list(filter, table, leading_column_id);
+        if index.unique && index.key_columns.len() == 1 && small_in_list {
+            return true;
+        }
+        let small_or_chain = filter_has_small_indexed_or_chain(filter, table, leading_column_id);
+        if index.unique && index.key_columns.len() == 1 && small_or_chain {
+            return true;
+        }
+        if filter_has_selective_bitmap_or(filter, table, index, stats) {
+            return true;
+        }
+        if filter_has_selective_composite_prefix_bitmap_or(filter, table, index, stats) {
+            return true;
+        }
+        if filter_has_selective_composite_disjunct_bitmap_or(filter, table, index, stats) {
+            return true;
+        }
+        if filter_has_selective_composite_prefix_path(filter, table, index, stats) {
+            return true;
+        }
+        if index_leading_key_not_known_low_distinct(index, stats) {
+            if filter_has_composite_equality_prefix(filter, table, index) {
+                return true;
+            }
+            if filter_has_composite_bitmap_or(filter, table, index) {
+                return true;
+            }
+            if filter_has_composite_equality_prefix_with_bounded_range(filter, table, index) {
+                return true;
+            }
+            if filter_has_composite_equality_prefix_with_in_list(filter, table, index) {
+                return true;
+            }
+            if filter_has_composite_equality_prefix_with_or_chain(filter, table, index) {
+                return true;
+            }
+        }
+        if !column_appears_high_distinct(leading_column_id, stats) {
+            return false;
+        }
+        extract_index_lookup_value(filter, table, leading_column_id).is_some()
+            || small_in_list
+            || small_or_chain
+            || extract_index_range(filter, table, leading_column_id).is_some_and(|range| {
+                !range.is_empty()
+                    && !matches!(range.lower, std::ops::Bound::Unbounded)
+                    && !matches!(range.upper, std::ops::Bound::Unbounded)
+            })
+    })
+}
+
+fn filter_has_selective_bitmap_and(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    indexes: &[IndexDescriptor],
+    vector_column_id: ColumnId,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    struct BitmapAndCandidate {
+        index_id: aiondb_core::IndexId,
+        columns: Vec<ColumnId>,
+        selectivity: f64,
+    }
+
+    let mut candidates = Vec::new();
+    for index in indexes {
+        if index.kind != IndexKind::BTree
+            || index.key_columns.is_empty()
+            || index
+                .key_columns
+                .iter()
+                .any(|column| column.column_id == vector_column_id)
+        {
+            continue;
+        }
+        let Some(path) = extract_index_prefix_access_path(filter, table, index) else {
+            continue;
+        };
+        let Some(columns) = bitmap_and_candidate_columns(&path, index) else {
+            continue;
+        };
+        let Some(selectivity) = bitmap_and_candidate_selectivity(&path, index, stats) else {
+            continue;
+        };
+        candidates.push(BitmapAndCandidate {
+            index_id: index.index_id,
+            columns,
+            selectivity,
+        });
+    }
+
+    if candidates.len() < 2 {
+        return false;
+    }
+
+    let candidates_are_disjoint = |selected: &[usize], candidate_idx: usize| {
+        let candidate = &candidates[candidate_idx];
+        selected.iter().all(|selected_idx| {
+            let selected = &candidates[*selected_idx];
+            selected.index_id != candidate.index_id
+                && !selected
+                    .columns
+                    .iter()
+                    .any(|column| candidate.columns.contains(column))
+        })
+    };
+    let subset_selectivity = |selected: &[usize]| {
+        selected
+            .iter()
+            .map(|idx| candidates[*idx].selectivity)
+            .product::<f64>()
+            .clamp(1.0e-6, 1.0)
+    };
+
+    let mut best_selectivity: Option<f64> = None;
+    for left_idx in 0..candidates.len() {
+        for right_idx in (left_idx + 1)..candidates.len() {
+            if !candidates_are_disjoint(&[left_idx], right_idx) {
+                continue;
+            }
+            let mut selected = vec![left_idx, right_idx];
+            let mut selected_selectivity = subset_selectivity(&selected);
+
+            loop {
+                let mut best_extension: Option<(usize, f64)> = None;
+                for candidate_idx in 0..candidates.len() {
+                    if selected.contains(&candidate_idx)
+                        || !candidates_are_disjoint(&selected, candidate_idx)
+                    {
+                        continue;
+                    }
+                    let mut extended = selected.clone();
+                    extended.push(candidate_idx);
+                    let extended_selectivity = subset_selectivity(&extended);
+                    if extended_selectivity < selected_selectivity
+                        && best_extension
+                            .as_ref()
+                            .map_or(true, |(_, best)| extended_selectivity < *best)
+                    {
+                        best_extension = Some((candidate_idx, extended_selectivity));
+                    }
+                }
+                let Some((candidate_idx, extension_selectivity)) = best_extension else {
+                    break;
+                };
+                selected.push(candidate_idx);
+                selected_selectivity = extension_selectivity;
+            }
+
+            if best_selectivity.map_or(true, |best| selected_selectivity < best) {
+                best_selectivity = Some(selected_selectivity);
+            }
+        }
+    }
+
+    best_selectivity.is_some_and(|selectivity| selectivity <= SELECTIVE_BITMAP_AND_SELECTIVITY)
+}
+
+fn filter_has_selective_bitmap_or(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if index.kind != IndexKind::BTree || index.key_columns.is_empty() {
+        return false;
+    }
+    let column_id = index.key_columns[0].column_id;
+    let Some(values) = extract_small_in_list_values(filter, table, column_id)
+        .or_else(|| extract_small_or_chain_values(filter, table, column_id))
+    else {
+        return false;
+    };
+    let mut unique_values = Vec::with_capacity(values.len());
+    for value in values {
+        if !unique_values.contains(&value) {
+            unique_values.push(value);
+        }
+    }
+    if unique_values.is_empty() || unique_values.len() > MAX_BITMAP_OR_LITERAL_COUNT {
+        return false;
+    }
+
+    let Some(equality_selectivity) = column_stats_equality_selectivity(stats, column_id) else {
+        return false;
+    };
+    let mut child_selectivity = equality_selectivity;
+    for column in index.key_columns.iter().skip(1) {
+        if extract_index_lookup_value(filter, table, column.column_id).is_some() {
+            let Some(suffix_selectivity) =
+                column_stats_equality_selectivity(stats, column.column_id)
+            else {
+                return false;
+            };
+            child_selectivity *= suffix_selectivity;
+            continue;
+        }
+        if let Some(range) = extract_index_range(filter, table, column.column_id) {
+            if range.is_empty() || range.is_unbounded() {
+                return false;
+            }
+            child_selectivity *=
+                column_range_selectivity(stats, column.column_id, &range.lower, &range.upper);
+        }
+        break;
+    }
+    let combined_selectivity = (unique_values.len() as f64 * child_selectivity).clamp(0.0, 1.0);
+    combined_selectivity <= SELECTIVE_BITMAP_OR_SELECTIVITY
+}
+
+fn filter_has_selective_composite_prefix_bitmap_or(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if index.kind != IndexKind::BTree || index.key_columns.len() < 2 {
+        return false;
+    }
+
+    let mut prefix_selectivity = 1.0;
+    let mut equality_prefix_len = 0;
+    for (key_position, column) in index.key_columns.iter().enumerate() {
+        if extract_index_lookup_value(filter, table, column.column_id).is_some() {
+            let Some(selectivity) = column_stats_equality_selectivity(stats, column.column_id)
+            else {
+                return false;
+            };
+            prefix_selectivity *= selectivity;
+            equality_prefix_len += 1;
+            continue;
+        }
+
+        if equality_prefix_len == 0 {
+            return false;
+        }
+        let Some(values) = extract_small_in_list_values(filter, table, column.column_id)
+            .or_else(|| extract_small_or_chain_values(filter, table, column.column_id))
+        else {
+            return false;
+        };
+        let mut unique_values = Vec::with_capacity(values.len());
+        for value in values {
+            if !unique_values.contains(&value) {
+                unique_values.push(value);
+            }
+        }
+        if unique_values.is_empty() || unique_values.len() > MAX_BITMAP_OR_LITERAL_COUNT {
+            return false;
+        }
+
+        let Some(in_selectivity) = column_stats_equality_selectivity(stats, column.column_id)
+        else {
+            return false;
+        };
+        let mut child_selectivity = prefix_selectivity * in_selectivity;
+        for suffix in index.key_columns.iter().skip(key_position + 1) {
+            if extract_index_lookup_value(filter, table, suffix.column_id).is_some() {
+                let Some(suffix_selectivity) =
+                    column_stats_equality_selectivity(stats, suffix.column_id)
+                else {
+                    return false;
+                };
+                child_selectivity *= suffix_selectivity;
+                continue;
+            }
+            if let Some(range) = extract_index_range(filter, table, suffix.column_id) {
+                if range.is_empty() || range.is_unbounded() {
+                    return false;
+                }
+                child_selectivity *=
+                    column_range_selectivity(stats, suffix.column_id, &range.lower, &range.upper);
+            }
+            break;
+        }
+        let combined_selectivity = (unique_values.len() as f64 * child_selectivity).clamp(0.0, 1.0);
+        return combined_selectivity <= SELECTIVE_BITMAP_OR_SELECTIVITY;
+    }
+    false
+}
+
+fn filter_has_selective_composite_prefix_path(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if index.kind != IndexKind::BTree || index.key_columns.len() < 2 {
+        return false;
+    }
+    let Some(path) = extract_index_prefix_access_path(filter, table, index) else {
+        return false;
+    };
+    match &path {
+        ScanAccessPath::IndexEqComposite { values, .. } if values.len() >= 2 => {}
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } if !eq_values.is_empty() => {}
+        _ => return false,
+    }
+    bitmap_and_candidate_selectivity(&path, index, stats)
+        .is_some_and(|selectivity| selectivity <= SELECTIVE_BITMAP_AND_SELECTIVITY)
+}
+
+fn bitmap_and_candidate_columns(
+    path: &ScanAccessPath,
+    index: &IndexDescriptor,
+) -> Option<Vec<ColumnId>> {
+    let constrained_len = match path {
+        ScanAccessPath::IndexEq { .. } | ScanAccessPath::IndexRange { .. } => 1,
+        ScanAccessPath::IndexEqComposite { values, .. } => values.len(),
+        ScanAccessPath::IndexEqRangeComposite { eq_values, .. } => eq_values.len() + 1,
+        _ => return None,
+    };
+    if constrained_len == 0 || constrained_len > index.key_columns.len() {
+        return None;
+    }
+    Some(
+        index
+            .key_columns
+            .iter()
+            .take(constrained_len)
+            .map(|column| column.column_id)
+            .collect(),
+    )
+}
+
+fn bitmap_and_candidate_selectivity(
+    path: &ScanAccessPath,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> Option<f64> {
+    match path {
+        ScanAccessPath::IndexEq { value, .. } => {
+            let column = index.key_columns.first()?;
+            Some(column_equality_selectivity(
+                stats,
+                column.column_id,
+                Some(value),
+            ))
+        }
+        ScanAccessPath::IndexEqComposite { values, .. } => {
+            Some(composite_equality_selectivity(stats, index, values))
+        }
+        ScanAccessPath::IndexRange { lower, upper, .. } => {
+            let column = index.key_columns.first()?;
+            Some(column_range_selectivity(
+                stats,
+                column.column_id,
+                lower,
+                upper,
+            ))
+        }
+        ScanAccessPath::IndexEqRangeComposite {
+            eq_values,
+            lower,
+            upper,
+            ..
+        } => {
+            let range_column = index.key_columns.get(eq_values.len())?;
+            Some(
+                composite_equality_selectivity(stats, index, eq_values)
+                    * column_range_selectivity(stats, range_column.column_id, lower, upper),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn composite_equality_selectivity(
+    stats: Option<&TableStatistics>,
+    index: &IndexDescriptor,
+    values: &[Value],
+) -> f64 {
+    values
+        .iter()
+        .zip(&index.key_columns)
+        .map(|(value, column)| column_equality_selectivity(stats, column.column_id, Some(value)))
+        .product::<f64>()
+        .clamp(1.0e-6, 1.0)
+}
+
+fn column_equality_selectivity(
+    stats: Option<&TableStatistics>,
+    column_id: ColumnId,
+    value: Option<&Value>,
+) -> f64 {
+    if matches!(value, Some(Value::Null)) {
+        return 1.0;
+    }
+    stats
+        .and_then(|stats| {
+            stats
+                .column_stats
+                .iter()
+                .find(|column| column.column_id == column_id)
+        })
+        .map(|column| {
+            if column.ndistinct.is_finite() && column.ndistinct > 0.0 {
+                ((1.0 - column.null_fraction.clamp(0.0, 1.0)) / column.ndistinct).clamp(1.0e-6, 1.0)
+            } else {
+                DEFAULT_BITMAP_AND_EQ_SELECTIVITY
+            }
+        })
+        .unwrap_or(DEFAULT_BITMAP_AND_EQ_SELECTIVITY)
+}
+
+fn column_stats_equality_selectivity(
+    stats: Option<&TableStatistics>,
+    column_id: ColumnId,
+) -> Option<f64> {
+    let column = stats?
+        .column_stats
+        .iter()
+        .find(|column| column.column_id == column_id)?;
+    if !column.ndistinct.is_finite() || column.ndistinct <= 0.0 {
+        return None;
+    }
+    Some(((1.0 - column.null_fraction.clamp(0.0, 1.0)) / column.ndistinct).clamp(1.0e-6, 1.0))
+}
+
+fn range_shape_selectivity(lower: &std::ops::Bound<Value>, upper: &std::ops::Bound<Value>) -> f64 {
+    if matches!(lower, std::ops::Bound::Unbounded) || matches!(upper, std::ops::Bound::Unbounded) {
+        DEFAULT_BITMAP_AND_RANGE_SELECTIVITY
+    } else {
+        DEFAULT_BITMAP_AND_BOUNDED_RANGE_SELECTIVITY
+    }
+}
+
+fn column_range_selectivity(
+    stats: Option<&TableStatistics>,
+    column_id: ColumnId,
+    lower: &std::ops::Bound<Value>,
+    upper: &std::ops::Bound<Value>,
+) -> f64 {
+    let fallback = range_shape_selectivity(lower, upper);
+    let Some(column) = stats.and_then(|stats| {
+        stats
+            .column_stats
+            .iter()
+            .find(|column| column.column_id == column_id)
+    }) else {
+        return fallback;
+    };
+    if !column.ndistinct.is_finite() || column.ndistinct <= 0.0 {
+        return fallback;
+    }
+    let Some(span) = integer_range_span(lower, upper) else {
+        return fallback;
+    };
+    let non_null = 1.0 - column.null_fraction.clamp(0.0, 1.0);
+    ((span / column.ndistinct) * non_null).clamp(1.0e-6, fallback)
+}
+
+fn integer_range_span(
+    lower: &std::ops::Bound<Value>,
+    upper: &std::ops::Bound<Value>,
+) -> Option<f64> {
+    use std::ops::Bound;
+
+    let lower_value = match lower {
+        Bound::Included(value) => i128::from(integer_bound_value(value)?),
+        Bound::Excluded(value) => i128::from(integer_bound_value(value)?).checked_add(1)?,
+        Bound::Unbounded => return None,
+    };
+    let upper_value = match upper {
+        Bound::Included(value) => i128::from(integer_bound_value(value)?),
+        Bound::Excluded(value) => i128::from(integer_bound_value(value)?).checked_sub(1)?,
+        Bound::Unbounded => return None,
+    };
+    if upper_value < lower_value {
+        return None;
+    }
+    Some((upper_value - lower_value + 1) as f64)
+}
+
+fn integer_bound_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(i64::from(*value)),
+        Value::BigInt(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn filter_has_composite_equality_prefix(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> bool {
+    if index.key_columns.len() < 2 {
+        return false;
+    }
+    index
+        .key_columns
+        .iter()
+        .take_while(|column| extract_index_lookup_value(filter, table, column.column_id).is_some())
+        .count()
+        >= 2
+}
+
+fn filter_has_composite_bitmap_or(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> bool {
+    const MAX_OR_CHAIN_BITMAP_OR_LEN: usize = 64;
+    if index.key_columns.len() < 2 {
+        return false;
+    }
+
+    let mut disjuncts = Vec::new();
+    collect_or_disjuncts(filter, &mut disjuncts);
+    if disjuncts.len() < 2 || disjuncts.len() > MAX_OR_CHAIN_BITMAP_OR_LEN {
+        return false;
+    }
+
+    disjuncts.iter().all(|disjunct| {
+        match extract_index_prefix_access_path(disjunct, table, index) {
+            Some(ScanAccessPath::IndexEqComposite { values, .. }) => values.len() >= 2,
+            Some(ScanAccessPath::IndexEqRangeComposite { eq_values, .. }) => !eq_values.is_empty(),
+            _ => false,
+        }
+    })
+}
+
+fn filter_has_selective_composite_disjunct_bitmap_or(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    const MAX_OR_CHAIN_BITMAP_OR_LEN: usize = 64;
+    if index.kind != IndexKind::BTree || index.key_columns.len() < 2 {
+        return false;
+    }
+
+    let mut disjuncts = Vec::new();
+    collect_or_disjuncts(filter, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return false;
+    }
+
+    let mut unique_paths: Vec<ScanAccessPath> = Vec::new();
+    let mut combined_selectivity = 0.0;
+    for disjunct in disjuncts {
+        let Some(path) = extract_index_prefix_access_path(disjunct, table, index) else {
+            return false;
+        };
+        if unique_paths.contains(&path) {
+            continue;
+        }
+        if unique_paths.len() >= MAX_OR_CHAIN_BITMAP_OR_LEN {
+            return false;
+        }
+        let Some(selectivity) = strict_composite_bitmap_or_child_selectivity(&path, index, stats)
+        else {
+            return false;
+        };
+        unique_paths.push(path);
+        combined_selectivity += selectivity;
+    }
+    if unique_paths.is_empty() {
+        return false;
+    }
+
+    combined_selectivity.clamp(0.0, 1.0) <= SELECTIVE_BITMAP_OR_SELECTIVITY
+}
+
+fn strict_composite_bitmap_or_child_selectivity(
+    path: &ScanAccessPath,
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> Option<f64> {
+    match path {
+        ScanAccessPath::IndexEqComposite { values, .. } if values.len() >= 2 => {
+            strict_composite_equality_selectivity(stats, index, values)
+        }
+        ScanAccessPath::IndexEqRangeComposite {
+            eq_values,
+            lower,
+            upper,
+            ..
+        } if !eq_values.is_empty() => {
+            let range_column = index.key_columns.get(eq_values.len())?;
+            strict_composite_equality_selectivity(stats, index, eq_values).map(|selectivity| {
+                selectivity * column_range_selectivity(stats, range_column.column_id, lower, upper)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn strict_composite_equality_selectivity(
+    stats: Option<&TableStatistics>,
+    index: &IndexDescriptor,
+    values: &[Value],
+) -> Option<f64> {
+    values
+        .iter()
+        .zip(&index.key_columns)
+        .map(|(_, column)| column_stats_equality_selectivity(stats, column.column_id))
+        .try_fold(1.0, |acc, selectivity| {
+            selectivity.map(|selectivity| acc * selectivity)
+        })
+        .map(|selectivity| selectivity.clamp(1.0e-6, 1.0))
+}
+
+fn filter_has_composite_equality_prefix_with_or_chain(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> bool {
+    if index.key_columns.len() < 2 {
+        return false;
+    }
+    let mut equality_prefix_len = 0;
+    for column in &index.key_columns {
+        if extract_index_lookup_value(filter, table, column.column_id).is_some() {
+            equality_prefix_len += 1;
+            continue;
+        }
+        return equality_prefix_len > 0
+            && extract_small_or_chain_values(filter, table, column.column_id)
+                .is_some_and(|values| !values.is_empty() && values.len() <= 64);
+    }
+    false
+}
+
+fn filter_has_composite_equality_prefix_with_in_list(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> bool {
+    if index.key_columns.len() < 2 {
+        return false;
+    }
+    let mut equality_prefix_len = 0;
+    for column in &index.key_columns {
+        if extract_index_lookup_value(filter, table, column.column_id).is_some() {
+            equality_prefix_len += 1;
+            continue;
+        }
+        return equality_prefix_len > 0
+            && extract_small_in_list_values(filter, table, column.column_id)
+                .is_some_and(|values| !values.is_empty() && values.len() <= 64);
+    }
+    false
+}
+
+fn filter_has_composite_equality_prefix_with_bounded_range(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    index: &IndexDescriptor,
+) -> bool {
+    if index.key_columns.len() < 2 {
+        return false;
+    }
+    let mut equality_prefix_len = 0;
+    for column in &index.key_columns {
+        if extract_index_lookup_value(filter, table, column.column_id).is_some() {
+            equality_prefix_len += 1;
+            continue;
+        }
+        return equality_prefix_len > 0
+            && extract_index_range(filter, table, column.column_id).is_some_and(|range| {
+                !range.is_empty()
+                    && !matches!(range.lower, std::ops::Bound::Unbounded)
+                    && !matches!(range.upper, std::ops::Bound::Unbounded)
+            });
+    }
+    false
+}
+
+fn filter_has_small_indexed_in_list(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    column_id: ColumnId,
+) -> bool {
+    extract_small_in_list_values(filter, table, column_id)
+        .is_some_and(|values| !values.is_empty() && values.len() <= MAX_BITMAP_OR_LITERAL_COUNT)
+}
+
+fn filter_has_small_indexed_or_chain(
+    filter: &TypedExpr,
+    table: &TableDescriptor,
+    column_id: ColumnId,
+) -> bool {
+    extract_small_or_chain_values(filter, table, column_id)
+        .is_some_and(|values| !values.is_empty() && values.len() <= MAX_BITMAP_OR_LITERAL_COUNT)
+}
+
+fn collect_or_disjuncts<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
+    match &expr.kind {
+        TypedExprKind::LogicalOr { left, right } => {
+            collect_or_disjuncts(left, out);
+            collect_or_disjuncts(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn column_appears_high_distinct(column_id: ColumnId, stats: Option<&TableStatistics>) -> bool {
+    let Some(stats) = stats else {
+        return false;
+    };
+    if stats.row_count <= 1 {
+        return true;
+    }
+    let min_distinct = (crate::u64_to_f64(stats.row_count) * 0.5).max(1.0);
+    stats
+        .column_stats
+        .iter()
+        .find(|column| column.column_id == column_id)
+        .is_some_and(|column| column.ndistinct >= min_distinct)
+}
+
+fn index_leading_key_not_known_low_distinct(
+    index: &IndexDescriptor,
+    stats: Option<&TableStatistics>,
+) -> bool {
+    if index.unique {
+        return true;
+    }
+    let Some(stats) = stats else {
+        return true;
+    };
+    if stats.row_count <= 1 {
+        return true;
+    }
+    let Some(leading) = index.key_columns.first() else {
+        return false;
+    };
+    let Some(column) = stats
+        .column_stats
+        .iter()
+        .find(|column| column.column_id == leading.column_id)
+    else {
+        return true;
+    };
+    let min_distinct = (crate::u64_to_f64(stats.row_count) * 0.5).max(1.0);
+    column.ndistinct >= min_distinct
 }
 
 fn parse_positive_limit(limit: &TypedExpr) -> Option<usize> {
@@ -275,7 +1080,7 @@ fn try_extract_col_and_vector(
         )));
     }
 
-    Ok(Some((column.column_id, vector.values.clone())))
+    Ok(Some((column.column_id, vector.values)))
 }
 
 fn extract_vector_column_ordinal(expr: &TypedExpr) -> Option<usize> {

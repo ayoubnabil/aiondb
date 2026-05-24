@@ -367,10 +367,14 @@ pub(in crate::executor) fn compact_node_bound_value(
     labels: SharedStrings,
     column_names: SharedStrings,
 ) -> BoundValue {
+    // The `row` and `raw_row` fields hold the same single-column marker;
+    // share one Arc<Row> instead of allocating two identical Rows and
+    // cloning `id_value` an extra time.
+    let marker_row = Arc::new(Row::new(vec![id_value.clone()]));
     BoundValue::Node {
         table_id,
-        row: Arc::new(Row::new(vec![id_value.clone()])),
-        raw_row: Arc::new(Row::new(vec![id_value.clone()])),
+        row: Arc::clone(&marker_row),
+        raw_row: marker_row,
         id_value,
         tuple_id,
         labels,

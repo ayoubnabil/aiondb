@@ -190,7 +190,7 @@ pub fn shortest_path(
                     }
                 }
 
-                parents.entry(next_node_key).or_insert(ParentLink {
+                parents.entry(next_node_key).or_insert_with(|| ParentLink {
                     parent_key: current_key,
                     parent_value: current_val.clone(),
                     edge_row: edge.row.clone(),

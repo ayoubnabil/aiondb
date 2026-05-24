@@ -550,8 +550,9 @@ impl Executor {
 
             last_value = match result {
                 ExecutionResult::Query { rows, .. } => rows
-                    .first()
-                    .and_then(|row| row.values.first().cloned())
+                    .into_iter()
+                    .next()
+                    .and_then(|row| row.values.into_iter().next())
                     .unwrap_or(Value::Null),
                 ExecutionResult::Command { .. }
                 | ExecutionResult::CopyIn { .. }

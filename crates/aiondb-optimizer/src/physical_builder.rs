@@ -9,7 +9,10 @@ use aiondb_plan::{
 #[path = "physical_builder_costing_and_keys.rs"]
 mod physical_builder_costing_and_keys;
 
+pub(crate) use self::physical_builder_costing_and_keys::estimate_filter_selectivity;
+pub(crate) use self::physical_builder_costing_and_keys::estimate_hybrid_function_rows;
 pub(crate) use self::physical_builder_costing_and_keys::exposed_plan_width;
+pub(crate) use self::physical_builder_costing_and_keys::plan_sorted_on_keys;
 pub(crate) use self::physical_builder_costing_and_keys::plan_sorted_prefix;
 pub use self::physical_builder_costing_and_keys::{
     estimate_join_condition_selectivity, estimate_plan_rows, is_const_expr,
@@ -263,7 +266,7 @@ pub(crate) enum ExposedJoinSwapPolicy {
 }
 
 impl ExposedJoinSwapPolicy {
-    fn allows_empty_outputs(self) -> bool {
+    pub(crate) fn allows_empty_outputs(self) -> bool {
         !matches!(self, Self::Disallow)
     }
 
@@ -1432,13 +1435,9 @@ pub(crate) fn maybe_swap_join_inputs_for_cost(
         equi_keys
             .as_ref()
             .map_or((false, false), |(left_keys, right_keys)| {
-                let left_prefix: std::collections::HashSet<usize> =
-                    plan_sorted_prefix(&phys_left).into_iter().collect();
-                let right_prefix: std::collections::HashSet<usize> =
-                    plan_sorted_prefix(&phys_right).into_iter().collect();
                 (
-                    left_keys.iter().all(|key| left_prefix.contains(key)),
-                    right_keys.iter().all(|key| right_prefix.contains(key)),
+                    plan_sorted_on_keys(&phys_left, left_keys),
+                    plan_sorted_on_keys(&phys_right, right_keys),
                 )
             });
 

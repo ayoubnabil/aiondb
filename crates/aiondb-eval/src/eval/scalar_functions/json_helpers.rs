@@ -61,20 +61,21 @@ pub(super) fn eval_json_array(args: &[Value]) -> Value {
 
 pub(super) fn eval_json_array_subquery(args: &[Value]) -> DbResult<Value> {
     expect_args(args, 1, "__aiondb_json_array_subquery")?;
-    let values: Vec<Value> = match &args[0] {
+    // Iterate the source slice in place rather than cloning the entire array
+    // before filtering; the downstream `value_to_json` mapping only borrows.
+    let arr: Vec<serde_json::Value> = match &args[0] {
         Value::Null => Vec::new(),
-        Value::Array(values) => values.clone(),
+        Value::Array(values) => values
+            .iter()
+            .filter(|value: &&Value| !value.is_null())
+            .map(value_to_json)
+            .collect(),
         _ => {
             return Err(DbError::internal(
                 "__aiondb_json_array_subquery() expects an array argument",
             ));
         }
     };
-    let arr: Vec<serde_json::Value> = values
-        .iter()
-        .filter(|value: &&Value| !value.is_null())
-        .map(value_to_json)
-        .collect();
     Ok(Value::Jsonb(serde_json::Value::Array(arr)))
 }
 

@@ -269,8 +269,18 @@ impl PlanCost {
         Self(io_cost + cpu_cost)
     }
 
-    /// Cost of a bitmap OR scan: sum of child index scan costs (minus
-    /// their heap fetch) plus a single bitmap heap scan.
+    /// Cost of producing bitmap TIDs from one index, without heap fetches.
+    pub fn bitmap_index_probe(row_count: u64, selectivity: f64) -> Self {
+        let estimated_rows = estimated_rows(row_count, selectivity);
+        let index_io = INDEX_TRAVERSAL_PAGES * RANDOM_PAGE_COST;
+        let leaf_pages = (estimated_rows / 64.0).max(1.0);
+        let io_cost = index_io + leaf_pages * SEQ_PAGE_COST;
+        let cpu_cost = estimated_rows * CPU_INDEX_TUPLE_COST;
+        Self(io_cost + cpu_cost)
+    }
+
+    /// Cost of a bitmap OR scan: sum of child bitmap index probe costs plus
+    /// a single bitmap heap scan.
     pub fn bitmap_or(
         child_costs: &[PlanCost],
         row_count: u64,

@@ -373,7 +373,7 @@ impl Executor {
                     .is_empty()
                 {
                     let constraint_name = fk.effective_name(&child_table.name.name);
-                    let detail_key = fk.referenced_columns.clone().join(", ");
+                    let detail_key = fk.referenced_columns.join(", ");
                     let detail_value = parent_old_values
                         .iter()
                         .map(|v| v.to_string())
@@ -496,7 +496,7 @@ impl Executor {
                 .is_empty()
             {
                 let constraint_name = entry.fk.effective_name(&entry.child_table.name.name);
-                let detail_key = entry.fk.referenced_columns.clone().join(", ");
+                let detail_key = entry.fk.referenced_columns.join(", ");
                 let detail_value = parent_old_values
                     .iter()
                     .map(|v| v.to_string())

@@ -472,7 +472,10 @@ impl Executor {
                 label_col_cache.push((table_id, None, false, None));
             }
         }
-        let shared_union_cols: SharedStrings = Arc::new(union_cols.clone());
+        // Move `union_cols` into the shared Arc; downstream reads go through
+        // `shared_union_cols.iter()` / `.len()` so cloning the underlying
+        // Vec<String> just to satisfy the Arc was wasted work.
+        let shared_union_cols: SharedStrings = Arc::new(union_cols);
 
         let mut output = Vec::new();
 
@@ -531,11 +534,20 @@ impl Executor {
                         }
                     }
 
-                    let mut normalised_values = Vec::with_capacity(union_cols.len());
-                    for uc in &union_cols {
+                    let mut normalised_values = Vec::with_capacity(shared_union_cols.len());
+                    // Consume `record.row.values` so each present column moves
+                    // into `normalised_values` via `mem::replace` instead of
+                    // being cloned. Each `uc` maps to a unique position in
+                    // `table_col_names`, so positions don't collide.
+                    let mut row_values = record.row.values;
+                    for uc in shared_union_cols.iter() {
                         if let Some(pos) = table_col_names.iter().position(|n| n == uc) {
-                            normalised_values
-                                .push(record.row.values.get(pos).cloned().unwrap_or(Value::Null));
+                            let val = if pos < row_values.len() {
+                                std::mem::replace(&mut row_values[pos], Value::Null)
+                            } else {
+                                Value::Null
+                            };
+                            normalised_values.push(val);
                         } else {
                             normalised_values.push(Value::Null);
                         }

@@ -540,7 +540,7 @@ fn user_function_body_is_set_returning(body: &str) -> bool {
     lower.contains("return next") || lower.contains("return query")
 }
 
-pub(crate) fn expand_srf_rows(values: &[Value], srf_indices: &[usize]) -> Vec<Row> {
+pub(crate) fn expand_srf_rows(values: Vec<Value>, srf_indices: &[usize]) -> Vec<Row> {
     let row_count = srf_indices
         .iter()
         .filter_map(|index| match values.get(*index) {
@@ -556,7 +556,15 @@ pub(crate) fn expand_srf_rows(values: &[Value], srf_indices: &[usize]) -> Vec<Ro
         }
     }
     let mut rows = Vec::with_capacity(row_count);
-    for row_index in 0..row_count {
+    if row_count == 0 {
+        return rows;
+    }
+    // All rows but the last clone from `values`; the last row consumes
+    // `values` (and any inner SRF Array via `swap_remove`) so the final
+    // pass moves instead of cloning. For non-SRF slots that means one
+    // less Value clone per column.
+    let last_index = row_count.saturating_sub(1);
+    for row_index in 0..last_index {
         let mut expanded = Vec::with_capacity(values.len());
         for (value_index, value) in values.iter().enumerate() {
             if srf_mask[value_index] {
@@ -572,6 +580,24 @@ pub(crate) fn expand_srf_rows(values: &[Value], srf_indices: &[usize]) -> Vec<Ro
         }
         rows.push(Row::new(expanded));
     }
+    let mut expanded = Vec::with_capacity(values.len());
+    for (value_index, value) in values.into_iter().enumerate() {
+        if srf_mask[value_index] {
+            match value {
+                Value::Array(mut elements) => {
+                    if last_index < elements.len() {
+                        expanded.push(elements.swap_remove(last_index));
+                    } else {
+                        expanded.push(Value::Null);
+                    }
+                }
+                other => expanded.push(other),
+            }
+        } else {
+            expanded.push(value);
+        }
+    }
+    rows.push(Row::new(expanded));
     rows
 }
 

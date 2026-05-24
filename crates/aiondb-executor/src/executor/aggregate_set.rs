@@ -596,14 +596,14 @@ fn aggregate_multi_range_literal_filter(
         if let TypedExprKind::BinaryEq { left, right } = &filter.kind {
             let l = strip_aggregate_cast_wrappers(left);
             let r = strip_aggregate_cast_wrappers(right);
-            let (ord, lit) = match (&l.kind, &r.kind) {
+            let (ord, lit_ref) = match (&l.kind, &r.kind) {
                 (TypedExprKind::ColumnRef { ordinal, .. }, TypedExprKind::Literal(v))
                 | (TypedExprKind::Literal(v), TypedExprKind::ColumnRef { ordinal, .. }) => {
-                    (*ordinal, v.clone())
+                    (*ordinal, v)
                 }
                 _ => return None,
             };
-            if matches!(lit, Value::Null) {
+            if matches!(lit_ref, Value::Null) {
                 return None;
             }
             let entry = by_col
@@ -614,8 +614,10 @@ fn aggregate_multi_range_literal_filter(
             {
                 return None;
             }
-            entry.0 = std::ops::Bound::Included(lit.clone());
-            entry.1 = std::ops::Bound::Included(lit);
+            // Same pattern as projection_plans_filters: defer the literal
+            // clones until after the Null + already-bounded early returns.
+            entry.0 = std::ops::Bound::Included(lit_ref.clone());
+            entry.1 = std::ops::Bound::Included(lit_ref.clone());
             return Some(());
         }
         let leaf = aggregate_simple_range_literal_filter(filter)?;
@@ -1811,7 +1813,15 @@ impl Executor {
                                         .map(AggAccumulator::from_template)
                                         .collect(),
                                 );
-                                groups.insert(group_key_scratch.clone(), group_idx);
+                                // Move scratch into the HashMap; the next row
+                                // starts by `clear()`ing scratch anyway, so
+                                // we just hand it a fresh same-capacity Vec.
+                                let key_capacity = group_key_scratch.capacity();
+                                let key = std::mem::replace(
+                                    &mut group_key_scratch,
+                                    Vec::with_capacity(key_capacity),
+                                );
+                                groups.insert(key, group_idx);
                                 group_idx
                             };
                             let accumulators =

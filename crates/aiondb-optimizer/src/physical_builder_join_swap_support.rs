@@ -202,6 +202,26 @@ fn plan_is_swappable_hybrid_source(plan: &PhysicalPlan) -> bool {
     }
 }
 
+fn projections_contain_outer_refs(projections: &[ProjectionExpr]) -> bool {
+    projections
+        .iter()
+        .any(|projection| typed_expr_contains_outer_refs(&projection.expr))
+}
+
+fn sort_exprs_contain_outer_refs(order_by: &[SortExpr]) -> bool {
+    order_by
+        .iter()
+        .any(|sort| typed_expr_contains_outer_refs(&sort.expr))
+}
+
+fn optional_expr_contains_outer_refs(expr: &Option<TypedExpr>) -> bool {
+    expr.as_ref().is_some_and(typed_expr_contains_outer_refs)
+}
+
+fn exprs_contain_outer_refs(exprs: &[TypedExpr]) -> bool {
+    exprs.iter().any(typed_expr_contains_outer_refs)
+}
+
 /// Check if a physical plan contains any outer column references.
 /// Plans with outer refs are part of correlated subqueries and must
 /// not have their join sides swapped.
@@ -210,21 +230,285 @@ pub(super) fn plan_has_outer_refs(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::HybridFunctionScan { args, .. } => {
             args.iter().any(typed_expr_contains_outer_refs)
         }
+        PhysicalPlan::ProjectOnce {
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        }
+        | PhysicalPlan::ProjectTable {
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        }
+        | PhysicalPlan::LockingProjectTable {
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            projections_contain_outer_refs(outputs)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
+        }
         PhysicalPlan::ProjectSource {
             source,
             outputs,
             filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
             ..
         } => {
             plan_has_outer_refs(source)
-                || outputs
-                    .iter()
-                    .any(|p| typed_expr_contains_outer_refs(&p.expr))
-                || filter.as_ref().is_some_and(typed_expr_contains_outer_refs)
+                || projections_contain_outer_refs(outputs)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
         }
-        PhysicalPlan::ProjectTable { filter, .. } => {
-            filter.as_ref().is_some_and(typed_expr_contains_outer_refs)
+        PhysicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            having,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            exprs_contain_outer_refs(group_by)
+                || projections_contain_outer_refs(aggregates)
+                || optional_expr_contains_outer_refs(having)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
         }
+        PhysicalPlan::AggregateSource {
+            source,
+            group_by,
+            aggregates,
+            having,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            plan_has_outer_refs(source)
+                || exprs_contain_outer_refs(group_by)
+                || projections_contain_outer_refs(aggregates)
+                || optional_expr_contains_outer_refs(having)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
+        }
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            condition,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        }
+        | PhysicalPlan::HashJoin {
+            left,
+            right,
+            condition,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            plan_has_outer_refs(left)
+                || plan_has_outer_refs(right)
+                || optional_expr_contains_outer_refs(condition)
+                || projections_contain_outer_refs(outputs)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
+        }
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            residual,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            plan_has_outer_refs(left)
+                || plan_has_outer_refs(right)
+                || optional_expr_contains_outer_refs(residual)
+                || projections_contain_outer_refs(outputs)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
+        }
+        PhysicalPlan::NestedLoopIndexJoin {
+            left,
+            right_filter,
+            residual,
+            outputs,
+            filter,
+            order_by,
+            limit,
+            offset,
+            distinct_on,
+            ..
+        } => {
+            plan_has_outer_refs(left)
+                || optional_expr_contains_outer_refs(right_filter)
+                || optional_expr_contains_outer_refs(residual)
+                || projections_contain_outer_refs(outputs)
+                || optional_expr_contains_outer_refs(filter)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+                || exprs_contain_outer_refs(distinct_on)
+        }
+        PhysicalPlan::SetOperation {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            plan_has_outer_refs(left)
+                || plan_has_outer_refs(right)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+        }
+        PhysicalPlan::DistributedAppend {
+            fragments,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            fragments.iter().any(plan_has_outer_refs)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+        }
+        PhysicalPlan::Gather { child, .. } => plan_has_outer_refs(child),
+        PhysicalPlan::ProjectValues {
+            rows,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            rows.iter()
+                .flatten()
+                .any(typed_expr_contains_outer_refs)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+        }
+        PhysicalPlan::CreateTableAs { source, .. } => plan_has_outer_refs(source),
+        PhysicalPlan::InsertValues {
+            rows, returning, ..
+        } => {
+            rows.iter()
+                .flatten()
+                .any(typed_expr_contains_outer_refs)
+                || projections_contain_outer_refs(returning)
+        }
+        PhysicalPlan::InsertSelect {
+            assignments,
+            source,
+            returning,
+            ..
+        } => {
+            exprs_contain_outer_refs(assignments)
+                || plan_has_outer_refs(source)
+                || projections_contain_outer_refs(returning)
+        }
+        PhysicalPlan::DeleteFromTable {
+            filter, returning, ..
+        } => optional_expr_contains_outer_refs(filter) || projections_contain_outer_refs(returning),
+        PhysicalPlan::UpdateTable {
+            filter, returning, ..
+        } => optional_expr_contains_outer_refs(filter) || projections_contain_outer_refs(returning),
+        PhysicalPlan::DistributedScan {
+            outputs, filter, ..
+        } => projections_contain_outer_refs(outputs) || optional_expr_contains_outer_refs(filter),
+        PhysicalPlan::PartialAggregate {
+            source, group_by, ..
+        } => plan_has_outer_refs(source) || exprs_contain_outer_refs(group_by),
+        PhysicalPlan::FinalAggregate {
+            partials,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            partials.iter().any(plan_has_outer_refs)
+                || exprs_contain_outer_refs(group_by)
+                || optional_expr_contains_outer_refs(having)
+                || sort_exprs_contain_outer_refs(order_by)
+                || optional_expr_contains_outer_refs(limit)
+                || optional_expr_contains_outer_refs(offset)
+        }
+        PhysicalPlan::BroadcastHashJoin {
+            broadcast,
+            local,
+            left_keys,
+            right_keys,
+            condition,
+            outputs,
+            ..
+        } => {
+            plan_has_outer_refs(broadcast)
+                || plan_has_outer_refs(local)
+                || exprs_contain_outer_refs(left_keys)
+                || exprs_contain_outer_refs(right_keys)
+                || optional_expr_contains_outer_refs(condition)
+                || projections_contain_outer_refs(outputs)
+        }
+        PhysicalPlan::RecursiveCte {
+            base, recursive, ..
+        } => plan_has_outer_refs(base) || plan_has_outer_refs(recursive),
         _ => false,
     }
 }

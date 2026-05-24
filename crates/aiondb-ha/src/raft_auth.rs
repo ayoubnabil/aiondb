@@ -6,6 +6,7 @@
 //! misrouting and gives a tamper-evident channel inside trusted
 //! networks.
 
+use std::fmt;
 use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
@@ -13,7 +14,9 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Debug)]
+pub const MIN_RAFT_SHARED_SECRET_BYTES: usize = 32;
+
+#[derive(Clone)]
 pub struct RaftSharedSecret {
     secret: Arc<Vec<u8>>,
 }
@@ -23,6 +26,18 @@ impl RaftSharedSecret {
         Self {
             secret: Arc::new(secret.into()),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.secret.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.secret.is_empty()
+    }
+
+    pub fn is_strong_enough(&self) -> bool {
+        self.len() >= MIN_RAFT_SHARED_SECRET_BYTES
     }
 
     /// Compute a 32-byte HMAC-SHA256 tag over `payload`.
@@ -40,6 +55,15 @@ impl RaftSharedSecret {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC takes any key length");
         mac.update(payload);
         mac.verify_slice(tag).is_ok()
+    }
+}
+
+impl fmt::Debug for RaftSharedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RaftSharedSecret")
+            .field("len", &self.secret.len())
+            .field("secret", &"<redacted>")
+            .finish()
     }
 }
 

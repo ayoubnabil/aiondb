@@ -603,7 +603,11 @@ fn sort_query_rows_with_spill(
 
     let mut buffer = SortBuffer::new(order_by, context)?;
     for keyed in rows.drain(..) {
-        buffer.push(keyed.row, keyed.sort_keys.as_ref().clone(), context)?;
+        // The Arc is rarely shared at spill time; `unwrap_or_clone` reuses the
+        // inner Vec when refcount == 1 and only falls back to the previous
+        // full deep-clone when another holder is still around.
+        let sort_keys = Arc::try_unwrap(keyed.sort_keys).unwrap_or_else(|arc| (*arc).clone());
+        buffer.push(keyed.row, sort_keys, context)?;
     }
     let sorted = buffer.finish(context)?;
     *rows = sorted

@@ -466,13 +466,23 @@ fn cartesian_merge_graph_bindings(
     let avg_left = lefts.first().map_or(0, |binding| binding.entries.len());
     let avg_right = rights.first().map_or(0, |binding| binding.entries.len());
     let mut out = Vec::with_capacity(lefts.len().saturating_mul(rights.len()));
+    let Some((last_right, rights_prefix)) = rights.split_last() else {
+        return out;
+    };
     for left in lefts {
-        for right in rights {
+        // Clone `left.entries` for every right but the last; on the last right
+        // we consume `left.entries` to skip one Vec<(String, Arc<_>)> clone per
+        // outer iteration.
+        for right in rights_prefix {
             let mut entries = Vec::with_capacity(avg_left.saturating_add(avg_right));
             entries.extend(left.entries.iter().cloned());
             entries.extend(right.entries.iter().cloned());
             out.push(BindingRow { entries });
         }
+        let mut entries = Vec::with_capacity(avg_left.saturating_add(avg_right));
+        entries.extend(left.entries);
+        entries.extend(last_right.entries.iter().cloned());
+        out.push(BindingRow { entries });
     }
     out
 }
@@ -505,15 +515,18 @@ fn binding_node_id_key(binding: &BindingRow, variable: &str) -> Option<ValueHash
     }
 }
 
-fn dedup_bindings_by_node_id(bindings: &[BindingRow], variable: &str) -> Vec<BindingRow> {
+fn dedup_bindings_by_node_id(bindings: Vec<BindingRow>, variable: &str) -> Vec<BindingRow> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(bindings.len());
+    // Take bindings by value so we can move each row into `out` instead of
+    // cloning it after the dedup check; the previous &[..] signature forced a
+    // BindingRow clone for every kept binding.
     for binding in bindings {
-        let Some(key) = binding_node_id_key(binding, variable) else {
+        let Some(key) = binding_node_id_key(&binding, variable) else {
             continue;
         };
         if seen.insert(key) {
-            out.push(binding.clone());
+            out.push(binding);
         }
     }
     out
@@ -905,10 +918,20 @@ impl Executor {
                     edge_marker_node(start_node_id),
                 );
                 let mut first = self.match_node(context, start_node, vec![seeded], runtime_cache)?;
-                for binding in &mut first {
+                // Move `end_node_id` into the last binding's marker rather
+                // than cloning it for every binding.
+                let mut iter = first.iter_mut();
+                let last = iter.next_back();
+                for binding in iter {
                     binding.insert_binding(
                         "__edge_next_node_id__".to_owned(),
                         edge_marker_node(end_node_id.clone()),
+                    );
+                }
+                if let Some(binding) = last {
+                    binding.insert_binding(
+                        "__edge_next_node_id__".to_owned(),
+                        edge_marker_node(end_node_id),
                     );
                 }
                 let second = self.match_node(context, end_node, first, runtime_cache)?;
@@ -1097,31 +1120,39 @@ impl Executor {
             let cache_key = build_hash_key(&current_id)
                 .ok()
                 .map(|node_key| (rel_table_id, node_key, is_outgoing));
-            let neighbor_ids = if let Some(cache_key) = cache_key.as_ref() {
-                if let Some(neighbor_ids) = runtime_cache.adjacency_neighbor_cache.get(cache_key) {
-                    Arc::clone(neighbor_ids)
-                } else {
-                    let neighbor_ids = Arc::new(self.fast_graph_adjacency_neighbors_cached(
-                        context,
-                        rel_table_id,
-                        &current_id,
-                        is_outgoing,
-                    )?);
-                    runtime_cache
-                        .adjacency_neighbor_cache
-                        .insert(cache_key.clone(), Arc::clone(&neighbor_ids));
-                    neighbor_ids
+            let neighbor_ids = match cache_key {
+                Some(key) => {
+                    if let Some(neighbor_ids) =
+                        runtime_cache.adjacency_neighbor_cache.get(&key)
+                    {
+                        Arc::clone(neighbor_ids)
+                    } else {
+                        let neighbor_ids =
+                            Arc::new(self.fast_graph_adjacency_neighbors_cached(
+                                context,
+                                rel_table_id,
+                                &current_id,
+                                is_outgoing,
+                            )?);
+                        // Move `key` into the cache instead of cloning it.
+                        runtime_cache
+                            .adjacency_neighbor_cache
+                            .insert(key, Arc::clone(&neighbor_ids));
+                        neighbor_ids
+                    }
                 }
-            } else {
-                Arc::new(self.fast_graph_adjacency_neighbors_cached(
+                None => Arc::new(self.fast_graph_adjacency_neighbors_cached(
                     context,
                     rel_table_id,
                     &current_id,
                     is_outgoing,
-                )?)
+                )?),
             };
-            for neighbor_id in neighbor_ids.iter().cloned() {
-                let Some(neighbor_key) = build_hash_key(&neighbor_id).ok() else {
+            // Defer the per-neighbor `Value` clone until after the candidate
+            // / excluded checks: rejected neighbors no longer pay an upfront
+            // clone, only the ones we actually emit do.
+            for neighbor_id in neighbor_ids.iter() {
+                let Some(neighbor_key) = build_hash_key(neighbor_id).ok() else {
                     continue;
                 };
                 if next_node_candidate_ids
@@ -1138,7 +1169,7 @@ impl Executor {
                     target_variable.to_owned(),
                     Arc::new(compact_node_bound_value(
                         RelationId::new(0),
-                        neighbor_id,
+                        neighbor_id.clone(),
                         aiondb_core::TupleId::new(0),
                         Arc::new(Vec::new()),
                         Arc::new(Vec::new()),
@@ -1280,7 +1311,7 @@ impl Executor {
                                         )?
                                     };
                                     let target_bindings =
-                                        dedup_bindings_by_node_id(&target_bindings, target_var);
+                                        dedup_bindings_by_node_id(target_bindings, target_var);
                                     context.record_graph_profile_actual_rows(
                                         &graph_access_profile_key(
                                             clause_label,
@@ -1349,14 +1380,16 @@ impl Executor {
                                         continue;
                                     }
                                     let output_before = output.len();
-                                    for target_binding in &target_bindings {
+                                    // Consume `target_bindings` so kept rows
+                                    // move into `output` instead of cloning.
+                                    for target_binding in target_bindings {
                                         let Some(target_id) =
-                                            binding_node_id_key(target_binding, target_var)
+                                            binding_node_id_key(&target_binding, target_var)
                                         else {
                                             continue;
                                         };
                                         if probe_ids.len() > 1 || !probe_ids.contains(&target_id) {
-                                            output.push(target_binding.clone());
+                                            output.push(target_binding);
                                         }
                                     }
                                     context.record_graph_profile_actual_rows(

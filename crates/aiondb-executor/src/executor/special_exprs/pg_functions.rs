@@ -41,7 +41,7 @@ impl Executor {
         // caller having any direct privilege on the view; superusers always
         // see it. Owner of the view bypasses the gate as well.
         if let Some(view_desc) = view.as_ref() {
-            let role = context.current_user_name().unwrap_or_default().clone();
+            let role = context.current_user_name().unwrap_or_default();
             if !role.is_empty()
                 && self.role_exists(&role, context)?
                 && !self.role_is_superuser(&role, context)?
@@ -111,7 +111,7 @@ impl Executor {
                 (role, function_name, privilege)
             }
             2 => {
-                let role = context.current_user_name().unwrap_or_default().clone();
+                let role = context.current_user_name().unwrap_or_default();
                 let function_name = self.resolve_function_target_arg(
                     "has_function_privilege",
                     &arg_values[0],
@@ -194,7 +194,13 @@ impl Executor {
         }
         let (role_name, role_oid_missing, table_arg, privilege_arg) = match arg_values.len() {
             3 => {
-                let (role_name, role_oid_missing) = match &arg_values[0] {
+                // Consume the arg vector so the table arg moves into the
+                // result tuple instead of being cloned via index access.
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 3");
+                let arg1 = iter.next().expect("len == 3");
+                let arg2 = iter.next().expect("len == 3");
+                let (role_name, role_oid_missing) = match &arg0 {
                     Value::Text(text) => (text.trim_matches('"').to_owned(), false),
                     Value::Int(oid) => match role_name_from_oid(*oid) {
                         Some(name) => (name, false),
@@ -220,20 +226,21 @@ impl Executor {
                     }
                 };
                 let privilege_arg =
-                    self.privilege_name_from_arg("has_table_privilege", &arg_values[2])?;
+                    self.privilege_name_from_arg("has_table_privilege", &arg2)?;
+                (role_name, role_oid_missing, arg1, privilege_arg)
+            }
+            2 => {
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 2");
+                let arg1 = iter.next().expect("len == 2");
+                let privilege_arg = self.privilege_name_from_arg("has_table_privilege", &arg1)?;
                 (
-                    role_name,
-                    role_oid_missing,
-                    arg_values[1].clone(),
+                    context.current_user_name().unwrap_or_default(),
+                    false,
+                    arg0,
                     privilege_arg,
                 )
             }
-            2 => (
-                context.current_user_name().unwrap_or_default().clone(),
-                false,
-                arg_values[0].clone(),
-                self.privilege_name_from_arg("has_table_privilege", &arg_values[1])?,
-            ),
             _ => {
                 return Err(DbError::bind_error(
                     aiondb_core::SqlState::InvalidParameterValue,
@@ -466,22 +473,21 @@ impl Executor {
         }
         let (role_name, table_arg, column_arg, privilege_arg) = match arg_values.len() {
             4 => {
-                let role = self.role_name_from_priv_arg("has_column_privilege", &arg_values[0])?;
-                (
-                    role,
-                    arg_values[1].clone(),
-                    arg_values[2].clone(),
-                    arg_values[3].clone(),
-                )
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 4");
+                let arg1 = iter.next().expect("len == 4");
+                let arg2 = iter.next().expect("len == 4");
+                let arg3 = iter.next().expect("len == 4");
+                let role = self.role_name_from_priv_arg("has_column_privilege", &arg0)?;
+                (role, arg1, arg2, arg3)
             }
             3 => {
                 let role = context.current_user_name().unwrap_or_default();
-                (
-                    role,
-                    arg_values[0].clone(),
-                    arg_values[1].clone(),
-                    arg_values[2].clone(),
-                )
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 3");
+                let arg1 = iter.next().expect("len == 3");
+                let arg2 = iter.next().expect("len == 3");
+                (role, arg0, arg1, arg2)
             }
             _ => {
                 return Err(DbError::bind_error(
@@ -886,14 +892,23 @@ impl Executor {
         }
         match arg_values.len() {
             3 => {
-                let role = self.role_name_from_priv_arg(function_name, &arg_values[0])?;
-                let priv_name = self.privilege_name_from_arg(function_name, &arg_values[2])?;
-                Ok(Some((role, arg_values[1].clone(), priv_name)))
+                // Consume the args vector so the middle Value moves into the
+                // result instead of being cloned via index access.
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 3");
+                let arg1 = iter.next().expect("len == 3");
+                let arg2 = iter.next().expect("len == 3");
+                let role = self.role_name_from_priv_arg(function_name, &arg0)?;
+                let priv_name = self.privilege_name_from_arg(function_name, &arg2)?;
+                Ok(Some((role, arg1, priv_name)))
             }
             2 => {
-                let role = context.current_user_name().unwrap_or_default().clone();
-                let priv_name = self.privilege_name_from_arg(function_name, &arg_values[1])?;
-                Ok(Some((role, arg_values[0].clone(), priv_name)))
+                let role = context.current_user_name().unwrap_or_default();
+                let mut iter = arg_values.into_iter();
+                let arg0 = iter.next().expect("len == 2");
+                let arg1 = iter.next().expect("len == 2");
+                let priv_name = self.privilege_name_from_arg(function_name, &arg1)?;
+                Ok(Some((role, arg0, priv_name)))
             }
             _ => Err(DbError::bind_error(
                 aiondb_core::SqlState::InvalidParameterValue,
@@ -1214,7 +1229,9 @@ impl Executor {
             if !seen.insert(lower) {
                 continue;
             }
-            effective.push(name.clone());
+            // Walk parents using `&name` first, then move `name` into the
+            // effective set — skips the String clone the previous order
+            // forced on every visited role.
             for descriptor in self.catalog_reader.get_privileges(context.txn_id, &name)? {
                 if let PrivilegeTarget::Role(parent) = descriptor.target {
                     let parent_lower = parent.to_ascii_lowercase();
@@ -1223,6 +1240,7 @@ impl Executor {
                     }
                 }
             }
+            effective.push(name);
         }
         if !effective
             .iter()
@@ -1435,10 +1453,11 @@ impl Executor {
         else {
             return Ok(Value::Text(String::new()));
         };
+        // `func` is owned (`into_iter().find()`), so move `raw_return_type_name`
+        // out instead of cloning the Option.
+        let raw_name = func.raw_return_type_name;
         Ok(Value::Text(
-            func.raw_return_type_name
-                .clone()
-                .unwrap_or_else(|| format!("{}", func.return_type)),
+            raw_name.unwrap_or_else(|| format!("{}", func.return_type)),
         ))
     }
 
@@ -2061,22 +2080,26 @@ impl Executor {
             return Ok(Value::Null);
         }
 
-        let name = match &arg_values[0] {
-            Value::Text(value) => value.as_str(),
+        // Consume `arg_values` so the inner `String` of `Value::Text(_)`
+        // moves into `value` instead of being cloned.
+        let mut iter = arg_values.into_iter();
+        let name_v = iter.next().expect("len == 3");
+        let value_v = iter.next().expect("len == 3");
+        let is_local_v = iter.next().expect("len == 3");
+
+        let name = match name_v {
+            Value::Text(s) => s,
             other => return Ok(Value::Text(other.to_string())),
         };
-        let value = match &arg_values[1] {
-            Value::Text(value) => value.clone(),
+        let value = match value_v {
+            Value::Text(s) => s,
             other => other.to_string(),
         };
-        let is_local = match &arg_values[2] {
-            Value::Boolean(value) => *value,
-            _ => false,
-        };
+        let is_local = matches!(is_local_v, Value::Boolean(true));
 
-        context.apply_session_setting(name, &value, is_local)?;
+        context.apply_session_setting(&name, &value, is_local)?;
         let applied = context
-            .current_session_setting(name, false)?
+            .current_session_setting(&name, false)?
             .unwrap_or(value);
         Ok(Value::Text(applied))
     }
@@ -2180,7 +2203,8 @@ impl Executor {
         } else if let Some(schema_name) = table.name.schema_name() {
             QualifiedName::qualified(schema_name, parsed.object_name())
         } else {
-            parsed.clone()
+            // Move `parsed`; nothing else uses it past this branch.
+            parsed
         };
 
         if let Some(sequence) = self
@@ -2298,8 +2322,10 @@ impl Executor {
                         "more than one row returned by a subquery used as an expression",
                     ))));
                 }
-                match rows.first() {
-                    Some(row) => row.values.first().cloned().ok_or_else(|| {
+                // Consume the single returned row so its first Value moves
+                // straight into the result instead of being cloned.
+                match rows.into_iter().next() {
+                    Some(row) => row.values.into_iter().next().ok_or_else(|| {
                         DbError::internal("scalar subquery returned row with no columns")
                     }),
                     None => Ok(Value::Null),
@@ -2324,7 +2350,9 @@ impl Executor {
                 let mut values = Vec::with_capacity(rows.len());
                 for row in rows {
                     context.check_deadline()?;
-                    values.push(row.values.first().cloned().ok_or_else(|| {
+                    // Move the first Value out of each subquery row rather
+                    // than cloning it.
+                    values.push(row.values.into_iter().next().ok_or_else(|| {
                         DbError::internal("array subquery returned row with no columns")
                     })?);
                 }
@@ -2490,7 +2518,9 @@ impl Executor {
                     _ => return None,
                 };
                 let mut values: HashMap<ValueHashKey, Value> = HashMap::with_capacity(rows.len());
-                for row in &rows {
+                // Consume each row and move (key, agg) out of `row.values`
+                // instead of cloning the aggregate value into the map.
+                for row in rows {
                     if row.values.len() < 2 {
                         // Aggregate output must be `(group_key, agg)`;
                         // anything narrower means the materialisation
@@ -2498,17 +2528,18 @@ impl Executor {
                         // fall back rather than misinterpret it.
                         return None;
                     }
-                    let key_val = &row.values[0];
-                    let agg_val = &row.values[1];
+                    let mut values_iter = row.values.into_iter();
+                    let key_val = values_iter.next().expect("checked len >= 2");
+                    let agg_val = values_iter.next().expect("checked len >= 2");
                     if key_val.is_null() {
                         // SQL: `s.k = OUTER.k` is never true when the
                         // inner key is NULL, so a NULL group never
                         // matches any outer probe — drop it.
                         continue;
                     }
-                    match build_hash_key(key_val) {
+                    match build_hash_key(&key_val) {
                         Ok(hk) => {
-                            values.insert(hk, agg_val.clone());
+                            values.insert(hk, agg_val);
                         }
                         Err(_) => return None,
                     }

@@ -123,27 +123,30 @@ pub(crate) fn enrich_with_transitive_predicates(
         });
     }
 
-    // Collect filter conjuncts.
-    let mut filter_conjuncts = Vec::new();
-    predicate_pushdown::collect_conjuncts(filter_expr.clone(), &mut filter_conjuncts);
+    // Collect filter conjuncts by reference; cloning the whole filter expr
+    // up-front is wasted work when no transitive predicate is generated.
+    let mut filter_conjunct_refs: Vec<&TypedExpr> = Vec::new();
+    predicate_pushdown::collect_conjuncts_ref(filter_expr, &mut filter_conjunct_refs);
 
     // For each conjunct that is a `col op literal` pattern, try to
     // generate a transitive predicate for the partner column.
     let mut new_predicates: Vec<TypedExpr> = Vec::new();
-    for conjunct in &filter_conjuncts {
+    for conjunct in &filter_conjunct_refs {
         if let Some((col_ord, comparison)) = extract_column_comparison(conjunct) {
             for &(left_ord, right_ord) in &equi_pairs {
                 if col_ord == left_ord {
                     // Generate predicate for the right partner.
                     let inferred = substitute_ordinal(&comparison, col_ord, right_ord);
-                    if !filter_conjuncts.contains(&inferred) && !new_predicates.contains(&inferred)
+                    if !filter_conjunct_refs.iter().any(|c| *c == &inferred)
+                        && !new_predicates.contains(&inferred)
                     {
                         new_predicates.push(inferred);
                     }
                 } else if col_ord == right_ord {
                     // Generate predicate for the left partner.
                     let inferred = substitute_ordinal(&comparison, col_ord, left_ord);
-                    if !filter_conjuncts.contains(&inferred) && !new_predicates.contains(&inferred)
+                    if !filter_conjunct_refs.iter().any(|c| *c == &inferred)
+                        && !new_predicates.contains(&inferred)
                     {
                         new_predicates.push(inferred);
                     }
@@ -169,7 +172,7 @@ pub(crate) fn enrich_with_transitive_predicates(
     }
 
     // AND the new predicates into the existing filter.
-    let mut all_conjuncts = filter_conjuncts;
+    let mut all_conjuncts: Vec<TypedExpr> = filter_conjunct_refs.into_iter().cloned().collect();
     all_conjuncts.extend(new_predicates);
     let enriched_filter = predicate_pushdown::combine_conjuncts(all_conjuncts);
 

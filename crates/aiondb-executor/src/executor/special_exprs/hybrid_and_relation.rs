@@ -171,12 +171,43 @@ fn vector_filter_value_matches_numeric_range(
         Value::Array(values) => values
             .iter()
             .any(|value| vector_filter_value_matches_numeric_range(value, gt, gte, lt, lte)),
-        Value::Jsonb(serde_json::Value::Array(values)) => values.iter().any(|value| {
-            let candidate = Value::Jsonb(value.clone());
-            vector_filter_value_matches_numeric_range(&candidate, gt, gte, lt, lte)
-        }),
+        Value::Jsonb(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|value| vector_filter_json_value_matches_numeric_range(value, gt, gte, lt, lte)),
         candidate => {
             let Some(value) = vector_filter_candidate_to_f64(candidate) else {
+                return false;
+            };
+            if gt.is_some_and(|bound| value <= bound) {
+                return false;
+            }
+            if gte.is_some_and(|bound| value < bound) {
+                return false;
+            }
+            if lt.is_some_and(|bound| value >= bound) {
+                return false;
+            }
+            if lte.is_some_and(|bound| value > bound) {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+fn vector_filter_json_value_matches_numeric_range(
+    candidate: &serde_json::Value,
+    gt: Option<f64>,
+    gte: Option<f64>,
+    lt: Option<f64>,
+    lte: Option<f64>,
+) -> bool {
+    match candidate {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| vector_filter_json_value_matches_numeric_range(value, gt, gte, lt, lte)),
+        candidate => {
+            let Some(value) = candidate.as_f64().filter(|value| value.is_finite()) else {
                 return false;
             };
             if gt.is_some_and(|bound| value <= bound) {
@@ -258,7 +289,16 @@ fn vector_filter_json_value_matches_text(candidate: &serde_json::Value, expected
 }
 
 fn vector_filter_text_contains(candidate: &str, expected: &str) -> bool {
-    candidate.to_lowercase().contains(&expected.to_lowercase())
+    if expected.is_empty() {
+        return true;
+    }
+    if candidate.is_ascii() && expected.is_ascii() {
+        return candidate
+            .as_bytes()
+            .windows(expected.len())
+            .any(|window| window.eq_ignore_ascii_case(expected.as_bytes()));
+    }
+    candidate.to_lowercase().contains(expected)
 }
 
 fn vector_filter_scalar_value_matches(candidate: &Value, expected: &Value) -> bool {
@@ -286,12 +326,25 @@ fn vector_filter_json_value_matches(candidate: &serde_json::Value, expected: &Va
             .as_f64()
             .is_some_and(|candidate| (candidate - *expected).abs() < f64::EPSILON),
         Value::Text(expected) => candidate.as_str().is_some_and(|value| value == expected),
-        expected => Value::Jsonb(candidate.clone()) == *expected,
+        // `expected` is guaranteed not to be a `Value::Jsonb` here (the
+        // `Jsonb` arm is matched above), so wrapping `candidate` into
+        // a `Jsonb` and comparing to a non-`Jsonb` variant is always
+        // false. Skip the clone and return false directly.
+        _ => false,
     }
 }
 
 impl CompiledVectorTopKFilter {
+    fn is_impossible(&self) -> bool {
+        self.min_should
+            .as_ref()
+            .is_some_and(|min_should| min_should.min_count > min_should.conditions.len())
+    }
+
     fn matches(&self, row: &Row) -> bool {
+        if self.is_impossible() {
+            return false;
+        }
         if self.must.iter().any(|condition| !condition.matches(row)) {
             return false;
         }
@@ -302,14 +355,19 @@ impl CompiledVectorTopKFilter {
             return false;
         }
         if let Some(min_should) = &self.min_should {
-            let matched = min_should
-                .conditions
-                .iter()
-                .filter(|condition| condition.matches(row))
-                .count();
-            if matched < min_should.min_count {
-                return false;
+            if min_should.min_count == 0 {
+                return true;
             }
+            let mut matched = 0usize;
+            for condition in &min_should.conditions {
+                if condition.matches(row) {
+                    matched = matched.saturating_add(1);
+                    if matched >= min_should.min_count {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
         true
     }
@@ -420,14 +478,27 @@ fn vector_filter_candidate_to_f64(value: &Value) -> Option<f64> {
         let number = json.as_f64()?;
         return number.is_finite().then_some(number);
     }
-    let coerced = aiondb_eval::coerce_value(value.clone(), &DataType::Double).ok()?;
-    let Value::Double(number) = coerced else {
-        return None;
-    };
+    let number = coerce_value_ref_to_f64(value).ok().flatten()?;
     if number.is_finite() {
         Some(number)
     } else {
         None
+    }
+}
+
+fn coerce_value_ref_to_f64(value: &Value) -> DbResult<Option<f64>> {
+    match value {
+        Value::Int(value) => Ok(Some(f64::from(*value))),
+        Value::BigInt(value) => Ok(Some(*value as f64)),
+        Value::Real(value) => Ok(Some(f64::from(*value))),
+        Value::Double(value) => Ok(Some(*value)),
+        Value::Numeric(value) => Ok(Some(value.to_f64())),
+        Value::Money(value) => Ok(Some(*value as f64 / 100.0)),
+        _ => match aiondb_eval::coerce_value(value.clone(), &DataType::Double)? {
+            Value::Double(value) => Ok(Some(value)),
+            Value::Null => Ok(None),
+            _ => Ok(None),
+        },
     }
 }
 
@@ -439,7 +510,7 @@ fn vector_filter_supports_numeric_range(data_type: &DataType) -> bool {
 }
 
 #[derive(Clone, Debug, Default)]
-struct HybridRrfFusionEntry {
+struct HybridRrfFusionEntry<'a> {
     fused_score: f64,
     dense_rank: Option<usize>,
     sparse_rank: Option<usize>,
@@ -447,21 +518,21 @@ struct HybridRrfFusionEntry {
     sparse_score: Option<f64>,
     dense_distance: Option<f64>,
     sparse_distance: Option<f64>,
-    payload: Option<serde_json::Value>,
+    payload: Option<&'a serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
-struct HybridDbsfSourceHit {
+struct HybridDbsfSourceHit<'a> {
     id: i64,
     rank: usize,
     raw_score: f64,
     score: Option<f64>,
     distance: Option<f64>,
-    payload: Option<serde_json::Value>,
+    payload: Option<&'a serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct HybridDbsfFusionEntry {
+struct HybridDbsfFusionEntry<'a> {
     fused_score: f64,
     dense_rank: Option<usize>,
     sparse_rank: Option<usize>,
@@ -471,15 +542,39 @@ struct HybridDbsfFusionEntry {
     sparse_distance: Option<f64>,
     dense_normalized_score: Option<f64>,
     sparse_normalized_score: Option<f64>,
-    payload: Option<serde_json::Value>,
+    payload: Option<&'a serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DbsfScoreNormalizer {
+    low: f64,
+    span: f64,
+    fallback: Option<f64>,
+}
+
+impl DbsfScoreNormalizer {
+    fn constant(value: f64) -> Self {
+        Self {
+            low: 0.0,
+            span: 1.0,
+            fallback: Some(value),
+        }
+    }
+
+    fn normalize(self, score: f64) -> f64 {
+        if let Some(value) = self.fallback {
+            value
+        } else {
+            ((score - self.low) / self.span).clamp(0.0, 1.0)
+        }
+    }
 }
 
 fn parse_rrf_weight_arg(value: Option<&Value>, arg_name: &str) -> DbResult<f64> {
     let Some(value) = value else {
         return Ok(1.0);
     };
-    let coerced = aiondb_eval::coerce_value(value.clone(), &DataType::Double)?;
-    let Value::Double(weight) = coerced else {
+    let Some(weight) = coerce_value_ref_to_f64(value)? else {
         return Err(DbError::bind_error(
             SqlState::DatatypeMismatch,
             format!("{arg_name} must be numeric"),
@@ -494,10 +589,10 @@ fn parse_rrf_weight_arg(value: Option<&Value>, arg_name: &str) -> DbResult<f64> 
     Ok(weight)
 }
 
-fn parse_rrf_hits_arg(
-    value: &Value,
+fn parse_rrf_hits_arg<'a>(
+    value: &'a Value,
     arg_name: &str,
-) -> DbResult<Vec<serde_json::Map<String, serde_json::Value>>> {
+) -> DbResult<Vec<&'a serde_json::Map<String, serde_json::Value>>> {
     let hits = match value {
         Value::Null => return Ok(Vec::new()),
         Value::Array(values) => {
@@ -505,7 +600,7 @@ fn parse_rrf_hits_arg(
             for entry in values {
                 match entry {
                     Value::Null => {}
-                    Value::Jsonb(serde_json::Value::Object(object)) => hits.push(object.clone()),
+                    Value::Jsonb(serde_json::Value::Object(object)) => hits.push(object),
                     Value::Jsonb(_) => {
                         return Err(DbError::bind_error(
                             SqlState::DatatypeMismatch,
@@ -525,7 +620,7 @@ fn parse_rrf_hits_arg(
         Value::Jsonb(serde_json::Value::Array(values)) => values
             .iter()
             .map(|entry| {
-                entry.as_object().cloned().ok_or_else(|| {
+                entry.as_object().ok_or_else(|| {
                     DbError::bind_error(
                         SqlState::DatatypeMismatch,
                         format!("{arg_name} entries must be JSON objects"),
@@ -558,6 +653,25 @@ fn read_hit_id(hit: &serde_json::Map<String, serde_json::Value>, arg_name: &str)
                 format!("{arg_name} hit object is missing integer field \"id\""),
             )
         })
+}
+
+fn read_bigint_first_value(values: &[Value]) -> DbResult<Option<i64>> {
+    match values.first() {
+        Some(Value::BigInt(id)) => Ok(Some(*id)),
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => read_bigint_value(value.clone()),
+    }
+}
+
+fn read_bigint_value(value: Value) -> DbResult<Option<i64>> {
+    match value {
+        Value::BigInt(id) => Ok(Some(id)),
+        Value::Null => Ok(None),
+        value => match aiondb_eval::coerce_value(value, &DataType::BigInt)? {
+            Value::BigInt(id) => Ok(Some(id)),
+            _ => Ok(None),
+        },
+    }
 }
 
 fn read_hit_score_for_dbsf(hit: &serde_json::Map<String, serde_json::Value>) -> Option<f64> {
@@ -749,8 +863,7 @@ fn parse_recommend_value_array_as_vector(
     }
     let mut values = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let coerced = aiondb_eval::coerce_value(entry.clone(), &DataType::Double)?;
-        let Value::Double(number) = coerced else {
+        let Some(number) = coerce_value_ref_to_f64(entry)? else {
             return Err(DbError::bind_error(
                 SqlState::DatatypeMismatch,
                 format!("{arg_name} vector element #{index} must be numeric"),
@@ -777,13 +890,10 @@ fn json_array_looks_like_vector(entries: &[serde_json::Value], expected_dims: u3
 fn value_array_looks_like_vector(entries: &[Value], expected_dims: u32) -> bool {
     entries.len() == usize::try_from(expected_dims).unwrap_or(usize::MAX)
         && entries.iter().all(|entry| {
-            aiondb_eval::coerce_value(entry.clone(), &DataType::Double)
+            coerce_value_ref_to_f64(entry)
                 .ok()
-                .and_then(|value| match value {
-                    Value::Double(number) => Some(number.is_finite()),
-                    _ => None,
-                })
-                .unwrap_or(false)
+                .flatten()
+                .is_some_and(f64::is_finite)
         })
 }
 
@@ -965,20 +1075,22 @@ fn collect_recommend_example_ids(specs: &[RecommendExampleSpec]) -> std::collect
 }
 
 fn materialize_recommend_vectors(
-    specs: &[RecommendExampleSpec],
+    specs: Vec<RecommendExampleSpec>,
     id_vectors: &std::collections::HashMap<i64, aiondb_core::VectorValue>,
     expected_dims: u32,
     arg_name: &str,
 ) -> DbResult<Vec<aiondb_core::VectorValue>> {
     let mut vectors = Vec::with_capacity(specs.len());
+    // Consume the specs so the Vector variant moves its `VectorValue` into
+    // the output instead of cloning it.
     for spec in specs {
         match spec {
             RecommendExampleSpec::Vector(vector) => {
-                validate_recommend_vector_dims(vector, expected_dims, arg_name)?;
-                vectors.push(vector.clone());
+                validate_recommend_vector_dims(&vector, expected_dims, arg_name)?;
+                vectors.push(vector);
             }
             RecommendExampleSpec::Id(id) => {
-                let Some(vector) = id_vectors.get(id) else {
+                let Some(vector) = id_vectors.get(&id) else {
                     return Err(DbError::bind_error(
                         SqlState::InvalidParameterValue,
                         format!("{arg_name} references unknown id {id}"),
@@ -1091,6 +1203,20 @@ struct FullTextTopKOptionOverrides {
     filter: Option<VectorTopKFilterSpec>,
 }
 
+enum ParsedJsonOptions<'a> {
+    Borrowed(&'a serde_json::Value),
+    Owned(serde_json::Value),
+}
+
+impl ParsedJsonOptions<'_> {
+    fn as_object(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        match self {
+            Self::Borrowed(value) => value.as_object(),
+            Self::Owned(value) => value.as_object(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FullTextTopHit {
     score: f64,
@@ -1182,8 +1308,7 @@ fn parse_full_text_score_threshold_arg(value: Option<&Value>) -> DbResult<Option
     let Some(value) = value else {
         return Ok(None);
     };
-    let coerced = aiondb_eval::coerce_value(value.clone(), &DataType::Double)?;
-    let Value::Double(score_threshold) = coerced else {
+    let Some(score_threshold) = coerce_value_ref_to_f64(value)? else {
         return Err(DbError::bind_error(
             SqlState::DatatypeMismatch,
             "full_text_top_k_hits() score_threshold must be numeric",
@@ -1198,27 +1323,34 @@ fn parse_full_text_score_threshold_arg(value: Option<&Value>) -> DbResult<Option
     Ok(Some(score_threshold))
 }
 
+fn parse_json_options_arg<'a>(
+    value: &'a Value,
+    function_name: &str,
+) -> DbResult<ParsedJsonOptions<'a>> {
+    match value {
+        Value::Jsonb(json) => Ok(ParsedJsonOptions::Borrowed(json)),
+        Value::Text(text) => serde_json::from_str::<serde_json::Value>(text)
+            .map(ParsedJsonOptions::Owned)
+            .map_err(|err| {
+                DbError::bind_error(
+                    SqlState::InvalidParameterValue,
+                    format!("{function_name} options must be valid JSON: {err}"),
+                )
+            }),
+        other => Err(DbError::bind_error(
+            SqlState::DatatypeMismatch,
+            format!("{function_name} options must be jsonb or text, got {other:?}"),
+        )),
+    }
+}
+
 fn parse_full_text_top_k_options_arg(
     value: Option<&Value>,
 ) -> DbResult<FullTextTopKOptionOverrides> {
     let Some(value) = value else {
         return Ok(FullTextTopKOptionOverrides::default());
     };
-    let parsed = match value {
-        Value::Jsonb(json) => json.clone(),
-        Value::Text(text) => serde_json::from_str::<serde_json::Value>(text).map_err(|err| {
-            DbError::bind_error(
-                SqlState::InvalidParameterValue,
-                format!("full_text_top_k_hits() options must be valid JSON: {err}"),
-            )
-        })?,
-        other => {
-            return Err(DbError::bind_error(
-                SqlState::DatatypeMismatch,
-                format!("full_text_top_k_hits() options must be jsonb or text, got {other:?}"),
-            ));
-        }
-    };
+    let parsed = parse_json_options_arg(value, "full_text_top_k_hits()")?;
     let object = parsed.as_object().ok_or_else(|| {
         DbError::bind_error(
             SqlState::InvalidParameterValue,
@@ -1357,21 +1489,7 @@ fn parse_hybrid_search_top_k_options_arg(
     let Some(value) = value else {
         return Ok(HybridSearchTopKOptionOverrides::default());
     };
-    let parsed = match value {
-        Value::Jsonb(json) => json.clone(),
-        Value::Text(text) => serde_json::from_str::<serde_json::Value>(text).map_err(|err| {
-            DbError::bind_error(
-                SqlState::InvalidParameterValue,
-                format!("hybrid_search_top_k_hits() options must be valid JSON: {err}"),
-            )
-        })?,
-        other => {
-            return Err(DbError::bind_error(
-                SqlState::DatatypeMismatch,
-                format!("hybrid_search_top_k_hits() options must be jsonb or text, got {other:?}"),
-            ));
-        }
-    };
+    let parsed = parse_json_options_arg(value, "hybrid_search_top_k_hits()")?;
     let object = parsed.as_object().ok_or_else(|| {
         DbError::bind_error(
             SqlState::InvalidParameterValue,
@@ -1813,14 +1931,14 @@ fn literal_expr_from_value(value: Value) -> TypedExpr {
     TypedExpr::literal(value, data_type, nullable)
 }
 
-fn collect_dbsf_source_hits(
-    hits: &[serde_json::Map<String, serde_json::Value>],
+fn collect_dbsf_source_hits<'a>(
+    hits: &[&'a serde_json::Map<String, serde_json::Value>],
     arg_name: &str,
     context: &ExecutionContext,
-) -> DbResult<Vec<HybridDbsfSourceHit>> {
+) -> DbResult<Vec<HybridDbsfSourceHit<'a>>> {
     let mut collected = Vec::with_capacity(hits.len());
-    let mut seen = std::collections::HashSet::new();
-    for (rank, hit) in hits.iter().enumerate() {
+    let mut seen = std::collections::HashSet::with_capacity(hits.len());
+    for (rank, hit) in hits.iter().copied().enumerate() {
         context.check_deadline()?;
         let id = read_hit_id(hit, arg_name)?;
         if !seen.insert(id) {
@@ -1835,15 +1953,15 @@ fn collect_dbsf_source_hits(
             raw_score,
             score: hit.get("score").and_then(serde_json::Value::as_f64),
             distance: hit.get("distance").and_then(serde_json::Value::as_f64),
-            payload: hit.get("payload").cloned(),
+            payload: hit.get("payload"),
         });
     }
     Ok(collected)
 }
 
-fn compute_dbsf_normalized_scores(source_hits: &[HybridDbsfSourceHit]) -> Vec<f64> {
+fn compute_dbsf_score_normalizer(source_hits: &[HybridDbsfSourceHit<'_>]) -> DbsfScoreNormalizer {
     if source_hits.is_empty() {
-        return Vec::new();
+        return DbsfScoreNormalizer::constant(0.0);
     }
     let mut score_sum = 0.0_f64;
     for hit in source_hits {
@@ -1858,21 +1976,22 @@ fn compute_dbsf_normalized_scores(source_hits: &[HybridDbsfSourceHit]) -> Vec<f6
     let variance = variance_sum / usize_to_f64(source_hits.len());
     let std_dev = variance.sqrt();
     if !mean.is_finite() || !std_dev.is_finite() {
-        return vec![0.0; source_hits.len()];
+        return DbsfScoreNormalizer::constant(0.0);
     }
     if std_dev <= f64::EPSILON {
-        return vec![0.5; source_hits.len()];
+        return DbsfScoreNormalizer::constant(0.5);
     }
     let low = mean - (3.0 * std_dev);
     let high = mean + (3.0 * std_dev);
     let span = high - low;
     if !low.is_finite() || !high.is_finite() || !span.is_finite() || span <= f64::EPSILON {
-        return vec![0.5; source_hits.len()];
+        return DbsfScoreNormalizer::constant(0.5);
     }
-    source_hits
-        .iter()
-        .map(|hit| ((hit.raw_score - low) / span).clamp(0.0, 1.0))
-        .collect()
+    DbsfScoreNormalizer {
+        low,
+        span,
+        fallback: None,
+    }
 }
 
 impl Executor {
@@ -1937,11 +2056,7 @@ impl Executor {
                 )?;
                 while let Some(record) = stream.next()? {
                     context.check_deadline()?;
-                    let row_id = aiondb_eval::coerce_value(
-                        record.row.values.first().cloned().unwrap_or(Value::Null),
-                        &DataType::BigInt,
-                    )?;
-                    let Value::BigInt(row_id) = row_id else {
+                    let Some(row_id) = read_bigint_first_value(&record.row.values)? else {
                         continue;
                     };
                     if row_id == *id {
@@ -1957,11 +2072,7 @@ impl Executor {
         let mut stream = self.scan_table_locked(context, table.table_id, None)?;
         while let Some(record) = stream.next()? {
             context.check_deadline()?;
-            let id = aiondb_eval::coerce_value(
-                record.row.values.first().cloned().unwrap_or(Value::Null),
-                &DataType::BigInt,
-            )?;
-            let Value::BigInt(id) = id else {
+            let Some(id) = read_bigint_first_value(&record.row.values)? else {
                 continue;
             };
             if target_ids.contains(&id) && !rows_by_id.contains_key(&id) {
@@ -2458,12 +2569,23 @@ impl Executor {
                 break;
             }
             context.check_deadline()?;
-            let current = record.row.values.first().cloned().unwrap_or(Value::Null);
-            let matches = if current == *probe {
+            // Compare via reference; only fall back to a Null placeholder when
+            // the row is empty. The previous `.cloned().unwrap_or(Null)` paid
+            // a Value clone for every scanned row even when the filter
+            // dropped it.
+            let null_placeholder;
+            let current_ref: &Value = match record.row.values.first() {
+                Some(v) => v,
+                None => {
+                    null_placeholder = Value::Null;
+                    &null_placeholder
+                }
+            };
+            let matches = if current_ref == probe {
                 true
             } else {
                 matches!(
-                    compare_runtime_values(&current, probe)?,
+                    compare_runtime_values(current_ref, probe)?,
                     Some(std::cmp::Ordering::Equal)
                 )
             };
@@ -2473,5 +2595,260 @@ impl Executor {
             push_bigint_neighbor_with_seen(record.row.values.get(1), output, seen)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        coerce_value_ref_to_f64, compute_dbsf_score_normalizer, parse_json_options_arg,
+        parse_rrf_hits_arg, read_bigint_first_value, read_bigint_value, read_hit_id,
+        vector_filter_text_contains, vector_filter_value_matches_numeric_range,
+        CompiledVectorTopKFilter, CompiledVectorTopKFilterCondition,
+        CompiledVectorTopKFilterPredicate, CompiledVectorTopKMinShould, HybridDbsfSourceHit,
+        ParsedJsonOptions,
+    };
+    use aiondb_core::{ColumnId, Row, Value};
+
+    #[test]
+    fn parse_rrf_hits_arg_borrows_value_array_hits() {
+        let value = Value::Array(vec![
+            Value::Jsonb(serde_json::json!({"id": 11, "score": 0.9})),
+            Value::Null,
+            Value::Jsonb(serde_json::json!({"id": 12, "score": 0.8})),
+        ]);
+
+        let hits = parse_rrf_hits_arg(&value, "test hits").unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| read_hit_id(hit, "test hits"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn parse_rrf_hits_arg_borrows_json_array_hits() {
+        let value = Value::Jsonb(serde_json::json!([
+            {"id": 21, "score": 0.7},
+            {"id": 22, "score": 0.6}
+        ]));
+
+        let hits = parse_rrf_hits_arg(&value, "test hits").unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| read_hit_id(hit, "test hits"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(ids, vec![21, 22]);
+    }
+
+    #[test]
+    fn parse_json_options_arg_borrows_jsonb_options() {
+        let value = Value::Jsonb(serde_json::json!({"source_k": 25}));
+
+        let parsed = parse_json_options_arg(&value, "test_fn()").unwrap();
+
+        match parsed {
+            ParsedJsonOptions::Borrowed(json) => {
+                assert_eq!(
+                    json.get("source_k").and_then(serde_json::Value::as_i64),
+                    Some(25)
+                );
+            }
+            ParsedJsonOptions::Owned(_) => panic!("jsonb options should be borrowed"),
+        }
+    }
+
+    #[test]
+    fn parse_json_options_arg_parses_text_options() {
+        let value = Value::Text(r#"{"source_k":25}"#.to_owned());
+
+        let parsed = parse_json_options_arg(&value, "test_fn()").unwrap();
+
+        match parsed {
+            ParsedJsonOptions::Owned(json) => {
+                assert_eq!(
+                    json.get("source_k").and_then(serde_json::Value::as_i64),
+                    Some(25)
+                );
+            }
+            ParsedJsonOptions::Borrowed(_) => {
+                panic!("text options should be parsed into owned JSON")
+            }
+        }
+    }
+
+    #[test]
+    fn read_bigint_first_value_reads_native_bigint_without_coercion() {
+        let values = vec![Value::BigInt(42), Value::Text("ignored".to_owned())];
+
+        assert_eq!(read_bigint_first_value(&values).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn read_bigint_first_value_allows_missing_or_null_id() {
+        assert_eq!(read_bigint_first_value(&[]).unwrap(), None);
+        assert_eq!(read_bigint_first_value(&[Value::Null]).unwrap(), None);
+    }
+
+    #[test]
+    fn read_bigint_value_reads_native_or_fallback_values() {
+        assert_eq!(read_bigint_value(Value::BigInt(42)).unwrap(), Some(42));
+        assert_eq!(read_bigint_value(Value::Null).unwrap(), None);
+        assert_eq!(
+            read_bigint_value(Value::Text("43".to_owned())).unwrap(),
+            Some(43)
+        );
+    }
+
+    #[test]
+    fn coerce_value_ref_to_f64_reads_native_numeric_values() {
+        assert_eq!(coerce_value_ref_to_f64(&Value::Int(7)).unwrap(), Some(7.0));
+        assert_eq!(
+            coerce_value_ref_to_f64(&Value::BigInt(9)).unwrap(),
+            Some(9.0)
+        );
+        assert_eq!(
+            coerce_value_ref_to_f64(&Value::Real(1.5)).unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            coerce_value_ref_to_f64(&Value::Double(2.5)).unwrap(),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn coerce_value_ref_to_f64_keeps_fallback_casts() {
+        assert_eq!(
+            coerce_value_ref_to_f64(&Value::Text("3.25".to_owned())).unwrap(),
+            Some(3.25)
+        );
+        assert_eq!(
+            coerce_value_ref_to_f64(&Value::Jsonb(serde_json::json!(4.5))).unwrap(),
+            Some(4.5)
+        );
+        assert_eq!(coerce_value_ref_to_f64(&Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn vector_filter_numeric_range_reads_json_arrays_without_wrapping() {
+        let value = Value::Jsonb(serde_json::json!([1, [2, 3], "skip"]));
+
+        assert!(vector_filter_value_matches_numeric_range(
+            &value,
+            Some(2.5),
+            None,
+            Some(3.5),
+            None,
+        ));
+        assert!(!vector_filter_value_matches_numeric_range(
+            &value,
+            Some(3.5),
+            None,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn vector_filter_text_contains_uses_pre_lowered_expected() {
+        assert!(vector_filter_text_contains(
+            "Hybrid Search Payload",
+            "search"
+        ));
+        assert!(vector_filter_text_contains(
+            "Hybrid Search Payload",
+            "SEARCH"
+        ));
+    }
+
+    #[test]
+    fn vector_filter_text_contains_handles_empty_and_unicode_fallback() {
+        assert!(vector_filter_text_contains("Hybrid Search Payload", ""));
+        assert!(vector_filter_text_contains("Résumé Payload", "résumé"));
+        assert!(!vector_filter_text_contains("Résumé Payload", "resume"));
+    }
+
+    #[test]
+    fn compiled_filter_min_should_preserves_threshold_semantics() {
+        let row = Row::new(vec![Value::Text("hit".to_owned())]);
+        let matching = compiled_match_condition(Value::Text("hit".to_owned()));
+        let missing = compiled_match_condition(Value::Text("miss".to_owned()));
+
+        let zero_required = compiled_min_should_filter(Vec::new(), 0);
+        assert!(zero_required.matches(&row));
+
+        let one_required = compiled_min_should_filter(vec![matching.clone(), missing.clone()], 1);
+        assert!(one_required.matches(&row));
+
+        let two_required = compiled_min_should_filter(vec![matching, missing], 2);
+        assert!(!two_required.matches(&row));
+
+        let impossible = compiled_min_should_filter(
+            vec![compiled_match_condition(Value::Text("hit".to_owned()))],
+            2,
+        );
+        assert!(impossible.is_impossible());
+        assert!(!impossible.matches(&row));
+    }
+
+    #[test]
+    fn compute_dbsf_score_normalizer_uses_half_for_flat_scores() {
+        let hits = vec![dbsf_hit(1, 0.7), dbsf_hit(2, 0.7), dbsf_hit(3, 0.7)];
+
+        let normalizer = compute_dbsf_score_normalizer(&hits);
+
+        assert_eq!(normalizer.normalize(0.7), 0.5);
+    }
+
+    #[test]
+    fn compute_dbsf_score_normalizer_clamps_to_unit_range() {
+        let hits = vec![dbsf_hit(1, 0.0), dbsf_hit(2, 10.0), dbsf_hit(3, 20.0)];
+
+        let normalizer = compute_dbsf_score_normalizer(&hits);
+
+        assert_eq!(normalizer.normalize(-100.0), 0.0);
+        assert_eq!(normalizer.normalize(100.0), 1.0);
+        assert!(normalizer.normalize(10.0) > 0.0);
+        assert!(normalizer.normalize(10.0) < 1.0);
+    }
+
+    fn dbsf_hit(id: i64, raw_score: f64) -> HybridDbsfSourceHit<'static> {
+        HybridDbsfSourceHit {
+            id,
+            rank: id as usize,
+            raw_score,
+            score: Some(raw_score),
+            distance: None,
+            payload: None,
+        }
+    }
+
+    fn compiled_match_condition(expected: Value) -> CompiledVectorTopKFilterCondition {
+        CompiledVectorTopKFilterCondition {
+            ordinal: 0,
+            column_id: ColumnId::new(1),
+            json_path: Vec::new(),
+            predicate: CompiledVectorTopKFilterPredicate::Match(expected),
+        }
+    }
+
+    fn compiled_min_should_filter(
+        conditions: Vec<CompiledVectorTopKFilterCondition>,
+        min_count: usize,
+    ) -> CompiledVectorTopKFilter {
+        CompiledVectorTopKFilter {
+            must: Vec::new(),
+            should: Vec::new(),
+            must_not: Vec::new(),
+            min_should: Some(CompiledVectorTopKMinShould {
+                conditions,
+                min_count,
+            }),
+        }
     }
 }

@@ -733,31 +733,19 @@ pub(crate) fn eval_arith_sub(left: &Value, right: &Value) -> DbResult<Value> {
         // matching arms in eval_arith_add. Without these, expressions like
         // `now() - '1 day'` raise "cannot subtract".
         (Value::Interval(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_sub(left, &coerced)
         }
         (Value::Timestamp(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_sub(left, &coerced)
         }
         (Value::TimestampTz(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_sub(left, &coerced)
         }
         (Value::Date(_), Value::Text(s)) => {
-            let coerced = crate::eval::cast::cast_value(
-                Value::Text(s.clone()),
-                &aiondb_core::DataType::Interval,
-            )?;
+            let coerced = crate::eval::cast::cast_text_to_interval(s)?;
             eval_arith_sub(left, &coerced)
         }
         _ => Err(DbError::internal(format!(

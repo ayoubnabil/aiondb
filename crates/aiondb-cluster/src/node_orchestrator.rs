@@ -26,6 +26,7 @@ use aiondb_ha::kv_engine::KvEngine;
 use aiondb_ha::metrics_server::MetricsServer;
 use aiondb_ha::multi_raft::MultiRaftRegistry;
 use aiondb_ha::protocol::NodeId as RaftNodeId;
+use aiondb_ha::raft_auth::RaftSharedSecret;
 use aiondb_ha::raft_control_plane::{RaftControlPlane, DEFAULT_METADATA_GROUP_ID};
 use aiondb_ha::raft_tcp::RaftTcpServer;
 
@@ -34,7 +35,7 @@ use crate::gossip::{GossipConfig, GossipNode};
 use crate::gossip_transport::GossipServer;
 
 /// Configuration for a single orchestrator node.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NodeOrchestratorConfig {
     pub raft_node_id: u64,
     pub cluster_node_id: String,
@@ -48,6 +49,32 @@ pub struct NodeOrchestratorConfig {
     /// When `true`, make the local node the metadata group leader
     /// after start. Set on the bootstrap node only.
     pub bootstrap_metadata_leader: bool,
+    /// HMAC-SHA256 shared secret authenticating every Raft TCP frame.
+    /// Must match across every node in the cluster ; must be at least
+    /// 32 bytes. Sourced from cluster bootstrap material — never from
+    /// SQL or wire input.
+    pub raft_shared_secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for NodeOrchestratorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeOrchestratorConfig")
+            .field("raft_node_id", &self.raft_node_id)
+            .field("cluster_node_id", &self.cluster_node_id)
+            .field("state_dir", &self.state_dir)
+            .field("gossip_bind", &self.gossip_bind)
+            .field("gossip_tick", &self.gossip_tick)
+            .field("raft_bind", &self.raft_bind)
+            .field("metrics_bind", &self.metrics_bind)
+            .field("metadata_voters", &self.metadata_voters)
+            .field("metadata_peer_ids", &self.metadata_peer_ids)
+            .field("bootstrap_metadata_leader", &self.bootstrap_metadata_leader)
+            .field(
+                "raft_shared_secret",
+                &(!self.raft_shared_secret.is_empty()).then_some("<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl NodeOrchestratorConfig {
@@ -63,6 +90,10 @@ impl NodeOrchestratorConfig {
             metadata_voters: 1,
             metadata_peer_ids: Vec::new(),
             bootstrap_metadata_leader: true,
+            // Deterministic 32-byte test secret for single-node setups.
+            // Production NodeOrchestratorConfig instances must override
+            // this with secret bytes from the cluster bootstrap.
+            raft_shared_secret: vec![0u8; 32],
         }
     }
 }
@@ -91,19 +122,26 @@ impl NodeOrchestrator {
 
         // Gossip
         let gossip = Arc::new(GossipNode::new(cluster_id.clone(), gossip_config(&config)));
-        let gossip_server =
-            GossipServer::start(Arc::clone(&gossip), config.gossip_bind, config.gossip_tick)
-                .await
-                .map_err(|e| aiondb_core::DbError::internal(format!("gossip bind: {e}")))?;
+        let cluster_secret = RaftSharedSecret::new(config.raft_shared_secret.clone());
+        let gossip_server = GossipServer::start(
+            Arc::clone(&gossip),
+            config.gossip_bind,
+            config.gossip_tick,
+            cluster_secret,
+        )
+        .await
+        .map_err(|e| aiondb_core::DbError::internal(format!("gossip bind: {e}")))?;
 
         // Multi-Raft registry rooted at <state_dir>/raft/.
         let raft_root = config.state_dir.join("raft");
         std::fs::create_dir_all(&raft_root)
             .map_err(|e| aiondb_core::DbError::internal(format!("raft dir: {e}")))?;
         let raft_registry = Arc::new(MultiRaftRegistry::new(raft_id, &raft_root)?);
-        let raft_server = RaftTcpServer::start(Arc::clone(&raft_registry), config.raft_bind)
-            .await
-            .map_err(|e| aiondb_core::DbError::internal(format!("raft bind: {e}")))?;
+        let raft_secret = RaftSharedSecret::new(config.raft_shared_secret.clone());
+        let raft_server =
+            RaftTcpServer::start(Arc::clone(&raft_registry), config.raft_bind, raft_secret)
+                .await
+                .map_err(|e| aiondb_core::DbError::internal(format!("raft bind: {e}")))?;
 
         // Control plane (metadata) + KV engine on the same registry.
         let control_plane = RaftControlPlane::new(Arc::clone(&raft_registry));
@@ -202,6 +240,17 @@ fn gossip_config(_cfg: &NodeOrchestratorConfig) -> GossipConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_orchestrator_config_debug_redacts_shared_secret() {
+        let mut cfg = NodeOrchestratorConfig::single_node_local(1);
+        cfg.raft_shared_secret = b"super-secret-cluster-hmac-key-32b".to_vec();
+
+        let debug = format!("{cfg:?}");
+
+        assert!(!debug.contains("super-secret-cluster-hmac-key-32b"));
+        assert!(debug.contains("redacted"));
+    }
 
     #[tokio::test]
     async fn single_node_starts_and_shuts_down() {

@@ -26,6 +26,7 @@ use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tracing::warn;
 
 use crate::client::{ConnInfo, SslMode};
 
@@ -116,8 +117,19 @@ fn build_tls_connector(conninfo: &ConnInfo) -> DbResult<TlsConnector> {
     let client_config = match conninfo.sslmode {
         SslMode::Disable => unreachable!("sslmode=disable should not call build_tls_connector"),
         SslMode::Allow | SslMode::Prefer | SslMode::Require => {
-            // libpq sslmode=require/prefer/allow accept any server cert.
-            // The threat model is opportunistic encryption, not auth.
+            // V2-07 : libpq sslmode=require/prefer/allow accept any server
+            // cert by design (opportunistic encryption, not auth). Warn
+            // loudly at every connect so an operator running on a flat
+            // L2 segment notices the missing peer auth and switches to
+            // verify-ca / verify-full with sslrootcert= set.
+            warn!(
+                host = %conninfo.host,
+                sslmode = ?conninfo.sslmode,
+                "V2-07 : replication TLS to primary accepts ANY server certificate \
+                 because sslmode is allow/prefer/require ; an active MITM on this \
+                 link is undetectable. Switch to sslmode=verify-full with \
+                 sslrootcert= set for production deployments."
+            );
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
