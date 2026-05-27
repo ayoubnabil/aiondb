@@ -21,6 +21,12 @@ use crate::distrib_metrics::DistribMetrics;
 const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_REQUEST_BUFFER_BYTES: usize = 4096;
 
+#[derive(Debug, Eq, PartialEq)]
+struct RequestLine<'a> {
+    method: &'a str,
+    path: &'a str,
+}
+
 pub struct MetricsServer {
     handle: JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
@@ -81,30 +87,49 @@ async fn serve_one(metrics: Arc<DistribMetrics>, stream: &mut TcpStream) -> io::
     if n == 0 {
         return Ok(());
     }
-    let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let mut request_parts = head.split_whitespace();
-    let method = request_parts.next().unwrap_or("");
-    let path = request_parts.next().unwrap_or("/").to_string();
-    let (status, body, content_type) = if method != "GET" {
-        (
+    let response = match parse_request_line(&buf[..n]) {
+        Ok(request) if request.method != "GET" => http_response(
             "405 Method Not Allowed",
-            "method not allowed\n".to_string(),
+            "method not allowed\n",
             "text/plain",
-        )
-    } else {
-        match path.as_str() {
-            "/metrics" => ("200 OK", metrics.prometheus(), "text/plain; version=0.0.4"),
-            "/metrics/json" => ("200 OK", metrics.json().to_string(), "application/json"),
-            _ => ("404 Not Found", "not found\n".to_string(), "text/plain"),
-        }
+        ),
+        Ok(request) => match request.path {
+            "/metrics" => {
+                http_response("200 OK", &metrics.prometheus(), "text/plain; version=0.0.4")
+            }
+            "/metrics/json" => {
+                http_response("200 OK", &metrics.json().to_string(), "application/json")
+            }
+            _ => http_response("404 Not Found", "not found\n", "text/plain"),
+        },
+        Err(()) => http_response("400 Bad Request", "bad request\n", "text/plain"),
     };
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+fn parse_request_line(buf: &[u8]) -> Result<RequestLine<'_>, ()> {
+    let head = std::str::from_utf8(buf).map_err(|_| ())?;
+    let first_line = head
+        .split_once('\n')
+        .map_or(head, |(line, _)| line)
+        .trim_end_matches('\r');
+    let mut parts = first_line.split_ascii_whitespace();
+    let method = parts.next().ok_or(())?;
+    let path = parts.next().ok_or(())?;
+    let version = parts.next().ok_or(())?;
+    if parts.next().is_some() || !version.starts_with("HTTP/") {
+        return Err(());
+    }
+    Ok(RequestLine { method, path })
+}
+
+fn http_response(status: &str, body: &str, content_type: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 #[cfg(test)]
@@ -133,9 +158,13 @@ mod tests {
     }
 
     async fn fetch_method(addr: SocketAddr, method: &str, path: &str) -> String {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
         let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await.unwrap();
+        fetch_raw(addr, req.as_bytes()).await
+    }
+
+    async fn fetch_raw(addr: SocketAddr, req: &[u8]) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req).await.unwrap();
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
@@ -187,5 +216,29 @@ mod tests {
         let body = fetch_method(addr, "POST", "/metrics").await;
         assert!(body.contains("HTTP/1.1 405 Method Not Allowed"));
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_request_line_returns_400() {
+        let (_t, server) = boot().await;
+        let addr = server.local_addr();
+        let body = fetch_raw(addr, b"GET\r\nHost: x\r\n\r\n").await;
+        assert!(body.contains("HTTP/1.1 400 Bad Request"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_request_returns_400() {
+        let (_t, server) = boot().await;
+        let addr = server.local_addr();
+        let body = fetch_raw(addr, b"GET /\xFF HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(body.contains("HTTP/1.1 400 Bad Request"));
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn request_line_parser_rejects_trailing_tokens() {
+        let err = parse_request_line(b"GET /metrics HTTP/1.1 extra\r\n").unwrap_err();
+        assert_eq!(err, ());
     }
 }
