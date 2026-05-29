@@ -9,7 +9,7 @@ order: 90
 
 ## v0.3 vector update
 
-AionDB v0.3 turns vector search into a first-class product surface. The release combines pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, PostgreSQL ecosystem compatibility work, and a reproducible vector benchmark harness.
+v0.3 adds the vector stack: pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered helpers, PostgreSQL ecosystem compatibility work, and a reproducible vector benchmark harness.
 
 ### Highlights
 

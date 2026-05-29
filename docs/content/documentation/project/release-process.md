@@ -36,7 +36,7 @@ Review:
 - benchmarks;
 - release notes.
 
-Also click through the documentation sidebar. The first impression matters: a broken docs navigation makes the database look less credible before anyone runs a query.
+Click through the documentation sidebar. Broken docs navigation undermines the release before anyone runs a query.
 
 ## Artifact checks
 

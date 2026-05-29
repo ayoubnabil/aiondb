@@ -1,15 +1,13 @@
 //! Cost-based optimizer for graph (Cypher) traversal.
 //!
-//! This is the planning brain that lets AionDB pick a good traversal order
-//! *without* relying on hand-written executor fast paths — the same family of
-//! algorithm Neo4j uses for Cypher: an Iterative-Dynamic-Programming (IDP)
-//! join-order search driven by a real cardinality/cost model fed from catalog
-//! statistics.
+//! Iterative-Dynamic-Programming (IDP) join-order search over a query graph,
+//! driven by a cardinality/cost model fed from catalog statistics. Same
+//! family of algorithm Neo4j uses for Cypher.
 //!
 //! Pipeline: [`QueryGraph`] (validated pattern) + [`GraphStatistics`]
-//! (per-label / per-type cardinalities) → [`plan_query_graph`] → the cheapest
-//! annotated [`ExpansionPlan`]. The crate is dependency-free and pure so it can
-//! be unit-tested in isolation and embedded wherever a graph plan is ordered.
+//! (per-label / per-type cardinalities) -> [`plan_query_graph`] -> cheapest
+//! annotated [`ExpansionPlan`]. Dependency-free and pure so it can be
+//! unit-tested in isolation and embedded wherever a graph plan is ordered.
 #![forbid(unsafe_code)]
 
 mod cost;

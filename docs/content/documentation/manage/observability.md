@@ -7,7 +7,7 @@ order: 61
 
 AionDB starts an HTTP observability server for local health and metrics.
 
-> New in v0.3: AionDB now presents SQL, graph, and vector retrieval as one engine story, backed by pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, and reproducible vector benchmarks. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
+> New in v0.3: SQL, graph, and vector retrieval share one engine. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 ## Defaults
 

@@ -781,9 +781,9 @@ impl BufferPool {
 // RAII page guard
 // ---------------------------------------------------------------------------
 
-/// RAII guard that automatically unpins a page when dropped.
+/// RAII guard that unpins a page on drop.
 ///
-/// Provides both shared and exclusive access to the underlying [`Page`].
+/// Exposes both shared and exclusive access to the underlying [`Page`].
 pub struct PageGuard<'a> {
     pool: &'a BufferPool,
     slot: usize,

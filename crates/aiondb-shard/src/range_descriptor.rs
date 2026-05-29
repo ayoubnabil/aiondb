@@ -7,11 +7,10 @@
 //! lookup: find the largest start_key ≤ the requested key, that's the
 //! owning range.
 //!
-//! This module provides the in-memory analog. It is intentionally not a
-//! durable store -- the higher layer is expected to load descriptors
-//! from the catalog at startup and persist mutations through Raft. The
-//! registry simply maintains the live in-memory index used by the SQL
-//! coordinator and the shard router.
+//! This is the in-memory analog. It is intentionally not durable -- the
+//! higher layer loads descriptors from the catalog at startup and
+//! persists mutations through Raft. The registry only maintains the live
+//! in-memory index used by the SQL coordinator and the shard router.
 //!
 //! # Key model
 //!

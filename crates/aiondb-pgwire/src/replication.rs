@@ -1,7 +1,7 @@
 //! Pgwire replication protocol handler.
 //!
-//! This module handles the `PostgreSQL` streaming replication protocol on top
-//! of the pgwire connection layer. It supports:
+//! Handles the `PostgreSQL` streaming replication protocol on top of the
+//! pgwire connection layer. Supports:
 //!
 //! - **Primary side**: `START_REPLICATION` command handling that sets up a
 //!   [`WalSender`] and streams `WalData` messages to a connected replica.
@@ -25,9 +25,8 @@
 //! messages containing WAL data and keepalives, while the replica sends
 //! `CopyData` messages containing standby status updates.
 //!
-//! This module implements a simplified version of this protocol using
-//! `AionDB`'s native replication message format encapsulated in `CopyData`
-//! frames.
+//! A simplified version of this protocol, with `AionDB`'s native
+//! replication message format encapsulated in `CopyData` frames.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -450,8 +449,8 @@ fn validate_slot_name(name: String) -> Option<String> {
 
 /// Read-only mode enforcement for replica servers.
 ///
-/// When the server is running as a replica, all write operations should be
-/// rejected with an appropriate error. This struct provides the check.
+/// Replicas reject every write with a "read-only" error. The check is
+/// done here.
 #[derive(Clone, Debug)]
 pub struct ReadOnlyGuard {
     /// Whether the server is in read-only (replica) mode.

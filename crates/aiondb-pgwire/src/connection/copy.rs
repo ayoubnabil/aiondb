@@ -1,8 +1,7 @@
 //! COPY sub-protocol transport layer.
 //!
-//! This module implements the `PostgreSQL` COPY sub-protocol for both
-//! `COPY FROM STDIN` (client-to-server) and `COPY TO STDOUT`
-//! (server-to-client) directions.
+//! Implements the `PostgreSQL` COPY sub-protocol for both `COPY FROM STDIN`
+//! (client-to-server) and `COPY TO STDOUT` (server-to-client) directions.
 //!
 //! **Supported format**: text only (format code 0).
 //! - Columns are tab-separated (`\t`).

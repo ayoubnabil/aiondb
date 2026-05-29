@@ -402,7 +402,8 @@ pub(super) fn resolve_view_underlying_table(
 }
 
 /// Result of resolving a view as a DML target.
-/// Contains the underlying table and a mapping from view column name
+///
+/// Holds the underlying table and a mapping from view column name
 /// (lowercased) to the underlying table column name.
 pub(super) struct ViewDmlTarget {
     pub table: TableDescriptor,

@@ -38,15 +38,11 @@ order: 10
 
 ## Short version
 
-AionDB is built around a simple database idea: keep relational records, graph relationships, and vector embeddings in one engine instead of syncing the same data across separate systems.
+AionDB keeps relational records, graph relationships, and vector embeddings in one engine. The same row carries its edges and its embedding. Nothing is synced into a second database.
 
-That design matters for graph-heavy scans. In the current benchmark snapshot, the `graph_multi_count` workload is a clear win for AionDB because the query shape is exactly what AionDB is designed to run well: relationship-heavy counting over structured data.
+That helps graph-heavy scans. In the current benchmark snapshot, the `graph_multi_count` workload wins on AionDB because the query shape — relationship-heavy counting over structured data — is exactly what the engine runs.
 
-For developers building RAG apps, knowledge graphs, AI agents, recommendations, fraud workflows, dependency maps, or entity relationship systems, this is the important takeaway:
-
-- AionDB is not just a SQL database with a vector bolt-on.
-- AionDB is not only a graph demo.
-- AionDB is a multimodal embedded database path for SQL, graph, and vector workloads in one Rust engine.
+The takeaway for RAG, knowledge graphs, AI agents, recommendations, fraud workflows, dependency maps, and entity-relationship systems: AionDB is a single engine for SQL, graph, and vector workloads. Use it when you actually need the three together; for a pure SQL or pure vector workload, the specialised tool is still the better choice.
 
 ## The benchmark result in plain English
 
@@ -86,7 +82,10 @@ That is the exact reason AionDB exists. Tables stay the source of truth. Graph l
 
 The 113x result is not magic. It comes from workload fit.
 
-AionDB is designed for graph-shaped work over structured records. The engine can treat graph labels, edge labels, relational rows, and vector values as parts of the same database model. For graph scans that count connected records, that is a strong shape.
+AionDB runs graph-shaped work over structured records. Graph labels,
+edge labels, rows, and vector values are parts of the same database
+model. Graph scans that count connected records match that model
+directly.
 
 The `graph_multi_count` workload rewards three things:
 
@@ -94,7 +93,9 @@ The `graph_multi_count` workload rewards three things:
 2. Low overhead when counting graph matches.
 3. A query path that does not force the application to stitch results across separate services.
 
-AionDB’s model is intentionally boring in the right place: keep the core data as tables, then add graph and vector access paths around that same catalog. For this benchmark, boring is fast.
+The model is boring on purpose: rows stay in tables, graph and vector
+access paths attach to the same catalog. For this benchmark, boring is
+fast.
 
 ## More than one result
 
@@ -108,20 +109,22 @@ On the same benchmark family:
 
 These are the workloads that matter when an application needs to filter, count, and explore connected data before doing higher-level ranking or analysis.
 
-## Why this matters for a multimodal database
+## Implications for a multimodal database
 
-The database market has been split into separate boxes:
+The market is split into separate boxes:
 
 - PostgreSQL for relational data.
 - Neo4j or SurrealDB for graph-shaped data.
 - pgvector or a vector database for embeddings.
 - DuckDB for local analytics.
 
-That split creates real engineering cost. Data gets copied. Permissions drift. Indexes disagree. Pipelines break. RAG quality suffers because the vector result is detached from the actual business graph.
+That split costs engineering time. Data gets copied. Permissions drift.
+Indexes disagree. Pipelines break. RAG quality suffers when the vector
+result is detached from the business graph that produced it.
 
-AionDB’s bet is different: one local engine for SQL, graph, and vector search.
-
-That is why the phrase “multimodal embedded database” matters. AionDB is not trying to make developers choose between relational correctness, graph relationships, and vector retrieval. It is building toward one database surface where those workloads can meet.
+AionDB takes the other bet: one local engine for SQL, graph, and vector
+search. Relational correctness, graph relationships, and vector
+retrieval sit on the same catalog instead of three separate services.
 
 ## Reproduce the benchmark
 

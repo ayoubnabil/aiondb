@@ -1,14 +1,14 @@
 //! Real persistent compact graph projection.
 //!
 //! The rest of this crate is catalog *metadata*; this is the actual store.
-//! A [`PersistentGraphProjection`] owns the compact CSR topology, serialises
-//! to a single binary blob (so a projection survives process restarts
-//! instead of being rebuilt from the row store on every query), and exposes
-//! [`GraphViewV2`] directly -- algorithms execute straight on it with **no
-//! in-memory adjacency rebuild**.
+//! [`PersistentGraphProjection`] owns the compact CSR topology, serialises
+//! to a single binary blob so a projection survives process restarts
+//! instead of being rebuilt from the row store on every query, and exposes
+//! [`GraphViewV2`] directly -- algorithms execute straight on it with no
+//! in-memory adjacency rebuild.
 //!
-//! This is the foundation that lets the engine keep large named graphs
-//! resident/persisted the way Neo4j's in-memory catalog does, but durable.
+//! Lets the engine keep large named graphs resident/persisted the way
+//! Neo4j's in-memory catalog does, but durable.
 
 use std::collections::BTreeMap;
 

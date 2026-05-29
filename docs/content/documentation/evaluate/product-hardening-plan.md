@@ -37,4 +37,4 @@ This plan converts broad evaluation concerns into repository-level work. It is i
 
 ## Review Rule
 
-If a claim cannot point to a command, a test, a doc page, or a fixture, treat it as roadmap language. This keeps marketing, engineering, and investor-facing material aligned with the actual product surface.
+If a claim cannot point to a command, a test, a doc page, or a fixture, treat it as roadmap language. That keeps marketing, engineering, and investor-facing material aligned with what AionDB actually ships.

@@ -1,9 +1,9 @@
 //! Stable contracts for the distributed AionDB split.
 //!
-//! This module is intentionally interface-only. It gives the frontend,
-//! planner, shard engine, transaction coordinator, and fragment transport a
-//! shared vocabulary without making the current single-process engine depend
-//! on a concrete network, Raft, or storage implementation.
+//! Interface-only. Shared vocabulary for the frontend, planner, shard
+//! engine, transaction coordinator and fragment transport. No concrete
+//! network, Raft or storage implementation lives here, so the
+//! single-process engine stays free of those dependencies.
 
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc)]
 

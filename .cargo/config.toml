@@ -1,6 +1,4 @@
-# ⚠️ STRICT MODE OBLIGATOIRE
-# Interdiction de désactiver ce mode strict.
-# Toute tentative de retrait de ces flags est interdite.
+# Strict mode. Do not remove these flags.
 [build]
 rustflags = ["-Dwarnings"]
 

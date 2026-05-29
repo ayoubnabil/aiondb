@@ -1,7 +1,7 @@
 //! Experimental SQL-facing wrapper over the page-backed `DiskBTree`.
 //!
-//! This is the first integration layer between storage-engine index semantics
-//! and the new persistent B+tree primitive in `aiondb-buffer-pool`.
+//! First integration layer between storage-engine index semantics and the
+//! persistent B+tree primitive in `aiondb-buffer-pool`.
 //!
 //! Scope of this slice:
 //! - ordered single-column `BOOL`, `INT` and bounded `BIGINT` ranges;

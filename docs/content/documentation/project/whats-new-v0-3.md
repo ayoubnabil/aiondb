@@ -5,9 +5,9 @@ order: 88
 
 # What's New in v0.3
 
-AionDB v0.3 is the vector update. It turns vector search from a feature checkbox into a first-class product surface: pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered retrieval, PostgreSQL ecosystem compatibility, and reproducible vector benchmarks all land in the same release line.
+v0.3 is the vector update. It adds pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered retrieval, PostgreSQL ecosystem compatibility work, and a reproducible vector benchmark harness.
 
-The message is direct: AionDB now gives application builders one engine for relational records, graph relationships, and semantic retrieval. The vector stack lives beside the SQL catalog and graph model instead of forcing the application to split data between a database, a graph service, and a separate vector store.
+Rows, graph edges, and embeddings now sit in the same catalog. Applications no longer need a separate vector store or graph service next to the SQL database to support these workloads.
 
 > New in v0.3: pgvector-facing SQL, two ANN index families, Qdrant-style filtered vector helpers, and benchmarked recall/latency numbers from the repository.
 

@@ -48,7 +48,7 @@ aiondb-fragment-transport = { path = "../aiondb-fragment-transport" }
 # === Cluster-level catalog (ADR-0014) ===
 aiondb-cluster = { path = "../aiondb-cluster" }
 
-# === PG compatibility façade ===
+# === PG compatibility facade ===
 aiondb-pg-compat = { path = "../aiondb-pg-compat" }
 
 # === Third-party ===

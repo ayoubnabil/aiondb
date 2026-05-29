@@ -7,15 +7,10 @@
 //! 3. Publishes closed timestamps via the [`ClosedTimestampTracker`]
 //!    so followers can serve stale reads.
 //!
-//! This module provides the background loop that does (2) and (3) for
-//! a single shard. Callers spawn one loop per shard the local node
-//! holds a lease on; the loop exits when the lease is preempted
-//! (either by another node taking it, or because the holder calls
-//! [`LeaseholderHandle::demote`]).
-//!
-//! Keeping the loop in its own module makes the lifecycle easy to
-//! reason about and easy to test independently of the rest of the
-//! cluster runtime.
+//! The background loop here does (2) and (3) for a single shard.
+//! Callers spawn one loop per shard the local node holds a lease on;
+//! the loop exits when the lease is preempted -- either by another node
+//! taking it, or because the holder calls [`LeaseholderHandle::demote`].
 
 use std::time::{Duration, Instant as StdInstant};
 

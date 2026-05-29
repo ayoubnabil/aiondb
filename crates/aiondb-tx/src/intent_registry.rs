@@ -9,7 +9,7 @@
 //! - Owning txn aborted → garbage-collect, skip the intent.
 //! - Owning txn pending → wait, push, or abort according to priority.
 //!
-//! This module provides the in-memory side of that bookkeeping: a
+//! The in-memory side of that bookkeeping lives here: an
 //! [`IntentRegistry`] mapping each `(range, key)` to its current
 //! [`Intent`]. The durable side lives in storage; the registry exists
 //! so reads and writes on the same node can resolve intents without a

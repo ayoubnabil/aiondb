@@ -327,7 +327,7 @@ pub enum DistinctKind {
     DistinctOn(Vec<Expr>),
 }
 
-/// Represents a structured GROUP BY item, preserving ROLLUP/CUBE/GROUPING SETS
+/// Structured GROUP BY item that preserves ROLLUP/CUBE/GROUPING SETS
 /// semantics instead of flattening them into plain expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupByItem {

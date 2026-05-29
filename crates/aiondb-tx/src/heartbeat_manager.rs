@@ -8,16 +8,15 @@
 //! `expiration` window. A separate reaper task scans the registry,
 //! aborts every expired record, and frees its intents.
 //!
-//! This module provides both halves:
+//! Both halves live here:
 //!
 //! - [`HeartbeatHandle`] keeps a single live coordinator's record warm
 //!   until dropped.
 //! - [`OrphanReaper`] runs on every node and aborts records whose
 //!   coordinator stopped heartbeating.
 //!
-//! The two are independent : a coordinator only ever needs the
-//! heartbeat handle for its own txns; the reaper is a cluster-wide
-//! janitor.
+//! The two are independent. A coordinator only ever needs the heartbeat
+//! handle for its own txns; the reaper is a cluster-wide janitor.
 
 use std::sync::Arc;
 use std::time::Duration;

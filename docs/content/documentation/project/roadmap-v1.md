@@ -271,7 +271,10 @@ The v0.4 target is to make relational execution credible against PostgreSQL on p
 
 ## v0.5 — Distributed SQL challenge
 
-The v0.5 target is to make AionDB a credible distributed SQL system, not only a local engine with networking. The benchmark and correctness pressure should be CockroachDB/Yugabyte-style: serializable behavior, shard movement, replica failure, node loss, rejoin, and observable recovery.
+v0.5 takes AionDB from a local engine with networking to a distributed
+SQL system. Benchmark and correctness pressure is CockroachDB/Yugabyte
+style: serializable behaviour, shard movement, replica failure, node
+loss, rejoin, observable recovery.
 
 ### Sharding and placement
 
@@ -397,7 +400,10 @@ The v0.7 target is to make failures uneventful. After the graph, SQL, distribute
 
 ## v0.8 — High availability
 
-The v0.8 target is to turn the distributed engine into an operator-facing HA system. The goal is not just to have replicas; it is to survive leader loss, stale primaries, client reconnects, rolling maintenance, and replica promotion with a documented contract.
+v0.8 turns the distributed engine into an operator-facing HA system.
+Replicas alone are not enough; v0.8 has to survive leader loss, stale
+primaries, client reconnects, rolling maintenance, and replica
+promotion, with the contract written down.
 
 ### Replication
 
@@ -478,7 +484,7 @@ The v0.8 target is to turn the distributed engine into an operator-facing HA sys
 
 ### Connection management
 
-- Built-in connection pool with documented sizing guidance, or first-class PgBouncer guidance.
+- Built-in connection pool with documented sizing guidance, or supported PgBouncer guidance.
 - `idle_in_transaction_session_timeout`, `statement_timeout`, `lock_timeout` honored.
 
 ### Kubernetes

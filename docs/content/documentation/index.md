@@ -25,7 +25,7 @@ Crate-by-crate implementation notes live in [Advanced Specification](/specificat
 
 ## v0.3 At A Glance
 
-v0.3 is the release where vector search becomes a major AionDB product surface:
+v0.3 ships the vector stack:
 
 - HNSW raw reaches `0.996` recall@10 in the default vector benchmark.
 - HNSW PQ reaches `0.994` recall@10.

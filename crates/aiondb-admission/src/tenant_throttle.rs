@@ -4,10 +4,9 @@
 //! tenant cannot starve the others. Tenants are isolated by
 //! (tenant_id, priority) ; admission decisions consult both.
 //!
-//! In a sharded deployment the tenant bucket "lives" on the node
-//! hashing of `tenant_id` — but this module provides only the local
-//! state, which is enough for nodes that already shard their
-//! workload before reaching admission.
+//! In a sharded deployment the tenant bucket lives on the node hashing
+//! `tenant_id`. Only the local state is kept here; that is enough for
+//! nodes that already shard their workload before reaching admission.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

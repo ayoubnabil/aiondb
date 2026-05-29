@@ -1,10 +1,9 @@
 //! Row-level lock table for the storage engine.
 //!
-//! This module provides the per-row and per-table lock infrastructure that
-//! enables concurrent DML operations in the storage engine. It complements
-//! the session-level `WaitGraphLockManager` (in `aiondb-tx`) by adding a
+//! Per-row and per-table locks used by concurrent DML. Complements the
+//! session-level `WaitGraphLockManager` (in `aiondb-tx`) by adding a
 //! storage-internal lock table that coordinates access to committed state
-//! during split-phase DML operations.
+//! during split-phase DML.
 //!
 //! # Split-Phase DML
 //!

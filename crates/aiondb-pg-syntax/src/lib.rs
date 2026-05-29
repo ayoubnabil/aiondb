@@ -1,7 +1,7 @@
 //! Pure SQL scanning/parsing helpers for PostgreSQL-compatible syntax.
 //!
-//! This crate intentionally stays engine-agnostic so compatibility logic can
-//! evolve and be tested without coupling to engine/session internals.
+//! Engine-agnostic so compatibility logic can evolve and be tested without
+//! coupling to engine/session internals.
 
 #![allow(
     clippy::assigning_clones,

@@ -1,8 +1,8 @@
 //! Embedded Rust API for AionDB.
 //!
-//! This crate provides a synchronous in-process facade around `aiondb-engine`.
-//! It is intended for applications that want to embed the database without
-//! speaking PostgreSQL wire protocol.
+//! Synchronous in-process facade around `aiondb-engine`, for applications
+//! that embed the database without going through the PostgreSQL wire
+//! protocol.
 //!
 //! # Quick example
 //!

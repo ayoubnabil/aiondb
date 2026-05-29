@@ -8,19 +8,24 @@ order: 2
 
 # Multimodal database for SQL, graph, and vector search
 
-AionDB is a multimodal database, also known as a multi-model database, designed to keep relational data, graph relationships, and vector embeddings in one Rust engine.
+AionDB is a multimodal (multi-model) database in Rust. Relational data,
+graph relationships, and vector embeddings live in one engine.
 
-The practical goal is to avoid copying the same application data into a SQL database, a graph database, and a vector database when the product needs hybrid queries.
+The point is to stop copying the same application data into a SQL
+database, a graph database, and a vector database whenever a query
+needs all three.
 
 ## Why a multimodal database?
 
-Modern applications often need several data shapes at once:
+Many applications need several data shapes at once:
 
-- tables for users, documents, tickets, products, events, and business state;
-- graph relationships for exploring connections between those records;
-- vectors for semantic search, recommendations, RAG, and private AI assistants.
+- tables for users, documents, tickets, products, events, business state;
+- graph edges for connections between those records;
+- vectors for semantic search, recommendations, RAG, AI assistants.
 
-AionDB exposes those models through one PostgreSQL-compatible system. Tables stay the source of truth, while graph and vector queries can operate over the same records.
+AionDB exposes the three through one PostgreSQL-compatible engine.
+Tables remain the source of truth. Graph and vector queries operate
+over the same rows.
 
 ## Hybrid queries
 
@@ -36,14 +41,21 @@ ORDER BY distance ASC
 LIMIT 5;
 ```
 
-This is useful for knowledge bases, product catalogs, support tooling, private copilots, and applications that need both structured business context and semantic retrieval.
+Useful for knowledge bases, product catalogs, support tooling, private
+copilots, and any application that needs structured business context
+alongside semantic retrieval.
 
 ## PostgreSQL-compatible tooling
 
-AionDB speaks the PostgreSQL wire protocol. The goal is to preserve a familiar developer workflow with `psql`, pgAdmin, migrations, ORMs, and standard drivers when the required features are compatible.
+AionDB speaks the PostgreSQL wire protocol so `psql`, pgAdmin,
+migrations, ORMs, and standard drivers keep working when the features
+they touch are supported.
 
 ## Project status
 
-AionDB is alpha software. It does not claim to replace PostgreSQL in production today. The narrower claim is that it gives teams an experimental engine for evaluating a multimodal database that combines SQL, graph, and vector search without adding multiple separate services.
+AionDB is alpha software. It does not replace PostgreSQL in production
+today. The narrower claim: it gives teams an engine for evaluating a
+multimodal database that combines SQL, graph, and vector search without
+running three separate services next to each other.
 
 Start with the [documentation](/documentation/) and the [reproducible benchmarks](/documentation/evaluate/benchmarks.html).

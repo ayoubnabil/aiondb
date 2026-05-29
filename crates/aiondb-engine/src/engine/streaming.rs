@@ -2,15 +2,13 @@
 
 //! Streaming replication integration for the `AionDB` engine.
 //!
-//! This module provides the engine-level components for WAL-based streaming
-//! replication:
+//! Engine-level components for WAL-based streaming replication:
 //!
 //! - [`StreamingReplicationState`] holds the shared state needed by both the
 //!   primary (WAL sender infrastructure) and replica (WAL receiver + replay
-//!   loop) sides of the replication protocol.
-//! - [`ReplicationManager`] coordinates the lifecycle of replication
-//!   connections and provides the interface between the pgwire layer and
-//!   the storage engine.
+//!   loop) sides of the protocol.
+//! - [`ReplicationManager`] drives the lifecycle of replication connections
+//!   and is the interface between the pgwire layer and the storage engine.
 //!
 //! # Primary mode
 //!

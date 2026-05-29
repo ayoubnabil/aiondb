@@ -11,12 +11,11 @@
 //! - **Aborted** : the intent is garbage-collected.
 //! - **Pending** : the reader must either wait or push the writer.
 //!
-//! This module implements the in-memory side of that bookkeeping: a
+//! The in-memory side of that bookkeeping lives here: a
 //! [`DistributedTxnRegistry`] mapping each [`DistributedTxnId`] to its
 //! current [`DistributedTxnRecord`]. The durable side belongs to the
 //! storage / replication layer; the registry exists so all nodes can
-//! agree on the live state without consulting the disk on every
-//! check.
+//! agree on the live state without consulting the disk on every check.
 //!
 //! # State machine
 //!

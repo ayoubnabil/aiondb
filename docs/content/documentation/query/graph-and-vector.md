@@ -5,7 +5,7 @@ order: 40
 
 # Graph and Vector
 
-AionDB includes graph and vector features in the same engine as SQL. The goal is to make hybrid queries possible without duplicating application state into a separate graph or vector store.
+Graph and vector features run in the same engine as SQL. Hybrid queries do not need a separate graph or vector store for application state.
 
 ## Graph model
 
@@ -32,13 +32,13 @@ The current alpha model is explicit. If a relationship is stored in a backing ta
 
 ## Why graph labels are catalog objects
 
-The important design choice is that labels describe tables instead of creating a separate graph store. A row remains a row. A node label says that rows from a table can be addressed as graph nodes. An edge label says that rows from another table can be interpreted as relationships.
+Labels describe tables. They do not create a separate graph store. A row is still a row. A node label says rows from a table can be addressed as graph nodes. An edge label says rows from another table can be read as relationships.
 
-That keeps SQL as the fallback and correctness reference. If a graph query is unclear, the equivalent SQL join should still be possible.
+SQL stays as the fallback and correctness reference. If a graph query is unclear, the equivalent SQL join should still work.
 
 ## Edge labels on existing relational columns
 
-AionDB is moving toward edge labels that can point at existing foreign-key-style columns instead of requiring duplicate edge tables. The intended model is:
+Edge labels are moving toward pointing at existing foreign-key-style columns instead of requiring duplicate edge tables. The intended model:
 
 ```sql
 CREATE TABLE tickets (
@@ -54,9 +54,9 @@ CREATE EDGE LABEL handled_by ON tickets
     TARGET Employee KEY (assigned_to);
 ```
 
-That design keeps the relational column as the source of truth while still enabling graph traversal.
+The relational column stays the source of truth. Graph traversal works against it directly.
 
-This matters because duplicate edge tables create application friction. If `tickets.assigned_to` is already the true relationship, forcing the application to also maintain a `ticket_employee_edges` table introduces write duplication, triggers, or eventual inconsistency.
+Duplicate edge tables create application friction. If `tickets.assigned_to` is already the relationship, forcing a `ticket_employee_edges` table introduces write duplication, triggers, or eventual inconsistency.
 
 Check the graph reference and parser support before relying on endpoint mapping syntax in a release. The architectural direction is clear, but public syntax should match the current binary.
 
@@ -76,7 +76,7 @@ The remaining alpha boundaries are mostly compatibility and evidence work: broad
 
 ## Vector data
 
-Vector functions and indexes are intended for embeddings stored beside application records. A typical workload starts from a vector predicate or nearest-neighbor ordering, then joins or traverses to related records.
+Vector functions and indexes handle embeddings stored beside application records. A typical workload starts from a vector predicate or nearest-neighbor ordering, then joins or traverses to related records.
 
 Example shape:
 
@@ -113,18 +113,11 @@ ORDER BY dist ASC
 LIMIT 10;
 ```
 
-This shape is important because filtering can change the best plan. The engine may need to decide between filtering first and scoring fewer vectors, or using a vector index first and filtering the candidate set afterward.
+Filtering can change the best plan. The engine may filter first and score fewer vectors, or use a vector index first and filter the candidate set afterward.
 
 ## Hybrid queries
 
-The target is a single plan that can combine:
-
-- selective SQL predicates;
-- graph traversal;
-- vector similarity;
-- ordinary joins and projections.
-
-Validate hybrid graph/vector support on the exact workload you care about and read query plans when comparing behavior.
+A single plan should combine selective SQL predicates, graph traversal, vector similarity, and ordinary joins/projections. Validate hybrid graph/vector support on your workload and read the plans when comparing behavior.
 
 ## Correctness strategy
 

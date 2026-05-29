@@ -6,9 +6,9 @@
 //! applied state has advanced past those timestamps; reads on other
 //! shards are unaffected.
 //!
-//! This module provides the data structure and the merge / wait
-//! semantics. Storage hooks plug in via the closed-timestamp tracker
-//! (read waits for `closed_ts >= causality(shard)`).
+//! Below: the data structure and the merge / wait semantics. Storage
+//! hooks plug in via the closed-timestamp tracker (read waits for
+//! `closed_ts >= causality(shard)`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -6,7 +6,7 @@
 //! new commit ts. If any span has been re-read at a conflicting ts,
 //! the txn restarts. Otherwise the commit proceeds at the bumped ts.
 //!
-//! This module provides the bookkeeping and the verification routine.
+//! Bookkeeping and the verification routine.
 
 use std::sync::Arc;
 

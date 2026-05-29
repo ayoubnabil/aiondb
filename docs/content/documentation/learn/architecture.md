@@ -20,16 +20,19 @@ client
   -> catalog, transaction layer, storage engine, WAL
 ```
 
-The important product decision is that server mode and embedded mode are intended to converge on the same engine behavior. A query should not mean one thing over pgwire and another thing in-process.
+Server mode and embedded mode converge on the same engine behaviour. A
+query must not mean one thing over pgwire and another thing in-process.
 
-## Public surfaces
+## Public interfaces
 
-AionDB exposes two product surfaces:
+There are two:
 
-- server mode, where applications connect over PostgreSQL wire protocol;
+- server mode, where applications connect over the PostgreSQL wire protocol;
 - embedded Rust mode, where an application links the engine and executes in-process.
 
-Server mode is the right surface for testing drivers, ORMs, network behavior, authentication, and operational settings. Embedded mode is the right surface for local applications that want database behavior without a separate server process.
+Use server mode to test drivers, ORMs, network behaviour, authentication,
+and operational settings. Use embedded mode for local applications that
+want database behaviour without a separate server process.
 
 Both paths should eventually share parser, binder, planner, executor, catalog, storage, and transaction behavior. When a divergence is found, document it as a compatibility issue instead of treating it as expected behavior.
 

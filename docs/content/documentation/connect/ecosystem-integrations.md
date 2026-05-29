@@ -5,9 +5,9 @@ order: 56
 
 # Ecosystem Integrations
 
-AionDB should feel like a PostgreSQL-facing database before it asks users to learn AionDB-specific features. The integration strategy is therefore pgwire first, then AionDB extensions for graph and vector workflows.
+Integration is pgwire first, then AionDB extensions for graph and vector workflows. Users connect through PostgreSQL tooling before learning anything AionDB-specific.
 
-> New in v0.3: the PostgreSQL ecosystem path now includes a stronger vector surface with pgvector-style SQL, catalog-facing vector helpers, and Qdrant-style filtered retrieval. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
+> New in v0.3: the PostgreSQL ecosystem path includes a wider vector surface with pgvector-style SQL, catalog-facing vector helpers, and Qdrant-style filtered retrieval. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 ## Current Public Integrations
 
@@ -43,13 +43,13 @@ For every driver or ORM, record:
 
 ## Native Extension Surfaces
 
-AionDB-specific graph and vector features should remain visible, but they should not block basic PostgreSQL tooling. The dashboard and docs can provide snippets, graph previews, and capability metadata while generic SQL clients keep working through pgwire.
+AionDB-specific graph and vector features stay visible. They must not block basic PostgreSQL tooling. The dashboard and docs carry snippets, graph previews, and capability metadata while generic SQL clients keep working through pgwire.
 
 ## Neo4j Ecosystem Target
 
-AionDB also has a separate graph-compatibility goal: be credible against a small, explicit subset of the Neo4j ecosystem.
+The separate graph-compatibility goal is to be credible against a small, explicit subset of the Neo4j ecosystem.
 
-That goal should stay narrow and evidence-based:
+Keep that goal narrow and evidence-based:
 
 - validate real tools, not only protocol fragments;
 - keep Bolt and Query API claims separate;
@@ -92,7 +92,7 @@ Bad claim:
 
 - "AionDB is compatible with the Neo4j ecosystem."
 
-The second claim is too broad unless the repository can point to reproducible tool-level smoke results and known limitations for each named tool.
+The second claim is too broad without reproducible tool-level smoke results and known limitations for each named tool.
 
 ### Evidence rule
 
@@ -149,9 +149,9 @@ That wave is enough to test:
 - Bolt auth and session behavior;
 - real Cypher/Bolt CLI interoperability.
 
-Browser should come immediately after, because it exposes metadata and graph-result gaps that driver-only smokes can miss.
+Browser should come next. It exposes metadata and graph-result gaps that driver-only smokes miss.
 
-The current repo now has one intermediate step before full Browser validation:
+One intermediate step exists before full Browser validation:
 
 - a Browser-oriented Bolt preflight smoke for the compatibility procedures Browser typically expects;
 - this proves the server-side preflight contract;
@@ -390,4 +390,4 @@ Known limitations in the current HTTP wrapper:
 
 ## Claiming Support
 
-Do not mark an ecosystem surface as supported because it connects once. Mark it supported only when the application path has a reproducible smoke test and a known limitations section.
+A connection that works once is not support. Mark a surface supported only when the application path has a reproducible smoke test and a known limitations section.

@@ -1,7 +1,7 @@
 //! Core shared types for `AionDB`.
 //!
-//! This crate contains runtime values, identifiers, SQLSTATE-aware errors,
-//! and small cross-cutting helpers used across parser/planner/executor/storage.
+//! Runtime values, identifiers, SQLSTATE-aware errors, and small
+//! cross-cutting helpers used across parser/planner/executor/storage.
 //!
 //! # Example
 //!

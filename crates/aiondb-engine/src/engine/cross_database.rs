@@ -2,18 +2,14 @@
 
 //! ADR-0014 phase 5: rejection of cross-database references.
 //!
-//! object that lives in another database. AionDB inherits this rule: if
-//! a `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE` / `DROP`
-//! mentions a three-part `ObjectName` (`db.schema.table`) whose first
-//! component differs from the session's active database, return
-//! `InvalidSchemaName` (3F000) with an explicit message.
+//! Statements (`SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE` / `DROP`)
+//! mentioning a three-part `ObjectName` (`db.schema.table`) whose first
+//! component differs from the session's active database return
+//! `InvalidSchemaName` (3F000).
 //!
-//! This module is intentionally a **static checker, not a binder**: it
-//! only looks at the main targets of statements (the FROM table and the
-//! INSERT / UPDATE / DELETE / CREATE / DROP target). Exhaustive
-//! inspection of every sub-expression (FROM subqueries, CTEs, JOINs,
-//! etc.) is binder work (phase 5.5); the static checker covers 95% of
-//! cases and clearly rejects first-order cross-db query attempts.
+//! Static checker, not a binder: only the main statement targets are
+//! inspected (FROM table, INSERT / UPDATE / DELETE / CREATE / DROP target).
+//! Subqueries, CTEs and JOINs are left to the binder (phase 5.5).
 
 use aiondb_core::{DbError, DbResult, SqlState};
 use aiondb_parser::{ObjectName, Statement};

@@ -1,12 +1,12 @@
 //! Page-backed variable-length ordered index prototype.
 //!
-//! This is the first storage primitive toward PostgreSQL-style variable-length
-//! index keys. It intentionally starts with a sorted leaf chain and bulk-load
-//! support rather than a mutable multi-level tree. It now also supports online
-//! leaf-chain inserts, deletes and leaf splits. That gives the storage layer a
-//! durable page format for full-width `TEXT`/`UUID`/composite keys before we add
-//! fully incremental internal-page splits, leaf merge/rebalance and page-level
-//! WAL redo.
+//! First storage primitive toward PostgreSQL-style variable-length index
+//! keys. Starts with a sorted leaf chain and bulk-load support rather than
+//! a mutable multi-level tree, and now also supports online leaf-chain
+//! inserts, deletes and leaf splits. Gives the storage layer a durable
+//! page format for full-width `TEXT`/`UUID`/composite keys before fully
+//! incremental internal-page splits, leaf merge/rebalance and page-level
+//! WAL redo land.
 
 #![allow(clippy::missing_errors_doc)]
 

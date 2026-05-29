@@ -9,11 +9,10 @@
 //!   T2 (node B) holds key Y, waits for key X on node A.
 //! ```
 //!
-//! Neither node sees the cycle locally. This module implements a
+//! Neither node sees the cycle locally. The detector here keeps a
 //! global wait-for graph that participating nodes feed into, plus a
-//! cycle detector that runs periodically. When a cycle is found, the
-//! lowest-priority transaction in it is selected as the victim and
-//! aborted.
+//! cycle scan that runs periodically. When a cycle is found, the
+//! lowest-priority transaction in it is the victim and gets aborted.
 //!
 //! The graph is intentionally **eventually consistent** -- nodes push
 //! their local edges into the detector on a cadence so we never

@@ -3,63 +3,74 @@ title: Presentation
 order: 1
 ---
 
-# Presentation
+Presentation
+============
 
-AionDB is a Rust database project built around a simple product thesis: relational data, graph relationships, and vector similarity should be queryable through one engine without forcing the application to keep three separate systems in sync.
+AionDB is a Rust database. It speaks the PostgreSQL wire protocol and
+exposes a Rust embedded API for in-process use. Rows live on disk in the
+storage engine. Graph labels and vector columns sit on top of the same
+catalog.
 
-It exposes a PostgreSQL-compatible wire surface for existing tools and a Rust embedded API for applications that want the engine in-process.
 
-## Design goals
+Scope
+-----
 
-- Keep one canonical execution path for server and embedded usage.
-- Speak enough PostgreSQL wire protocol to work with real clients and drivers.
-- Make SQL the stable base, then add graph and vector primitives around the same catalog and storage.
-- Prefer explicit errors over silent compatibility tricks.
-- Keep the internal architecture inspectable by separating parser, planner, optimizer, executor, storage, catalog, and WAL responsibilities.
+AionDB is alpha. The v0.1 release is meant for technical evaluation:
 
-## Product thesis
+* trying the query model;
+* checking PostgreSQL wire behaviour with real clients;
+* embedded use from Rust;
+* running the local benchmarks;
+* reading the internals.
 
-The product thesis is not "one database wins every benchmark." The thesis is that many application teams already maintain the same logical dataset in several systems:
+It is not meant for production data, hosted multi-tenant service, or
+compatibility-sensitive migrations from PostgreSQL.
 
-- PostgreSQL for relational state;
-- a graph database or application-level edge tables for relationships;
-- a vector database or extension for embeddings;
-- custom glue code to keep them consistent.
 
-AionDB asks whether that combination can be made simpler by starting from one SQL engine and adding graph/vector access around the same catalog and storage model.
+Design notes
+------------
 
-## What makes it different
+* One execution path serves both the server and the embedded API.
+* SQL is the stable base. Graph and vector access paths reuse the same
+  catalog and storage.
+* Speak enough PostgreSQL wire protocol to work with real drivers. Do
+  not pretend to be PostgreSQL beyond that.
+* Return an explicit error rather than silently emulating a feature that
+  is not implemented.
+* The pipeline is split into parser, planner, optimizer, executor,
+  storage, catalog, and WAL. Each stage is replaceable.
 
-AionDB is not trying to be a PostgreSQL fork. It is a new engine with PostgreSQL-facing compatibility where that helps adoption. The long-term bet is a unified query system for application data that naturally mixes tables, relationships, and embeddings.
 
-That tradeoff matters. AionDB will not beat mature specialized engines on every workload. PostgreSQL remains stronger for broad SQL compatibility and operational maturity. DuckDB remains stronger for columnar analytics. Dedicated graph engines remain stronger on deep graph traversal. The reason to evaluate AionDB is the combined surface, not a claim that every subsystem is already best in class.
+What AionDB is not
+------------------
 
-## v0.1 scope
+AionDB is not a PostgreSQL fork. It will not match PostgreSQL on broad
+SQL compatibility or operational maturity. It will not match DuckDB on
+columnar analytics. It will not match a dedicated graph engine on deep
+traversal workloads. Evaluate AionDB only if you actually need rows,
+graph edges, and vectors in the same engine; otherwise use the
+specialised tool.
 
-The v0.1 release is an alpha intended for technical evaluation. It is appropriate for:
 
-- testing the query model;
-- validating PostgreSQL wire behavior with clients;
-- experimenting with embedded usage;
-- running local benchmarks;
-- reviewing the internals.
+Reporting issues
+----------------
 
-It is not yet positioned for production data, hosted multi-tenant service operation, or compatibility-sensitive database migrations.
+A useful bug report or benchmark result includes:
 
-## Evaluation standard
+* commit hash;
+* server command and configuration;
+* client or driver version;
+* schema and data volume;
+* the exact query text;
+* durability settings;
+* raw output.
 
-A useful evaluation should include:
+A reduced script that reproduces the behaviour is worth more than any
+amount of prose.
 
-- the exact commit;
-- the server command;
-- client or driver version;
-- schema and data volume;
-- query text;
-- durability settings;
-- raw output.
 
-The most useful feedback is a reduced script that proves a behavior difference, performance issue, or documentation gap.
+Where to read next
+------------------
 
-## Documentation map
-
-Start with [Documentation](/documentation/) for user-facing setup and concepts. Use [Advanced Specification](/specification-avancee/) for crate-level design notes and implementation details.
+* User-facing setup and concepts: [Documentation](/documentation/).
+* Crate-level design notes: [Advanced Specification](/specification-avancee/).

@@ -19,8 +19,8 @@ use tracing::info;
 
 use super::streaming::StreamingReplicationState;
 
-/// Handles failover events by driving role transitions on the engine's
-/// streaming replication state, and manages the Raft consensus node for
+/// Drives role transitions on the streaming replication state in response
+/// to failover events, and owns the Raft consensus node used for
 /// distributed metadata coordination.
 pub struct HaIntegration {
     replication_state: Arc<StreamingReplicationState>,

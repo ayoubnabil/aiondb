@@ -1,8 +1,7 @@
 //! Buffer pool / page cache for `AionDB`.
 //!
-//! This crate provides the foundational infrastructure for managing
-//! fixed-size pages in memory, with clock-sweep eviction, dirty page
-//! tracking, and pluggable persistent storage via the [`PageStore`] trait.
+//! Fixed-size pages, clock-sweep eviction, dirty-page tracking, pluggable
+//! persistent storage via the [`PageStore`] trait.
 //!
 //! # Overview
 //!

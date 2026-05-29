@@ -1,7 +1,7 @@
 //! Public stable interfaces for AionDB.
 //!
-//! This crate is intended for external consumers (facades, tooling, tests)
-//! that need a stable contract without depending on engine internals.
+//! Stable contract for external consumers (facades, tooling, tests) that
+//! must not depend on engine internals.
 //!
 //! # Design goals
 //!

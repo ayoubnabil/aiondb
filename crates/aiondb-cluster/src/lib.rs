@@ -1,6 +1,6 @@
 //! Multi-catalog + multi-storage cluster layer - ADR-0014.
 //!
-//! This crate defines AionDB's **cluster-level** contracts:
+//! Cluster-level contracts:
 #![allow(
     clippy::cast_possible_truncation,
     clippy::doc_markdown,

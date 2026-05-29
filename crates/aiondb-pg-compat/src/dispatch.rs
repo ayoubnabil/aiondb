@@ -1,9 +1,8 @@
 //! Dispatch facade for PostgreSQL compatibility hooks.
 //!
-//! This module defines the **contract** the engine must implement to act as
-//! a host for the compat layer. The signatures preserve the historical
-//! contract of the old hooks that lived in
-//! `crates/aiondb-engine/src/engine/compat/mod.rs`, without forcing the old
+//! Defines the contract the engine implements to host the compat layer.
+//! Signatures preserve the historical contract of the old hooks that lived
+//! in `crates/aiondb-engine/src/engine/compat/mod.rs`, without the old
 //! `try` prefix on new implementations.
 //!
 //! Objectives:

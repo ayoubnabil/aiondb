@@ -290,7 +290,8 @@ pub fn betweenness_centrality_normalized<G: GraphViewV2 + ?Sized>(
 /// `sum_of_distances` is the sum of shortest-path distances from `v` to all
 /// reachable nodes. If `v` can reach no other node, its closeness is 0.
 ///
-/// This is the "harmonic" variant that handles disconnected graphs gracefully.
+/// This is the "harmonic" variant; isolated nodes get closeness 0
+/// instead of triggering a divide-by-zero.
 ///
 /// # Time complexity
 ///

@@ -29,7 +29,7 @@ It is also a forcing function. Real drivers expose protocol edge cases quickly: 
 
 ## Why combine SQL, graph, and vector?
 
-Many application workloads keep relational records, relationships, and embeddings side by side. AionDB is built around the idea that those should be queryable from one engine and one catalog.
+Many application workloads keep relational records, relationships, and embeddings side by side. AionDB queries all three from one engine and one catalog, so the same row does not have to be replicated into a graph database and a vector database.
 
 The target is not to replace every specialized database immediately. The target is to reduce duplicate state for hybrid workloads where a row also has relationships and an embedding.
 

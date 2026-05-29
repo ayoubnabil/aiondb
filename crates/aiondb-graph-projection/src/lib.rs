@@ -1,7 +1,7 @@
 //! Persistent graph projection metadata and catalog contracts.
 //!
-//! This crate is the landing zone for the future projection engine that will
-//! own named graph snapshots, refresh state, and graph-to-ordinal mappings.
+//! Landing zone for the future projection engine that owns named graph
+//! snapshots, refresh state, and graph-to-ordinal mappings.
 
 #![allow(
     clippy::missing_errors_doc,

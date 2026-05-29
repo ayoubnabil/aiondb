@@ -5,13 +5,7 @@ order: 72
 
 # v0.2 Performance Snapshot
 
-This page is the short, product-facing performance snapshot for v0.2.
-
-It is intentionally narrower than a full benchmark dashboard:
-
-- it uses named local benchmark artifacts from this repository;
-- it keeps graph-vs-Neo4j separate from the broader SurrealDB/pgstack matrix;
-- it does **not** collapse every workload into one winner number.
+A short performance snapshot for v0.2. Narrower than a full benchmark dashboard: named local artifacts, graph-vs-Neo4j kept separate from the SurrealDB/pgstack matrix, no single winner number across workloads.
 
 If you want the full benchmark machinery, use:
 
@@ -55,7 +49,7 @@ results.
 
 ## Graph vs Neo4j
 
-The current v0.2 graph snapshot is strong on core traversals and graph scans.
+The v0.2 graph snapshot favors AionDB on core traversals and graph scans.
 
 All representative queries below kept **result parity = true**.
 
@@ -72,18 +66,11 @@ All representative queries below kept **result parity = true**.
 
 ### Read this correctly
 
-This is not a claim that AionDB beats Neo4j on every graph workload.
-
-It is a precise claim:
-
-- on this pinned local graph workload,
-- with this dataset shape,
-- with this exact harness,
-- AionDB is ahead on the measured traversal and shortest-path shapes in this snapshot.
+This is not a claim that AionDB beats Neo4j on every graph workload. It is a narrow claim: on this pinned local graph workload, with this dataset, with this harness, AionDB is ahead on the measured traversal and shortest-path shapes.
 
 ## Broader matrix vs SurrealDB and pgstack
 
-The broader matrix is mixed, which is exactly why this page keeps it separate.
+The broader matrix is mixed, which is why this page keeps it separate.
 
 Fresh CRUD snapshot from `surreal-suite`:
 
@@ -107,28 +94,26 @@ Representative broader graph/hybrid results from the full `surreal-suite` snapsh
 
 ### What this means
 
-The broader v0.2 picture is:
+The broader v0.2 picture:
 
-- **graph scans and graph-shaped filters** are already a strong area for AionDB;
-- **simple CRUD throughput** is now competitive with SurrealDB on this all-durable CRUD refresh, while pgstack remains ahead;
-- **hybrid graph/vector** is real and runnable, but not yet a universal win;
-- some comparison cells are still `UNSUPPORTED` on one side or another, so fairness depends on the exact workload family.
+- graph scans and graph-shaped filters favor AionDB;
+- CRUD throughput is competitive with SurrealDB on this all-durable refresh; pgstack remains ahead;
+- hybrid graph/vector is real and runnable, but not a universal win;
+- some comparison cells are still `UNSUPPORTED` on one side. Fairness depends on the exact workload family.
 
-That is why v0.2 should be described as:
+Describe v0.2 as:
 
-> strong on a growing set of graph and hybrid graph/query shapes, but still mixed as a general benchmark matrix.
+> strong on a growing set of graph and hybrid shapes, mixed as a general benchmark matrix.
 
 Not:
 
 > faster than Neo4j, PostgreSQL, and SurrealDB overall.
 
-## Current v0.2 performance read
+## Short read
 
-If you want the short version:
-
-- against **Neo4j** on the current pinned graph snapshot, AionDB looks strong;
-- against the broader **SurrealDB / pgstack** matrix, AionDB is strong on several graph-heavy scans but clearly not the winner on every workload family;
-- v0.2 has a credible performance story for graph evaluation, not a universal cross-engine win story.
+- against Neo4j on the pinned graph snapshot, AionDB is ahead;
+- against the broader SurrealDB / pgstack matrix, AionDB wins several graph-heavy scans and loses other workload families;
+- v0.2 is a graph-evaluation performance story, not a universal cross-engine win.
 
 ## Reproduce the snapshots
 

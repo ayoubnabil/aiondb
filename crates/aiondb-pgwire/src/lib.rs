@@ -1,6 +1,5 @@
 //! `PostgreSQL` wire protocol (v3) implementation for `AionDB`.
 //!
-//! This crate provides:
 //! - TCP listener accepting `PostgreSQL` client connections
 //! - `StartupMessage` / `SSLRequest` handling
 //! - Simple query protocol (`Query` -> `RowDescription` -> `DataRow` -> `CommandComplete`)

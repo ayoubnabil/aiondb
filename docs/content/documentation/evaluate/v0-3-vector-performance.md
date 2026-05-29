@@ -5,7 +5,7 @@ order: 72
 
 # v0.3 Vector Performance
 
-AionDB v0.3 ships a dedicated vector benchmark harness for the new vector stack. It measures the paths that matter for application retrieval: HNSW raw, HNSW with product quantization, IVF-flat with different probe counts, and brute-force exact search as the recall reference.
+v0.3 ships a vector benchmark harness. It measures HNSW raw, HNSW with product quantization, IVF-flat at different probe counts, and brute-force exact search as the recall reference.
 
 Run it from the repository:
 
@@ -45,16 +45,11 @@ IVF-flat is the fast-build path: about `416-418 ms` build time on this dataset. 
 
 Brute-force exact remains in the benchmark as the ground truth. That keeps every approximate result tied to a measurable recall target instead of a standalone latency number.
 
-## Why This Matters
+## v0.3 surface
 
-v0.3 makes vector performance a normal AionDB evaluation surface:
+Vector performance is a normal evaluation surface in v0.3. SQL users create vector indexes through pgvector-style DDL. RAG workloads combine nearest-neighbor search with Qdrant-style metadata filters. Application data stays in one catalog with relational, graph, and vector access paths. Benchmark output includes build time, recall, and latency in one table.
 
-- SQL users can create vector indexes through pgvector-style DDL.
-- RAG workloads can combine nearest-neighbor search with Qdrant-style metadata filters.
-- Application data can stay in one catalog with relational, graph, and vector access paths.
-- Benchmark output includes build time, recall, and latency in one table.
-
-The default run is self-contained. External pgvector and Qdrant comparison targets can be provisioned separately for service-to-service comparisons.
+The default run is self-contained. Provision external pgvector and Qdrant targets separately for service-to-service comparisons.
 
 ## Raw Output
 

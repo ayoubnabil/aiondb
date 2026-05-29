@@ -1,28 +1,30 @@
 //! Matrix of every compatibility tag the compat layer accepts, with its
-//! guaranteed behaviour. **Single source of truth** for engine dispatch,
-//! for the pg-compat allowlist, and for the documentation mirror at
+//! guaranteed behaviour. Single source of truth for engine dispatch, the
+//! pg-compat allowlist, and the documentation mirror at
 //! `docs/compat/tag_matrix.toml`.
 //!
-//! Tags fall into exactly three buckets:
+//! Tag buckets:
 //!   * `ImplementedReal` - a dedicated handler intercepts the command and
-//!     never emitted for a successfully handled statement; a parse failure
+//!     applies real catalog/state effects. A parse failure on such a tag
 //!     surfaces as `feature_not_supported`.
 //!   * `ExplicitNotSupported` - the handler rejects the command with
-//!     `feature_not_supported`, even on valid syntax (e.g. features AionDB
+//!     `feature_not_supported`, even on valid syntax (features AionDB
 //!     genuinely cannot emulate).
-//!     best-effort (no catalog mutation).
+//!   * `IntentionalNoop` - sentinel for tags the engine would otherwise
+//!     silently acknowledge as a no-op. Gated to stay empty: any tag
+//!     ending up here is a regression and trips the test in this file.
 //!
-//! Dispatch is a *separate* axis from behaviour: it names which routing
+//! Dispatch is a separate axis from behaviour: it names which routing
 //! branch the engine uses to reach the handler. See `CompatDispatch`.
 //!
-//! matching entry is a regression**: the allowlist check or the
-//! sensitive-tag guard will surface `feature_not_supported` rather than
+//! Any tag reaching the engine without a matching entry here is a
+//! regression: the allowlist check or the sensitive-tag guard surfaces
+//! `feature_not_supported` instead of running an unspecified path.
 //!
-//! This module previously lived in `aiondb-engine` under
-//! `pub(in crate::engine)`. It now lives in `aiondb-pg-compat` so the
-//! compat crate owns its own metadata and the documentation file
-//! `docs/compat/tag_matrix.toml` can be validated against it via a
-//! single unit test.
+//! Previously lived in `aiondb-engine` under `pub(in crate::engine)`. Moved
+//! to `aiondb-pg-compat` so the compat crate owns its own metadata and the
+//! documentation file `docs/compat/tag_matrix.toml` can be validated
+//! against it via a single unit test.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompatTagBehavior {

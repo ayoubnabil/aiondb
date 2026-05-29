@@ -1,21 +1,19 @@
 //! Distributed schema migration coordinator.
 //!
-//! Implements the multi-phase online schema change protocol made
-//! famous by Google's F1 / Spanner / CockroachDB :
+//! Multi-phase online schema change protocol (F1 / Spanner / CockroachDB):
 //!
 //! ```text
 //!   DELETE-ONLY -> WRITE-ONLY -> WRITE-AND-READ -> PUBLIC
 //! ```
 //!
 //! At each phase boundary the coordinator pauses until every node has
-//! acknowledged the transition, ensuring that no node observes the
-//! schema at two contradictory phases simultaneously. A rollback
-//! flow is provided so half-applied migrations can be reversed
-//! cleanly.
+//! acknowledged the transition, so no node ever observes the schema at two
+//! contradictory phases simultaneously. A rollback flow reverses
+//! half-applied migrations cleanly.
 //!
-//! This module is the migration **state machine** -- the actual DDL
-//! application lives in `aiondb-catalog`. Coordinators consult this
-//! module to decide what nodes can do at each step.
+//! State machine only -- DDL application lives in `aiondb-catalog`.
+//! Coordinators consult this module to decide what nodes can do at each
+//! step.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

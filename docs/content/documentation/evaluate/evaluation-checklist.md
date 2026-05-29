@@ -53,7 +53,7 @@ Those four files make the evaluation portable.
 - Run brute-force vector distance queries.
 - Add HNSW indexes only after correctness is clear.
 
-Decision point: if graph/vector behavior is promising but incomplete, decide whether SQL fallbacks are acceptable. For alpha releases, a working SQL fallback is part of a credible adoption path.
+Decision point: if graph/vector behavior is promising but incomplete, decide whether SQL fallbacks are acceptable. For alpha releases, a working SQL fallback is part of the adoption path.
 
 ## Driver compatibility
 

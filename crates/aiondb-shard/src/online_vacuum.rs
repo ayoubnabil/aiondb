@@ -4,8 +4,8 @@
 //! below the system-wide GC horizon (the oldest still-running txn's
 //! start ts, capped by the cluster's closed-timestamp watermark).
 //!
-//! This module owns the **scheduling** + **bookkeeping** side; the
-//! actual byte removal lives in the storage engine.
+//! Scheduling and bookkeeping only -- the actual byte removal lives in
+//! the storage engine.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

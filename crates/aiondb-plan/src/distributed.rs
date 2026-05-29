@@ -1,9 +1,9 @@
 //! Serializable distributed physical plan graph.
 //!
-//! This module describes the fragment DAG that the distributed planner should
-//! produce. It is intentionally separate from [`crate::PhysicalPlan`] so the
-//! existing single-node executor can keep running unchanged while the planner
-//! and transport migrate to explicit fragment execution.
+//! Fragment DAG produced by the distributed planner. Kept separate from
+//! [`crate::PhysicalPlan`] so the existing single-node executor can keep
+//! running unchanged while the planner and transport migrate to explicit
+//! fragment execution.
 
 use std::collections::{BTreeMap, BTreeSet};
 

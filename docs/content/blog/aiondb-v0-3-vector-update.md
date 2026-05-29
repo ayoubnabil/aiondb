@@ -1,5 +1,5 @@
 ---
-title: AionDB v0.3 turns vector search into a first-class engine feature
+title: AionDB v0.3 vector update
 seo_title: AionDB v0.3 vector update - HNSW, IVF-flat, pgvector SQL, and Qdrant-style filters
 description: AionDB v0.3 adds a stronger vector stack with pgvector-compatible SQL, HNSW, IVF-flat, Qdrant-style filtered helpers, and reproducible vector benchmarks.
 date: 2026-05-22
@@ -7,13 +7,13 @@ tags: vector database, pgvector, Qdrant, HNSW, IVF-flat, RAG database
 order: 2
 ---
 
-# AionDB v0.3 turns vector search into a first-class engine feature
+# AionDB v0.3 vector update
 
-v0.3 is where AionDB's vector system becomes a product surface.
+v0.3 ships the vector stack.
 
-The release brings pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered helper options, PostgreSQL ecosystem compatibility work, and a reproducible benchmark harness into the same engine. The goal is simple: one database for relational records, graph relationships, and semantic retrieval.
+The release adds pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filtered helper options, PostgreSQL ecosystem compatibility work, and a reproducible benchmark harness. Rows, graph edges, and embeddings live in the same catalog.
 
-For RAG, recommendation, knowledge-base, support, and agent memory workloads, the interesting query is rarely just "nearest vectors." It is "nearest vectors inside this tenant, for this permission scope, related to this graph neighborhood, with these metadata constraints." AionDB v0.3 moves directly toward that shape.
+In RAG, recommendation, knowledge-base, support, and agent memory workloads the actual query is not "nearest vectors". It is "nearest vectors inside this tenant, for this permission scope, related to this graph neighborhood, with these metadata constraints". v0.3 targets that shape.
 
 ## The v0.3 Vector Stack
 

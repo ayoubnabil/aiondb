@@ -1,7 +1,7 @@
 //! Replication placement helpers.
 //!
-//! This module contains pure planning logic used by the distributed control
-//! plane. It does not mutate placement state and does not grant leases.
+//! Pure planning logic for the distributed control plane. Does not mutate
+//! placement state and does not grant leases.
 
 use std::collections::{BTreeMap, BTreeSet};
 

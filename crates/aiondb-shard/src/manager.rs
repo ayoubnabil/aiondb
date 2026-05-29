@@ -63,9 +63,9 @@ pub struct ShardTransferRequest {
     pub to: NodeAddress,
 }
 
-/// Manages the full lifecycle of shards for a sharded table/collection.
+/// Shard lifecycle owner for a sharded table/collection.
 ///
-/// Tracks shard metadata, handles creation/deletion, and computes
+/// Tracks shard metadata, drives creation/deletion, and computes
 /// rebalancing plans when nodes join or leave.
 #[derive(Debug)]
 pub struct ShardManager {

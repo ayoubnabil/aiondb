@@ -9,7 +9,7 @@
 //! the cluster state, then resume streaming from the snapshot's
 //! rendezvous LSN.
 //!
-//! This module provides:
+//! Two pieces:
 //!
 //! - [`CatchupPolicy`] -- pure decision function. Given the primary's
 //!   current LSN, the oldest WAL LSN still retained on disk, the

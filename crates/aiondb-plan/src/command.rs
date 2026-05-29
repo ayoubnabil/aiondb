@@ -7,9 +7,9 @@
 //! consumed by the executor. No direct dispatch on `Statement::*` in the
 //! runtime engine.
 //!
-//! This module is a **scaffold** - the variants are defined but not yet
-//! consumed by the engine. Migration will happen command by command, each
-//! with its ADR where applicable.
+//! Scaffold -- variants defined but not yet consumed by the engine.
+//! Migration happens command by command, each with its ADR where
+//! applicable.
 
 use aiondb_core::DataType;
 

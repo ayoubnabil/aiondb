@@ -1,9 +1,9 @@
 //! Value-to-`PostgreSQL` text format serialization.
 //!
-//! Converts [`Value`] instances to their `PostgreSQL` text wire representation.
-//! This module is the text-format helper used by the simple query protocol and
-//! by any extended-query result columns that stay in text format. Binary result
-//! encoding lives in [`crate::binary_format`].
+//! Converts [`Value`] instances to their `PostgreSQL` text wire
+//! representation. Used by the simple query protocol and by any
+//! extended-query result columns that stay in text format. Binary
+//! result encoding lives in [`crate::binary_format`].
 
 use std::fmt::Write as _;
 

@@ -1,9 +1,9 @@
 //! Page-backed B+tree foundation for persistent ordered indexes.
 //!
-//! This module is intentionally lower-level than the SQL storage engine. It
-//! stores fixed-width `u64 -> u64` entries on 8 KiB pages managed by the shared
-//! [`BufferPool`]. The SQL layer can build on this by encoding composite index
-//! keys and tuple ids into stable integer/table-space references.
+//! Lower-level than the SQL storage engine: fixed-width `u64 -> u64` entries
+//! on 8 KiB pages managed by the shared [`BufferPool`]. The SQL layer builds
+//! on this by encoding composite index keys and tuple ids into stable
+//! integer/table-space references.
 //!
 //! Current scope:
 //! - persistent metapage with root page and tree height;

@@ -1,6 +1,6 @@
 //! Shared graph runtime contracts.
 //!
-//! This crate holds the neutral interfaces used to separate:
+//! Neutral interfaces separating:
 //!
 //! - transaction-facing traversal storage
 //! - persistent graph projections

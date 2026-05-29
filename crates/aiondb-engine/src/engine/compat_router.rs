@@ -9,9 +9,9 @@
 //! `Statement` that the engine wants the compat layer to have a look at
 //! before falling through to the native planner/executor.
 //!
-//! Keeping this module separate lets `query_api.rs` focus on protocol
+//! Keeping this in its own module lets `query_api.rs` focus on protocol
 //! orchestration: parse, cache, metrics, dispatch, and format. The compat
-//! surface stays a first-class, navigable part of the engine module tree.
+//! surface stays a navigable, separate part of the engine module tree.
 //!
 //! Routing contract:
 //!     with `feature_not_supported`.

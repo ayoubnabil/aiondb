@@ -5,9 +5,15 @@ order: 71
 
 # v0.2 Evidence
 
-v0.2 is the credibility milestone. The release should prove that AionDB is a real PostgreSQL-wire database foundation, not only a demo path, while also making the graph surface credible against Neo4j-class expectations. This page lists the evidence that should exist before broad claims are made.
+v0.2 is the credibility milestone. The release has to show that AionDB
+is a working PostgreSQL-wire database foundation rather than a demo
+path, with a graph surface that holds up against Neo4j-class
+expectations. This page lists the evidence that has to exist before
+broad claims are made.
 
-The goal is not to claim production completeness. The goal is to make storage, WAL, driver behavior, type behavior, graph behavior, and baseline evaluation inspectable from a fresh checkout.
+v0.2 does not claim production completeness. It only makes storage,
+WAL, driver behavior, type behavior, graph behavior, and baseline
+evaluation inspectable from a fresh checkout.
 
 ## Evidence matrix
 
@@ -99,7 +105,9 @@ Type evidence should include:
 
 ## Graph acceptance
 
-v0.2 should treat graph as a serious product surface, not an isolated demo. The goal is Neo4j-class maturity as an engineering target, with evidence for what is already comparable and what is still behind.
+v0.2 treats graph as a real part of the engine, not an isolated demo.
+Neo4j-class maturity is the engineering target, with evidence for what
+is already comparable and what is still behind.
 
 Required graph evidence:
 

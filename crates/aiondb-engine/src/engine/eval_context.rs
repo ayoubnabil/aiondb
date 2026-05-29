@@ -513,8 +513,8 @@ impl Engine {
                 .read()
                 .grantor_tuples();
             eval_session.role_membership_grantors = Arc::new(role_membership_grantors);
-            // ADR-0014 phase 4: snapshot des bases cluster pour que
-            // pg_catalog.pg_database renvoie une ligne par base.
+            // ADR-0014 phase 4: snapshot cluster databases so
+            // pg_catalog.pg_database returns one row per database.
             let cluster_databases: Vec<aiondb_eval::ClusterDatabaseSummary> = self
                 .cluster_catalog
                 .list_databases()

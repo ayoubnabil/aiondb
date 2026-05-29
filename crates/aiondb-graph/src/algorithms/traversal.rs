@@ -3,7 +3,7 @@
 //! Returns the order in which nodes are first reached from a `source`:
 //! breadth-first (closest first) or depth-first (pre-order). Both are the
 //! building blocks the rest of the engine already uses; exposing them as
-//! first-class, deterministic primitives matches Neo4j and is handy for
+//! standalone deterministic primitives matches Neo4j and is handy for
 //! "reachable from X, in visit order" queries.
 //!
 //! Determinism: out-neighbours are followed in the graph's stored order, so

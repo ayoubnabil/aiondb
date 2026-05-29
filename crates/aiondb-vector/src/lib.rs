@@ -1,18 +1,15 @@
 //! Vector type support, distance functions, index descriptors, and planner
 //! integration for similarity search.
 //!
-//! This crate centralizes all vector-specific logic:
-//!
 //! - [`VectorValue`] is re-exported from `aiondb-core`.
-//! - [`VectorDistance`] enumerates the supported distance metrics.
-//! - [`distance`] contains the pure distance computation functions.
-//! - [`index`] defines [`VectorIndexDescriptor`] and
-//!   [`VectorIndexAlgorithmParams`] for algorithm-agnostic index metadata.
-//! - [`planner`] provides [`build_vector_search_plan`] and
-//!   [`build_vector_search_plan_with_registry`] for integrating vector
-//!   similarity search into the query planner.
-//! - [`planner_backends`] provides backend contracts and registries so new
-//!   algorithms can be onboarded without touching core planner flow.
+//! - [`VectorDistance`]: supported distance metrics.
+//! - [`distance`]: pure distance computation functions.
+//! - [`index`]: [`VectorIndexDescriptor`] and [`VectorIndexAlgorithmParams`]
+//!   for algorithm-agnostic index metadata.
+//! - [`planner`]: [`build_vector_search_plan`] and
+//!   [`build_vector_search_plan_with_registry`].
+//! - [`planner_backends`]: backend contracts and registries for onboarding
+//!   new ANN algorithms without touching core planner flow.
 
 #![allow(
     clippy::cast_possible_truncation,

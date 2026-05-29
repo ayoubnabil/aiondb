@@ -37,7 +37,7 @@ order: 0
 
 <div class="home-section">
 <p class="section-kicker">&gt;&gt; v0.3 vector update</p>
-<h2>Vector search is now a first-class AionDB surface.</h2>
+<h2>Vector search runs inside the SQL engine.</h2>
 <div class="feature-grid">
 <div class="feature-card"><h3>HNSW</h3><p>Raw vector search reaches 0.996 recall@10 in the default v0.3 vector benchmark.</p></div>
 <div class="feature-card"><h3>HNSW PQ</h3><p>Product-quantized search keeps 0.994 recall@10 while exercising compressed candidate search and exact rescoring.</p></div>

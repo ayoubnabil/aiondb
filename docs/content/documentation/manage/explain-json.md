@@ -7,7 +7,7 @@ order: 62
 
 AionDB exposes a structured `EXPLAIN` payload for graph and hybrid queries.
 
-> New in v0.3: vector search joins the same product story as SQL and graph, with pgvector-style SQL, HNSW, IVF-flat, Qdrant-style filters, and benchmarked recall/latency. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
+> New in v0.3: vector search runs through the same engine as SQL and graph, with pgvector-style SQL, HNSW, IVF-flat, and Qdrant-style filters. See [What's New in v0.3](/documentation/project/whats-new-v0-3.html).
 
 Supported forms:
 

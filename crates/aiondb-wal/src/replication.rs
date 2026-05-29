@@ -1,7 +1,6 @@
 //! WAL-based streaming replication protocol.
 //!
-//! This module provides the core replication primitives that sit between the
-//! WAL subsystem and the network layer:
+//! Replication primitives between the WAL subsystem and the network layer:
 //!
 //! - [`WalSender`] reads WAL entries starting from a given LSN and streams
 //!   them as encoded byte chunks to a consumer (the pgwire replication

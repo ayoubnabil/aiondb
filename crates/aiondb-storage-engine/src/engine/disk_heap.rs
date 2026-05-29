@@ -1,9 +1,8 @@
-//! Disk-backed heap integration for the storage engine.
+//! Disk-backed heap for the storage engine.
 //!
-//! This module provides [`DiskTableStore`], an abstraction that manages
-//! multiple [`DiskHeap`] instances (one per relation) behind a shared
-//! [`BufferPool`].  It serves as the bridge between the buffer-pool-level
-//! disk heap and the storage engine's relational model.
+//! [`DiskTableStore`] manages one [`DiskHeap`] per relation behind a shared
+//! [`BufferPool`]. It bridges the buffer-pool-level disk heap and the
+//! storage engine's relational model.
 //!
 //! ## Tuple serialization
 //!

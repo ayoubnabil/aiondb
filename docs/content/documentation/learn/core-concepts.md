@@ -5,7 +5,7 @@ order: 20
 
 # Core Concepts
 
-AionDB is built around one catalog, one SQL pipeline, and multiple query styles. The practical goal is simple: keep application state in ordinary tables, then query the same records relationally, as graph relationships, or by vector distance without copying the dataset into separate services.
+AionDB has one catalog and one SQL pipeline. Rows stay in tables. Graph traversal and vector search are extra access paths over the same rows, not separate stores. Application state is not duplicated into a graph database or a vector database next door.
 
 ## Mental model
 

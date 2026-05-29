@@ -1,7 +1,6 @@
 //! Backend abstraction for vector-search planning.
 //!
-//! This module is the single extension point for ANN algorithm onboarding.
-//! To add a new algorithm safely:
+//! Single extension point for ANN algorithm onboarding:
 //! 1) Implement [`VectorSearchBackend`] (in-tree or out-of-tree).
 //! 2) Register it into a [`VectorSearchBackendRegistry`].
 //! 3) Use `build_vector_search_plan_with_registry` for dependency injection,

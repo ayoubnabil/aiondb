@@ -36,12 +36,12 @@ impl fmt::Debug for WalIntegration {
     }
 }
 
-/// Manages WAL logging for the storage engine.
+/// WAL logging entry point for the storage engine.
 ///
-/// All WAL operations go through this struct. The WAL writer is behind a
-/// `Mutex` so that concurrent transactions can append records safely.
-/// Autocommit operations use synthetic transaction IDs from a high range
-/// to avoid collision with real explicit transaction IDs.
+/// All WAL operations funnel through here. The writer is behind a `Mutex`
+/// so concurrent transactions can append records safely. Autocommit
+/// operations use synthetic transaction IDs from a high range to avoid
+/// collision with real explicit transaction IDs.
 pub(super) struct WalIntegration {
     // Debug is manually implemented below since Mutex<WalWriter> doesn't derive it.
     writer: Mutex<WalWriter>,

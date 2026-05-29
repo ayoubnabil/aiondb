@@ -5,7 +5,7 @@ order: 16
 
 # Example Workloads
 
-These examples show the kind of hybrid data model AionDB is built for. They are intentionally small so readers can understand the shape quickly.
+These examples show the hybrid data model. They are small on purpose.
 
 ## Knowledge base search
 
@@ -167,9 +167,9 @@ For a serious evaluation, add:
 - a vector index on task embeddings;
 - tests for project isolation.
 
-## Why these examples matter
+## The modeling pattern
 
-The point is not that these small datasets need a new database. The point is the modeling pattern: one canonical set of tables, with graph and vector access paths over the same data.
+Small datasets do not need a new database. The point is the modeling pattern: one canonical set of tables, with graph and vector access paths over the same data.
 
 ## How to turn an example into a benchmark
 

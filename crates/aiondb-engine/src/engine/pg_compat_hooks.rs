@@ -2,14 +2,13 @@
 
 //! Facade `impl PgCompatHooks for Engine`.
 //!
-//! This file extracts the PostgreSQL compatibility hook **entry points**
-//! out of `engine/compat/mod.rs`. The implementation bodies are still
-//! inherent methods on `Engine` declared in `engine/compat/mod.rs`; this
-//! facade exposes them through the `aiondb_pg_compat::dispatch::PgCompatHooks`
-//! trait.
+//! Extracts the PostgreSQL compatibility hook entry points out of
+//! `engine/compat/mod.rs`. Implementation bodies remain inherent methods
+//! on `Engine` declared in `engine/compat/mod.rs`; this facade exposes
+//! them through the `aiondb_pg_compat::dispatch::PgCompatHooks` trait.
 //!
-//! See ADR-0004: any new hook must go through this trait, not through a
-//! new addition in `engine/compat/mod.rs`.
+//! See ADR-0004: any new hook goes through this trait, not through a new
+//! addition in `engine/compat/mod.rs`.
 
 use aiondb_core::DbResult;
 use aiondb_parser::Statement;

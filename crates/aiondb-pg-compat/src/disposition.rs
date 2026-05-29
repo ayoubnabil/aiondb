@@ -4,15 +4,14 @@
 //! Historically the engine's query-API cascade made routing decisions by
 //! calling a handful of `is_*` helpers that each inspected `Statement`
 //! variants and compatibility tag strings. Drift between those helpers
-//! through one helper, miss its post-hook in another, and end up
-//! emitting `command_ok` without running the real side effect.
+//! could route a statement through one helper, miss its post-hook in
+//! another, and emit `command_ok` without running the real side effect.
 //!
-//! This module centralises the decision:
+//! Centralised decision:
 //!
-//! * [`CompatDisposition`] - the four buckets every statement
-//!   falls into before execution (`Native`, `CompatHandler`,
-//!   before dispatching.
-//!   a post-statement hook (sensitive CREATE families, shared DROP IF
+//! * [`CompatDisposition`] - the buckets every statement falls into
+//!   before execution (`Native`, `CompatHandler`, post-statement hook for
+//!   sensitive CREATE families and shared DROP IF EXISTS, etc.).
 
 use aiondb_parser::Statement;
 
@@ -29,7 +28,8 @@ pub enum CompatDisposition {
     /// `CompatCommand` identifies the variant so the dispatcher can fan
     /// out without re-parsing the tag string.
     CompatHandler(CompatCommand),
-    /// explicit reject by the router.
+    /// Sentinel for the `CompatTagBehavior::IntentionalNoop` bucket;
+    /// the router rejects with `feature_not_supported`.
     IntentionalNoop,
     /// Tag reached the compat surface but has no registered behaviour.
     /// The caller must surface `feature_not_supported`.

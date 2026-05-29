@@ -67,7 +67,7 @@ High availability should not be marketed before the single-node operational stor
 
 ## Product and distribution direction
 
-The product surface should be easy to evaluate without reading crate internals:
+What AionDB ships should be easy to evaluate without reading crate internals:
 
 - release archives with checksums;
 - a local container profile;

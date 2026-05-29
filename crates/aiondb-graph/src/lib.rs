@@ -1,18 +1,11 @@
 //! Node/edge property graph model, label and property descriptors, and
 //! traversal planning.
 //!
-//! This crate centralizes all graph-specific logic:
-//!
-//! - [`model`] defines the core [`GraphLabelDescriptor`] enum that unifies
-//!   node and edge labels.
-//! - [`node`] provides [`NodeDescriptor`] with property metadata for graph
-//!   nodes.
-//! - [`edge`] provides [`EdgeDescriptor`] with source/target and property
-//!   metadata for graph edges.
-//! - [`traversal`] defines [`TraversalSpec`] for specifying graph traversal
-//!   patterns.
-//! - [`planner`] provides [`build_graph_plan`] for integrating graph
-//!   traversals into the query planner.
+//! - [`model`]: [`GraphLabelDescriptor`] enum unifying node and edge labels.
+//! - [`node`]: [`NodeDescriptor`] with property metadata for nodes.
+//! - [`edge`]: [`EdgeDescriptor`] with source/target and property metadata.
+//! - [`traversal`]: [`TraversalSpec`] for traversal patterns.
+//! - [`planner`]: [`build_graph_plan`] for the query planner.
 
 #![allow(
     clippy::cast_lossless,

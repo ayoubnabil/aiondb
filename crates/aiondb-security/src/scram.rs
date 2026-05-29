@@ -1,7 +1,7 @@
-//! Pure SCRAM-SHA-256 crypto logic (RFC 5802 / RFC 7677).
+//! SCRAM-SHA-256 (RFC 5802 / RFC 7677).
 //!
-//! This module implements the server-side SCRAM state machine with no I/O.
-//! The wire protocol layer feeds messages in and gets responses back.
+//! Server-side SCRAM state machine with no I/O. The wire protocol layer
+//! feeds messages in and reads responses back.
 
 #![allow(clippy::missing_errors_doc)]
 
